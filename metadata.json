@@ -1,0 +1,6 @@
+{
+  "name": "Glossy Looks Women Salon",
+  "description": "Premium women salon booking, services menu, artist portfolio gallery with upload, POS billing, WhatsApp follow-ups, and Google Maps integration.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
