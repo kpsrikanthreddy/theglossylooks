@@ -24,3 +24,33 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #BF9294;
 }
+
+/* 3-inch (80mm) & 4-inch (104mm) ESC/POS Thermal Receipt Print Styling */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .printable-thermal-invoice,
+  .printable-thermal-invoice * {
+    visibility: visible;
+  }
+  .printable-thermal-invoice {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 80mm !important;
+    max-width: 80mm !important;
+    padding: 2mm 3mm !important;
+    margin: 0 auto !important;
+    font-size: 11px !important;
+    color: #000000 !important;
+    background: #ffffff !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  @page {
+    size: 80mm auto;
+    margin: 2mm;
+  }
+}

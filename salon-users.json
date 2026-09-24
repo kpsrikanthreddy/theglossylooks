@@ -1,0 +1,26 @@
+[
+  {
+    "id": "usr-admin-1",
+    "name": "Salon Administrator",
+    "email": "admin@theglossylooks.com",
+    "phone": "+91 98765 43210",
+    "role": "SALON_ADMIN",
+    "passwordHash": "4e85fbc59ac93939351061dca1866d7ee195c59b73bcc68c3ebf5e2866931284aa613d68282fb742fb8206277411b526f0783371ef0c6c997471cb0b6d8d21c9",
+    "passwordSalt": "7c4351a3e03b0d4cd78f3145101c924f",
+    "active": true,
+    "createdAt": "2026-09-24T20:47:43.488Z",
+    "lastLogin": "2026-09-24T20:47:48.878Z"
+  },
+  {
+    "id": "usr-staff-1",
+    "name": "Pooja Stylist",
+    "email": "staff@theglossylooks.com",
+    "phone": "+91 98765 11002",
+    "role": "SALON_STAFF",
+    "passwordHash": "dd669733f55d2932400ec084b84e33dc27e16f2a14735d6024ba683f0aabb2653cde00bc89b7060bb81f0792f9f9377df3cbb63fadd858e6b81933fb3ae38521",
+    "passwordSalt": "905b159245fe8c2502a708a2b2d7fcd0",
+    "active": true,
+    "createdAt": "2026-09-24T20:47:43.488Z",
+    "lastLogin": "2026-09-24T20:47:48.901Z"
+  }
+]

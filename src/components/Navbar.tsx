@@ -1,132 +1,90 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { 
   Sparkles, 
-  Calendar, 
-  Receipt, 
-  Image as ImageIcon, 
-  PhoneCall, 
-  MessageCircle, 
-  ShieldCheck, 
   Menu as MenuIcon, 
-  X,
-  Compass,
-  MapPin,
-  Scissors
+  X
 } from 'lucide-react';
-import { SALON_INFO } from '../data/initialData';
-import { getSalonWhatsAppUrl } from '../utils/whatsapp';
 
 interface NavbarProps {
-  activeTab: 'customer' | 'admin';
-  setActiveTab: (tab: 'customer' | 'admin') => void;
-  onOpenBooking: () => void;
-  activeSection: string;
-  setActiveSection: (sec: string) => void;
-  appointmentCount: number;
+  currentPath: string;
+  onNavigate: (to: string) => void;
+  onOpenBooking?: () => void;
+  appointmentCount?: number;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
-  activeTab,
-  setActiveTab,
-  onOpenBooking,
-  activeSection,
-  setActiveSection,
-  appointmentCount,
+  currentPath,
+  onNavigate,
 }) => {
-  const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const handleNavClick = (sectionId: string) => {
-    setActiveTab('customer');
-    setActiveSection(sectionId);
+  const handleLinkClick = (to: string) => {
     setMobileMenuOpen(false);
-    const element = document.getElementById(sectionId);
-    if (element) {
-      element.scrollIntoView({ behavior: 'smooth' });
-    }
+    onNavigate(to);
+  };
+
+  const isActive = (path: string) => {
+    if (path === '/' && (currentPath === '/' || currentPath === '')) return true;
+    return currentPath === path;
   };
 
   return (
     <header className="sticky top-0 z-40 bg-[#FAF7F5]/95 backdrop-blur-md border-b border-[#E8DDD8] transition-all">
-      {/* Top micro bar for salon announcements */}
-      <div className="bg-[#2D2424] text-[#FAF7F5] px-4 py-1.5 text-xs">
-        <div className="max-w-7xl mx-auto flex flex-wrap justify-between items-center gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-block w-2 h-2 rounded-full bg-[#E5B5B7] animate-pulse"></span>
-            <span className="font-light tracking-wide text-xs">
-              Jubilee Hills, Hyderabad • Open Today 9:30 AM – 8:30 PM • Complimentary Bridal Consultations
-            </span>
-          </div>
-          <div className="flex items-center gap-4 text-xs">
-            <a 
-              href={`tel:${SALON_INFO.phone}`} 
-              className="flex items-center gap-1 text-[#E5B5B7] hover:text-white transition-colors"
-              id="topbar-call-link"
-            >
-              <PhoneCall className="w-3.5 h-3.5" />
-              <span>{SALON_INFO.phone}</span>
-            </a>
-            <a 
-              href={getSalonWhatsAppUrl()} 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="flex items-center gap-1 text-[#4ADE80] hover:text-white transition-colors"
-              id="topbar-whatsapp-link"
-            >
-              <MessageCircle className="w-3.5 h-3.5" />
-              <span>WhatsApp Us</span>
-            </a>
-          </div>
-        </div>
-      </div>
-
-      {/* Main navigation */}
+      {/* Clean main navigation container - No top information bar */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between h-20">
           
-          {/* Salon Logo */}
+          {/* Logo & Brand Name */}
           <div 
-            onClick={() => handleNavClick('hero')} 
-            className="flex items-center gap-3 cursor-pointer group"
+            onClick={() => handleLinkClick('/')} 
+            className="flex items-center gap-3 cursor-pointer group shrink-0"
             id="brand-logo-btn"
           >
-            <div className="w-11 h-11 rounded-full bg-gradient-to-br from-[#E8C5C8] to-[#D99B9F] flex items-center justify-center shadow-sm border border-[#D9B8B9] group-hover:scale-105 transition-transform">
-              <Sparkles className="w-6 h-6 text-[#2D2424]" />
+            <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-full bg-gradient-to-br from-[#E8C5C8] to-[#D99B9F] flex items-center justify-center shadow-xs border border-[#D9B8B9] group-hover:scale-105 transition-transform">
+              <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-[#2D2424]" />
             </div>
             <div>
-              <div className="flex items-center gap-1.5">
-                <span className="font-serif-luxury text-2xl font-bold tracking-tight text-[#2D2424]">
-                  Glossy Looks
-                </span>
-                <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded-full bg-[#F3E5E6] text-[#8C3A42] border border-[#E8C5C8]">
-                  Women Salon
-                </span>
-              </div>
-              <p className="text-[11px] text-[#7A6B6B] tracking-wider uppercase font-medium">
-                Luxury Hair, Bridal & Spa Studio
+              <span className="font-serif-luxury text-xl sm:text-2xl font-bold tracking-tight text-[#2D2424] block">
+                The Glossy Looks
+              </span>
+              <p className="text-[11px] sm:text-xs text-[#7A6B6B] tracking-wide font-medium">
+                Professional Women Salon
               </p>
             </div>
           </div>
 
-          {/* Desktop Navigation Links */}
-          <nav className="hidden lg:flex items-center space-x-1">
+          {/* Desktop Navigation Links: Home | Services | Artists | Gallery | Contact Us */}
+          <nav className="hidden md:flex items-center space-x-1 lg:space-x-2">
             <button
-              onClick={() => handleNavClick('menu')}
-              id="nav-menu-btn"
+              onClick={() => handleLinkClick('/')}
+              id="nav-home-btn"
               className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activeTab === 'customer' && activeSection === 'menu'
-                  ? 'text-[#8C3A42] bg-[#F7EBEB]'
+                isActive('/')
+                  ? 'text-[#8C3A42] bg-[#F7EBEB] font-semibold'
                   : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
               }`}
             >
-              Services Menu
+              Home
             </button>
 
             <button
-              onClick={() => handleNavClick('artists')}
+              onClick={() => handleLinkClick('/services')}
+              id="nav-services-btn"
+              className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors ${
+                isActive('/services')
+                  ? 'text-[#8C3A42] bg-[#F7EBEB] font-semibold'
+                  : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
+              }`}
+            >
+              Services
+            </button>
+
+            <button
+              onClick={() => handleLinkClick('/artists')}
               id="nav-artists-btn"
               className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activeTab === 'customer' && activeSection === 'artists'
-                  ? 'text-[#8C3A42] bg-[#F7EBEB]'
+                isActive('/artists')
+                  ? 'text-[#8C3A42] bg-[#F7EBEB] font-semibold'
                   : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
               }`}
             >
@@ -134,88 +92,32 @@ export const Navbar: React.FC<NavbarProps> = ({
             </button>
 
             <button
-              onClick={() => handleNavClick('gallery')}
+              onClick={() => handleLinkClick('/gallery')}
               id="nav-gallery-btn"
-              className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
-                activeTab === 'customer' && activeSection === 'gallery'
-                  ? 'text-[#8C3A42] bg-[#F7EBEB]'
-                  : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
-              }`}
-            >
-              <ImageIcon className="w-4 h-4 text-[#8C3A42]" />
-              Portfolio Gallery
-            </button>
-
-            <button
-              onClick={() => handleNavClick('enquiry')}
-              id="nav-enquiry-btn"
               className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activeTab === 'customer' && activeSection === 'enquiry'
-                  ? 'text-[#8C3A42] bg-[#F7EBEB]'
+                isActive('/gallery')
+                  ? 'text-[#8C3A42] bg-[#F7EBEB] font-semibold'
                   : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
               }`}
             >
-              Enquire
+              Gallery
             </button>
 
             <button
-              onClick={() => handleNavClick('contact')}
+              onClick={() => handleLinkClick('/contact')}
               id="nav-contact-btn"
-              className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1 ${
-                activeTab === 'customer' && activeSection === 'contact'
-                  ? 'text-[#8C3A42] bg-[#F7EBEB]'
+              className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors ${
+                isActive('/contact')
+                  ? 'text-[#8C3A42] bg-[#F7EBEB] font-semibold'
                   : 'text-[#4A3E3E] hover:text-[#2D2424] hover:bg-[#F3ECE8]'
               }`}
             >
-              <MapPin className="w-4 h-4 text-[#8C3A42]" />
-              Contact & Map
+              Contact Us
             </button>
           </nav>
 
-          {/* Action CTAs & Staff Portal Switch */}
-          <div className="hidden sm:flex items-center gap-3">
-            {/* Staff / Admin Portal Toggle Button */}
-            <button
-              onClick={() => {
-                if (activeTab === 'admin') {
-                  setActiveTab('customer');
-                  setActiveSection('hero');
-                } else {
-                  setActiveTab('admin');
-                }
-              }}
-              id="toggle-staff-portal-btn"
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold uppercase tracking-wider transition-all border ${
-                activeTab === 'admin'
-                  ? 'bg-[#2D2424] text-[#FAF7F5] border-[#2D2424] shadow-sm'
-                  : 'bg-white text-[#5A4B4B] border-[#D9C8C4] hover:bg-[#F7EBEB] hover:text-[#8C3A42]'
-              }`}
-            >
-              <ShieldCheck className="w-4 h-4 text-[#C98A8E]" />
-              <span>{activeTab === 'admin' ? 'Customer View' : 'Staff & Billing Portal'}</span>
-            </button>
-
-            {/* Book Appointment CTA */}
-            <button
-              onClick={onOpenBooking}
-              id="navbar-book-btn"
-              className="flex items-center gap-2 bg-[#8C3A42] hover:bg-[#742F36] text-white px-4 py-2.5 rounded-lg text-sm font-semibold shadow-sm transition-all hover:shadow hover:-translate-y-0.5"
-            >
-              <Calendar className="w-4 h-4" />
-              <span>Book Appointment</span>
-            </button>
-          </div>
-
           {/* Mobile hamburger button */}
-          <div className="lg:hidden flex items-center gap-2">
-            <button
-              onClick={onOpenBooking}
-              className="bg-[#8C3A42] text-white p-2 rounded-lg text-xs font-medium flex items-center gap-1"
-            >
-              <Calendar className="w-4 h-4" />
-              <span>Book</span>
-            </button>
-
+          <div className="md:hidden flex items-center">
             <button
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
               id="mobile-menu-toggle-btn"
@@ -225,64 +127,53 @@ export const Navbar: React.FC<NavbarProps> = ({
               {mobileMenuOpen ? <X className="w-6 h-6" /> : <MenuIcon className="w-6 h-6" />}
             </button>
           </div>
+
         </div>
       </div>
 
       {/* Mobile dropdown menu */}
       {mobileMenuOpen && (
-        <div className="lg:hidden border-t border-[#E8DDD8] bg-[#FAF7F5] px-4 pt-3 pb-6 space-y-2">
+        <div className="md:hidden border-t border-[#E8DDD8] bg-[#FAF7F5] px-4 pt-3 pb-6 space-y-2 shadow-lg animate-in slide-in-from-top-2 duration-150">
           <button
-            onClick={() => handleNavClick('menu')}
-            className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-[#2D2424] hover:bg-[#F3ECE8]"
+            onClick={() => handleLinkClick('/')}
+            className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+              isActive('/') ? 'bg-[#F7EBEB] text-[#8C3A42] font-semibold' : 'text-[#2D2424] hover:bg-[#F3ECE8]'
+            }`}
           >
-            Services & Price Menu
+            Home
           </button>
           <button
-            onClick={() => handleNavClick('artists')}
-            className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-[#2D2424] hover:bg-[#F3ECE8]"
+            onClick={() => handleLinkClick('/services')}
+            className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+              isActive('/services') ? 'bg-[#F7EBEB] text-[#8C3A42] font-semibold' : 'text-[#2D2424] hover:bg-[#F3ECE8]'
+            }`}
           >
-            Our Master Stylists & Artists
+            Services
           </button>
           <button
-            onClick={() => handleNavClick('gallery')}
-            className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-[#2D2424] hover:bg-[#F3ECE8]"
+            onClick={() => handleLinkClick('/artists')}
+            className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+              isActive('/artists') ? 'bg-[#F7EBEB] text-[#8C3A42] font-semibold' : 'text-[#2D2424] hover:bg-[#F3ECE8]'
+            }`}
           >
-            Artist Works & Gallery
+            Artists
           </button>
           <button
-            onClick={() => handleNavClick('enquiry')}
-            className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-[#2D2424] hover:bg-[#F3ECE8]"
+            onClick={() => handleLinkClick('/gallery')}
+            className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+              isActive('/gallery') ? 'bg-[#F7EBEB] text-[#8C3A42] font-semibold' : 'text-[#2D2424] hover:bg-[#F3ECE8]'
+            }`}
           >
-            Customer Enquiries
+            Gallery
           </button>
           <button
-            onClick={() => handleNavClick('contact')}
-            className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-[#2D2424] hover:bg-[#F3ECE8]"
+            onClick={() => handleLinkClick('/contact')}
+            className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+              isActive('/contact') ? 'bg-[#F7EBEB] text-[#8C3A42] font-semibold' : 'text-[#2D2424] hover:bg-[#F3ECE8]'
+            }`}
           >
-            Salon Location & Google Maps
+            Contact Us
           </button>
-
-          <div className="pt-3 border-t border-[#E8DDD8] flex flex-col gap-2">
-            <button
-              onClick={() => {
-                setActiveTab(activeTab === 'admin' ? 'customer' : 'admin');
-                setMobileMenuOpen(false);
-              }}
-              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold bg-[#2D2424] text-white"
-            >
-              <ShieldCheck className="w-4 h-4 text-[#E5B5B7]" />
-              <span>{activeTab === 'admin' ? 'Switch to Customer View' : 'Staff Admin & Billing Portal'}</span>
-            </button>
-            <a
-              href={getSalonWhatsAppUrl()}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold bg-[#22C55E] text-white"
-            >
-              <MessageCircle className="w-4 h-4" />
-              <span>WhatsApp Customer Support</span>
-            </a>
-          </div>
         </div>
       )}
     </header>

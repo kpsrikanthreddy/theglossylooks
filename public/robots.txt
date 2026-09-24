@@ -1,0 +1,7 @@
+User-agent: *
+Disallow: /admin/
+Disallow: /staff/
+Disallow: /api/
+Allow: /
+
+Sitemap: https://glossylooks.ai.studio/sitemap.xml

@@ -3,11 +3,15 @@ export interface SalonService {
   name: string;
   category: 'Bridal & Makeup' | 'Hair Styling & Care' | 'Skin & Facials' | 'Nails & Feet' | 'Spa & Body' | 'Waxing & Threading';
   price: number;
+  originalPrice?: number;
+  offerPrice?: number;
   durationMinutes: number;
   description: string;
   popular?: boolean;
   tier?: 'Classic' | 'Signature' | 'Luxury Royal';
   image?: string;
+  active?: boolean;
+  displayOrder?: number;
 }
 
 export interface Artist {
@@ -20,6 +24,8 @@ export interface Artist {
   experienceYears: number;
   bio: string;
   instagram?: string;
+  phone?: string;
+  active?: boolean;
 }
 
 export interface GalleryWork {
@@ -29,13 +35,16 @@ export interface GalleryWork {
   artistName: string;
   mediaType: 'image' | 'video';
   mediaUrl: string;
+  url?: string;
+  type?: 'image' | 'video';
   thumbnailUrl?: string;
-  category: 'Bridal' | 'Party Makeup' | 'Hair Styling' | 'Facial Glow' | 'Nail Art' | 'Reception';
+  category: 'Bridal' | 'Party Makeup' | 'Hair Styling' | 'Facial Glow' | 'Nail Art' | 'Reception' | string;
   description: string;
-  tags: string[];
-  likes: number;
+  tags?: string[];
+  likes?: number;
   createdAt: string;
   featured?: boolean;
+  active?: boolean;
 }
 
 export interface Appointment {
@@ -51,16 +60,19 @@ export interface Appointment {
   date: string;
   timeSlot: string;
   notes?: string;
-  status: 'confirmed' | 'pending' | 'completed' | 'cancelled';
+  durationMinutes?: number;
+  status: 'confirmed' | 'pending' | 'completed' | 'cancelled' | 'in_progress' | 'no_show';
   bookedBy: 'customer' | 'staff';
   totalAmount: number;
+  paymentStatus?: 'PAID' | 'PENDING' | 'PARTIAL';
+  feedbackStatus?: 'NOT_SENT' | 'SENT' | 'RECEIVED';
   createdAt: string;
 }
 
 export interface BillItem {
   id: string;
   name: string;
-  type: 'service' | 'product';
+  type?: 'service' | 'product' | 'custom';
   price: number;
   quantity: number;
   stylistName?: string;
@@ -73,14 +85,15 @@ export interface BillOrder {
   customerPhone: string;
   customerEmail?: string;
   items: BillItem[];
-  subtotal: number;
+  subtotal?: number;
+  subTotal?: number;
   discountAmount: number;
   taxAmount: number;
-  tipAmount: number;
+  tipAmount?: number;
   grandTotal: number;
-  paymentMode: 'UPI' | 'Credit/Debit Card' | 'Cash' | 'Net Banking';
-  paymentStatus: 'Paid' | 'Pending';
-  staffName: string;
+  paymentMode: 'UPI' | 'Credit/Debit Card' | 'Cash' | 'Net Banking' | 'Card' | 'Other';
+  paymentStatus: 'Paid' | 'Pending' | 'Partial';
+  staffName?: string;
   createdAt: string;
   notes?: string;
 }
@@ -91,6 +104,10 @@ export interface CustomerEnquiry {
   customerPhone: string;
   customerEmail?: string;
   serviceOfInterest: string;
+  name?: string;
+  phone?: string;
+  email?: string;
+  serviceInterested?: string;
   preferredDate?: string;
   message: string;
   status: 'New' | 'Contacted' | 'Converted' | 'Closed';

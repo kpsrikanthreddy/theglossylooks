@@ -87,12 +87,12 @@ Here is your itemized billing statement:
 --------------------------------
 ${itemsText}
 --------------------------------
-Subtotal: ₹${bill.subtotal.toLocaleString('en-IN')}
+Subtotal: ₹${(bill.subtotal ?? bill.subTotal ?? 0).toLocaleString('en-IN')}
 ${bill.discountAmount > 0 ? `Discount: -₹${bill.discountAmount.toLocaleString('en-IN')}\n` : ''}Tax: ₹${bill.taxAmount.toLocaleString('en-IN')}
-${bill.tipAmount > 0 ? `Stylist Gratuity: ₹${bill.tipAmount.toLocaleString('en-IN')}\n` : ''}*Grand Total Paid:* ₹${bill.grandTotal.toLocaleString('en-IN')}
+${(bill.tipAmount ?? 0) > 0 ? `Stylist Gratuity: ₹${(bill.tipAmount ?? 0).toLocaleString('en-IN')}\n` : ''}*Grand Total Paid:* ₹${bill.grandTotal.toLocaleString('en-IN')}
 Payment Mode: *${bill.paymentMode}* (${bill.paymentStatus})
 
-Handled by: ${bill.staffName}
+Handled by: ${bill.staffName || 'Reception Desk'}
 We hope you loved your new look! Looking forward to your next visit. 🌸`;
 }
 

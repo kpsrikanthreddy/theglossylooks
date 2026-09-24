@@ -137,13 +137,14 @@ export const Footer: React.FC<FooterProps> = ({
                 </button>
               </li>
               <li>
-                <button onClick={() => onNavigate('contact')} className="hover:text-white transition-colors">
+                <button onClick={() => onNavigate('/contact')} className="hover:text-white transition-colors">
                   Google Maps & Directions
                 </button>
               </li>
               <li>
-                <button onClick={onOpenAdmin} className="text-[#E8C5C8] hover:underline font-medium">
-                  Staff & Billing Portal →
+                <button onClick={onOpenAdmin} className="text-[#B8A7A7] hover:text-[#E8C5C8] transition-colors flex items-center gap-1.5 cursor-pointer">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#C98A8E]" />
+                  <span>Admin Login</span>
                 </button>
               </li>
             </ul>
@@ -183,13 +184,18 @@ export const Footer: React.FC<FooterProps> = ({
 
         {/* Bottom copyright and hygiene assurance */}
         <div className="pt-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[#8A7979]">
-          <p>© {new Date().getFullYear()} Glossy Looks Women Salon. All Rights Reserved.</p>
+          <p>© {new Date().getFullYear()} The Glossy Looks Women Salon. All Rights Reserved.</p>
           <div className="flex items-center gap-4 text-[11px]">
             <span>100% Sterilized Tools</span>
             <span>•</span>
-            <span>Private Bridal Dressing Rooms</span>
+            <span>Private Bridal Rooms</span>
             <span>•</span>
-            <span>Complimentary WiFi & Valet</span>
+            <button 
+              onClick={onOpenAdmin} 
+              className="text-[#998686] hover:text-[#E8C5C8] transition-colors cursor-pointer"
+            >
+              Admin Login
+            </button>
           </div>
         </div>
 

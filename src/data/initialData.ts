@@ -1,14 +1,14 @@
-import { SalonService, Artist, GalleryWork, Appointment, BillOrder, CustomerEnquiry, RetailProduct } from '../types/salon';
+import type { SalonService, Artist, GalleryWork, Appointment, BillOrder, CustomerEnquiry, RetailProduct } from '../types/salon.ts';
 
 export const SALON_INFO = {
-  name: 'Glossy Looks Women Salon',
+  name: 'The Glossy Looks Women Salon',
   tagline: 'Luxury Hair, Bridal Makeover & Aesthetic Spa Studio',
   phone: '+91 98765 43210',
   whatsapp: '919876543210',
-  email: 'appointments@glossylookssalon.com',
-  address: 'Plot 42, Horizon Heights, Road No. 36, Jubilee Hills, Hyderabad, Telangana 500033',
-  googleMapsEmbedUrl: 'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3806.634125860717!2d78.40428387588325!3d17.430030583466185!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3bcb913508b53d49%3A0x8979c3c17830cb82!2sRoad%20Number%2036%2C%20Jubilee%20Hills%2C%20Hyderabad%2C%20Telangana!5e0!3m2!1sen!2sin!4v1700000000000!5m2!1sen!2sin',
-  googleMapsDirectionsUrl: 'https://maps.google.com/?q=Road+No+36+Jubilee+Hills+Hyderabad',
+  email: 'contact@theglossylooks.com',
+  address: '31, Vinayak Nagar, Gachibowli, Hyderabad, Telangana 500032',
+  googleMapsEmbedUrl: 'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3806.273167195454!2d78.358245!3d17.441221!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3bcb93dc8c12345%3A0x6b82937!2sVinayak+Nagar%2C+Gachibowli%2C+Hyderabad!5e0!3m2!1sen!2sin!4v1700000000000!5m2!1sen!2sin',
+  googleMapsDirectionsUrl: 'https://maps.google.com/?q=31+Vinayak+Nagar+Gachibowli+Hyderabad',
   openingHours: 'Mon - Sun: 9:30 AM – 8:30 PM (All 7 Days Open)',
   currency: '₹',
 };

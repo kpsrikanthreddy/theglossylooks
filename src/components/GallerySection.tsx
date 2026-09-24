@@ -178,7 +178,7 @@ export const GallerySection: React.FC<GallerySectionProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
             {filteredItems.map((item) => {
               const isLiked = likedIds[item.id];
-              const likeCount = item.likes + (isLiked ? 1 : 0);
+              const likeCount = (item.likes ?? 0) + (isLiked ? 1 : 0);
 
               return (
                 <div
@@ -324,7 +324,7 @@ export const GallerySection: React.FC<GallerySectionProps> = ({
 
                   {/* Tags */}
                   <div className="pt-3 flex flex-wrap gap-1.5">
-                    {activeItem.tags.map((tag) => (
+                    {(activeItem.tags || []).map((tag) => (
                       <span
                         key={tag}
                         className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-[#FAF7F5] border border-[#E0D2CE] text-[#695757]"

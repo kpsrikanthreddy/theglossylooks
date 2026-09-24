@@ -38,6 +38,9 @@ export const ServicesMenu: React.FC<ServicesMenuProps> = ({
   ];
 
   const filteredServices = services.filter((srv) => {
+    // Only active/public services should be displayed to customers
+    if (srv.active === false) return false;
+
     const matchesCategory = selectedCategory === 'All' || srv.category === selectedCategory;
     const matchesSearch =
       srv.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
