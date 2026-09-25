@@ -265,6 +265,40 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
                 )}
               </button>
 
+              {/* Demo Credentials Helper */}
+              <div className="p-3 bg-stone-50 border border-stone-200 rounded-xl space-y-2 text-xs">
+                <p className="font-semibold text-stone-700 flex items-center justify-between">
+                  <span>Authorized System Credentials:</span>
+                  <span className="text-[10px] text-stone-400 font-normal">Click to fill</span>
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEmail('superadmin@theglossylooks.com');
+                      setPassword('GlossySuper@2026');
+                    }}
+                    className="p-2 rounded-lg bg-white border border-stone-200 hover:border-[#8C3A42] text-left transition-colors cursor-pointer"
+                  >
+                    <p className="font-bold text-[#8C3A42] text-[11px]">Platform Admin</p>
+                    <p className="text-[10px] text-stone-600 truncate">superadmin@theglossylooks.com</p>
+                    <p className="text-[9px] text-stone-400 font-mono">GlossySuper@2026</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEmail('admin@theglossylooks.com');
+                      setPassword('GlossyAdmin@2026');
+                    }}
+                    className="p-2 rounded-lg bg-white border border-stone-200 hover:border-[#8C3A42] text-left transition-colors cursor-pointer"
+                  >
+                    <p className="font-bold text-[#8C3A42] text-[11px]">Salon Admin</p>
+                    <p className="text-[10px] text-stone-600 truncate">admin@theglossylooks.com</p>
+                    <p className="text-[9px] text-stone-400 font-mono">GlossyAdmin@2026</p>
+                  </button>
+                </div>
+              </div>
+
               {/* Link to Staff Login */}
               <div className="pt-3 border-t border-[#F0E6E3] text-center space-y-2">
                 <p className="text-xs text-[#7A6B6B]">

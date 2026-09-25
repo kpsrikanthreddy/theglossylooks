@@ -116,7 +116,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   // New Service Form State
   const [newServiceName, setNewServiceName] = useState('');
-  const [newServiceCategory, setNewServiceCategory] = useState<SalonService['category']>('Bridal & Makeup');
+  const [newServiceCategory, setNewServiceCategory] = useState<SalonService['category']>('Threading & Waxing');
   const [newServicePrice, setNewServicePrice] = useState<number>(2500);
   const [newServiceDuration, setNewServiceDuration] = useState<number>(60);
   const [newServiceDesc, setNewServiceDesc] = useState('');
@@ -1696,12 +1696,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         onChange={(e) => setNewServiceCategory(e.target.value as SalonService['category'])}
                         className="w-full bg-[#FAF7F5] border border-[#D9C4BE] rounded-xl px-2.5 py-2 text-xs"
                       >
-                        <option value="Bridal & Makeup">Bridal & Makeup</option>
-                        <option value="Hair Styling & Care">Hair Styling & Care</option>
-                        <option value="Skin & Facials">Skin & Facials</option>
-                        <option value="Nails & Feet">Nails & Feet</option>
-                        <option value="Spa & Body">Spa & Body</option>
-                        <option value="Waxing & Threading">Waxing & Threading</option>
+                        <option value="Threading & Waxing">Threading & Waxing</option>
+                        <option value="Skin Care & Facials">Skin Care & Facials</option>
+                        <option value="Body Care & Massage">Body Care & Massage</option>
+                        <option value="Manicure & Pedicure">Manicure & Pedicure</option>
+                        <option value="Hair Cut, Wash & Styling">Hair Cut, Wash & Styling</option>
+                        <option value="Hair Colour">Hair Colour</option>
+                        <option value="Hair Spa & Treatments">Hair Spa & Treatments</option>
+                        <option value="Pre-Bridal Packages">Pre-Bridal Packages</option>
                       </select>
                     </div>
 

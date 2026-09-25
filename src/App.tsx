@@ -228,6 +228,12 @@ export default function App() {
   // Core Data Collections (with localStorage persistence)
   const [services, setServices] = useState<SalonService[]>(() => {
     try {
+      const menuVer = localStorage.getItem('glossy_menu_version');
+      if (menuVer !== 'v2_theglossylooks_pdf') {
+        localStorage.setItem('glossy_services', JSON.stringify(INITIAL_SERVICES));
+        localStorage.setItem('glossy_menu_version', 'v2_theglossylooks_pdf');
+        return INITIAL_SERVICES;
+      }
       const saved = localStorage.getItem('glossy_services');
       return saved ? JSON.parse(saved) : INITIAL_SERVICES;
     } catch {

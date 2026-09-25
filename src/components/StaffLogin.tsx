@@ -166,6 +166,28 @@ export const StaffLogin: React.FC<StaffLoginProps> = ({
               )}
             </button>
 
+            {/* Demo Staff Credentials Helper */}
+            <div className="p-3 bg-stone-50 border border-stone-200 rounded-xl space-y-1.5 text-xs">
+              <p className="font-semibold text-stone-700 flex items-center justify-between">
+                <span>Authorized Staff Account:</span>
+                <span className="text-[10px] text-stone-400 font-normal">Click to fill</span>
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('staff@theglossylooks.com');
+                  setPassword('GlossyStaff@2026');
+                }}
+                className="w-full p-2 rounded-lg bg-white border border-stone-200 hover:border-[#8C3A42] text-left transition-colors cursor-pointer"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-[#8C3A42] text-[11px]">Pooja Stylist (Staff)</span>
+                  <span className="text-[9px] text-stone-400 font-mono">GlossyStaff@2026</span>
+                </div>
+                <p className="text-[10px] text-stone-600">staff@theglossylooks.com</p>
+              </button>
+            </div>
+
             {/* Notice for new staff */}
             <div className="p-3 bg-[#FAF7F5] border border-[#E8DDD8] rounded-xl text-[11px] text-[#7A6B6B] leading-relaxed">
               <span className="font-semibold text-[#2D2424] block mb-0.5">Need a Staff Login?</span>

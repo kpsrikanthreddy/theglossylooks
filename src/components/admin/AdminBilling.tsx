@@ -436,7 +436,7 @@ export const AdminBilling: React.FC<AdminBillingProps> = ({
                     className="flex-1 p-2 rounded-lg border border-stone-300 bg-white"
                   >
                     <option value="">Select Salon Service from Menu...</option>
-                    {services.map(s => (
+                    {services.filter(s => s.active !== false).map(s => (
                       <option key={s.id} value={s.id}>
                         {s.name} — ₹{s.price} ({s.category})
                       </option>

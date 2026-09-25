@@ -285,8 +285,10 @@ app.post('/api/whatsapp/process-due-feedback', async (_req: Request, res: Respon
 /**
  * GET /api/services
  * Returns salon services. If Supabase is connected, pulls from Supabase.
+ * Respects include_archived=true query param, otherwise returns only active services.
  */
-app.get('/api/services', async (_req: Request, res: Response) => {
+app.get('/api/services', async (req: Request, res: Response) => {
+  const includeArchived = req.query.include_archived === 'true' || req.query.all === 'true';
   try {
     const supaServices = await fetchServicesFromSupabase();
     if (supaServices && supaServices.length > 0) {
@@ -294,6 +296,7 @@ app.get('/api/services', async (_req: Request, res: Response) => {
         id: s.id,
         name: s.name,
         category: s.category,
+        serviceGroup: s.service_group || s.serviceGroup,
         price: Number(s.price),
         originalPrice: s.original_price ? Number(s.original_price) : Number(s.price),
         offerPrice: Number(s.price),
@@ -305,12 +308,14 @@ app.get('/api/services', async (_req: Request, res: Response) => {
         active: s.active !== false,
         displayOrder: s.display_order || 1,
       }));
-      return res.json(mapped);
+      const filtered = includeArchived ? mapped : mapped.filter((s: any) => s.active !== false);
+      return res.json(filtered);
     }
   } catch (err) {
     console.warn('[Services Fetch Warning]:', err);
   }
-  return res.json(inMemoryServices);
+  const filteredInMemory = includeArchived ? inMemoryServices : inMemoryServices.filter(s => s.active !== false);
+  return res.json(filteredInMemory);
 });
 
 /**
@@ -555,11 +560,23 @@ function loadUsers(): StoredUser[] {
     console.warn('[Users Store Warning]: Could not read users file, initializing defaults.', err);
   }
 
-  // Seed default admin and staff accounts so the system is initialized and ready
+  // Seed default platform admin, salon admin and staff accounts so the system is initialized and ready
+  const superCred = hashPasswordNode('GlossySuper@2026');
   const adminCred = hashPasswordNode('GlossyAdmin@2026');
   const staffCred = hashPasswordNode('GlossyStaff@2026');
 
   const defaultUsers: StoredUser[] = [
+    {
+      id: 'usr-superadmin-1',
+      name: 'Platform Super Administrator',
+      email: 'superadmin@theglossylooks.com',
+      phone: '+91 98765 00001',
+      role: 'SUPER_ADMIN',
+      passwordHash: superCred.hash,
+      passwordSalt: superCred.salt,
+      active: true,
+      createdAt: new Date().toISOString(),
+    },
     {
       id: 'usr-admin-1',
       name: 'Salon Administrator',

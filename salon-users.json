@@ -1,15 +1,27 @@
 [
   {
+    "id": "usr-superadmin-1",
+    "name": "Platform Super Administrator",
+    "email": "superadmin@theglossylooks.com",
+    "phone": "+91 98765 00001",
+    "role": "SUPER_ADMIN",
+    "passwordHash": "2c11242a694ec90c4ace4181590a06c4f04fd20df49da237c8d3f34c8e9955d2081a1dfde7ade05eec68191cbe48dc20297ffa9c0feb0fc1457a9b8e97662e40",
+    "passwordSalt": "f0acd9fa8d8fcdd72c6c5c62f95580ca",
+    "active": true,
+    "createdAt": "2026-09-24T20:47:43.488Z",
+    "lastLogin": "2026-09-25T07:29:23.330Z"
+  },
+  {
     "id": "usr-admin-1",
     "name": "Salon Administrator",
     "email": "admin@theglossylooks.com",
     "phone": "+91 98765 43210",
     "role": "SALON_ADMIN",
-    "passwordHash": "4e85fbc59ac93939351061dca1866d7ee195c59b73bcc68c3ebf5e2866931284aa613d68282fb742fb8206277411b526f0783371ef0c6c997471cb0b6d8d21c9",
-    "passwordSalt": "7c4351a3e03b0d4cd78f3145101c924f",
+    "passwordHash": "a716522d66857c681b10a0b9d0d0637b04b1d3d2112c084b1577bf02d48759a45074a6e49e0ad80f14ce0c6e8da8b961e2ddb920a96e090cff26d591b6a4e76a",
+    "passwordSalt": "e01e7b4049f7d39814750992feaed31d",
     "active": true,
     "createdAt": "2026-09-24T20:47:43.488Z",
-    "lastLogin": "2026-09-24T20:47:48.878Z"
+    "lastLogin": "2026-09-25T07:29:23.355Z"
   },
   {
     "id": "usr-staff-1",
@@ -17,10 +29,10 @@
     "email": "staff@theglossylooks.com",
     "phone": "+91 98765 11002",
     "role": "SALON_STAFF",
-    "passwordHash": "dd669733f55d2932400ec084b84e33dc27e16f2a14735d6024ba683f0aabb2653cde00bc89b7060bb81f0792f9f9377df3cbb63fadd858e6b81933fb3ae38521",
-    "passwordSalt": "905b159245fe8c2502a708a2b2d7fcd0",
+    "passwordHash": "31fbc15dbc7b189daadccd6bd37d54bbfd0ad2827cb53249a87a1a14b493f197ad971c6724956dd221da7477d49844d7108713460faed907da4eccd2b75aab64",
+    "passwordSalt": "5d40076e6c72e2aa69ae185c52482ca6",
     "active": true,
     "createdAt": "2026-09-24T20:47:43.488Z",
-    "lastLogin": "2026-09-24T20:47:48.901Z"
+    "lastLogin": "2026-09-25T07:29:23.378Z"
   }
 ]

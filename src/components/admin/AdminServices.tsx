@@ -31,12 +31,13 @@ export const AdminServices: React.FC<AdminServicesProps> = ({
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [showArchived, setShowArchived] = useState<boolean>(false);
   const [editingService, setEditingService] = useState<SalonService | null>(null);
   const [isAddingNew, setIsAddingNew] = useState(false);
 
   // Form state
   const [formName, setFormName] = useState('');
-  const [formCategory, setFormCategory] = useState<SalonService['category']>('Bridal & Makeup');
+  const [formCategory, setFormCategory] = useState<SalonService['category']>('Threading & Waxing');
   const [formPrice, setFormPrice] = useState<number>(2500);
   const [formOriginalPrice, setFormOriginalPrice] = useState<number>(3000);
   const [formDuration, setFormDuration] = useState<number>(60);
@@ -47,19 +48,21 @@ export const AdminServices: React.FC<AdminServicesProps> = ({
   const [formTier, setFormTier] = useState<SalonService['tier']>('Classic');
 
   const categories: SalonService['category'][] = [
-    'Bridal & Makeup',
-    'Hair Styling & Care',
-    'Skin & Facials',
-    'Nails & Feet',
-    'Spa & Body',
-    'Waxing & Threading',
+    'Threading & Waxing',
+    'Skin Care & Facials',
+    'Body Care & Massage',
+    'Manicure & Pedicure',
+    'Hair Cut, Wash & Styling',
+    'Hair Colour',
+    'Hair Spa & Treatments',
+    'Pre-Bridal Packages',
   ];
 
   const handleOpenAdd = () => {
     setIsAddingNew(true);
     setEditingService(null);
     setFormName('');
-    setFormCategory('Bridal & Makeup');
+    setFormCategory('Threading & Waxing');
     setFormPrice(2500);
     setFormOriginalPrice(3000);
     setFormDuration(60);
@@ -134,6 +137,7 @@ export const AdminServices: React.FC<AdminServicesProps> = ({
   };
 
   const filteredServices = services.filter(s => {
+    if (!showArchived && s.active === false) return false;
     if (selectedCategory !== 'All' && s.category !== selectedCategory) return false;
     if (searchTerm) {
       const q = searchTerm.toLowerCase();
@@ -142,26 +146,50 @@ export const AdminServices: React.FC<AdminServicesProps> = ({
     return true;
   });
 
+  const activeCount = services.filter(s => s.active !== false).length;
+  const archivedCount = services.filter(s => s.active === false).length;
+
   return (
     <div className="space-y-6">
 
       {/* HEADER */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-serif font-bold text-[#2D2424]">Salon Menu & Services</h2>
-          <p className="text-xs text-stone-500">
-            Manage treatments, durations, pricing tiers, and active status. Changes sync instantly to the public site.
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-serif font-bold text-[#2D2424]">Salon Menu & Services</h2>
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+              PDF Source of Truth Active ({activeCount})
+            </span>
+          </div>
+          <p className="text-xs text-stone-500 mt-1">
+            Displaying only services originating from the 16-page The Glossy Looks PDF menu across the 8 official categories.
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={handleOpenAdd}
-          className="px-4 py-2 rounded-xl bg-[#8C3A42] hover:bg-[#722F36] text-white text-xs font-semibold shadow-sm transition-all flex items-center gap-1.5 cursor-pointer self-start sm:self-auto"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Add New Service</span>
-        </button>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {archivedCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowArchived(!showArchived)}
+              className={`px-3 py-2 rounded-xl text-xs font-medium border transition-all cursor-pointer ${
+                showArchived
+                  ? 'bg-amber-100 text-amber-900 border-amber-300'
+                  : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'
+              }`}
+            >
+              {showArchived ? 'Hide Archived (' + archivedCount + ')' : 'View Archived (' + archivedCount + ')'}
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={handleOpenAdd}
+            className="px-4 py-2 rounded-xl bg-[#8C3A42] hover:bg-[#722F36] text-white text-xs font-semibold shadow-sm transition-all flex items-center gap-1.5 cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Add New Service</span>
+          </button>
+        </div>
       </div>
 
       {/* SEARCH AND CATEGORY FILTER */}
@@ -186,7 +214,7 @@ export const AdminServices: React.FC<AdminServicesProps> = ({
               selectedCategory === 'All' ? 'bg-[#8C3A42] text-white font-semibold' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
             }`}
           >
-            All Categories ({services.length})
+            All Categories ({showArchived ? services.length : activeCount})
           </button>
           {categories.map(cat => (
             <button

@@ -1,7 +1,19 @@
+export type SalonCategory =
+  | 'Threading & Waxing'
+  | 'Skin Care & Facials'
+  | 'Body Care & Massage'
+  | 'Manicure & Pedicure'
+  | 'Hair Cut, Wash & Styling'
+  | 'Hair Colour'
+  | 'Hair Spa & Treatments'
+  | 'Pre-Bridal Packages';
+
 export interface SalonService {
   id: string;
   name: string;
-  category: 'Bridal & Makeup' | 'Hair Styling & Care' | 'Skin & Facials' | 'Nails & Feet' | 'Spa & Body' | 'Waxing & Threading';
+  category: SalonCategory | string;
+  serviceGroup?: string;
+  variantName?: string;
   price: number;
   originalPrice?: number;
   offerPrice?: number;

@@ -22,7 +22,7 @@ export const EnquirySection: React.FC<EnquirySectionProps> = ({ onEnquirySubmitt
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
-  const [serviceOfInterest, setServiceOfInterest] = useState('Bridal & Makeup');
+  const [serviceOfInterest, setServiceOfInterest] = useState('Pre-Bridal Packages');
   const [preferredDate, setPreferredDate] = useState('');
   const [message, setMessage] = useState('');
   const [submitted, setSubmitted] = useState(false);
@@ -206,12 +206,14 @@ Could you please share package details and availability?`;
                         onChange={(e) => setServiceOfInterest(e.target.value)}
                         className="w-full bg-[#FAF7F5] border border-[#D9C4BE] rounded-xl px-3 py-2 text-xs sm:text-sm text-[#2D2424] focus:outline-none focus:ring-1 focus:ring-[#8C3A42]"
                       >
-                        <option value="Bridal & Makeup">Bridal & Makeup Consultation</option>
-                        <option value="Hair Styling & Care">Hair Balayage / Keratin / Botox</option>
-                        <option value="Skin & Facials">24K Gold / Hydra Facial</option>
-                        <option value="Nails & Feet">Chrome / Gel Nail Extensions</option>
-                        <option value="Spa & Body">Full Body Aromatherapy Spa</option>
-                        <option value="Other Query">Other Custom Request</option>
+                        <option value="Pre-Bridal Packages">Pre-Bridal & Bridal Packages</option>
+                        <option value="Hair Spa & Treatments">Keratin / Hair Botox / Hair Spa</option>
+                        <option value="Hair Colour">Global Hair Colour & Balayage</option>
+                        <option value="Skin Care & Facials">Hydra Facial & 24K Gold Facial</option>
+                        <option value="Body Care & Massage">Body Polishing & Massage Therapy</option>
+                        <option value="Manicure & Pedicure">Spa Manicure & Pedicure</option>
+                        <option value="Threading & Waxing">Rica Waxing & Full Face Threading</option>
+                        <option value="Hair Cut, Wash & Styling">Haircut, Wash & Blow Dry Styling</option>
                       </select>
                     </div>
 
