@@ -1,0 +1,8 @@
+{
+  "name": "Remix The Glossy Looks - Salon \u0026 Management System",
+  "description": "Luxury women\u0027s beauty salon in Gachibowli, Hyderabad. Online service booking, bridal makeup studio, and complete salon operations management with POS billing and auto-printing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
