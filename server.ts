@@ -108,6 +108,84 @@ app.use((req, _res, next) => {
   next();
 });
 
+
+// SMAV sale event signature. The sender signs `${timestamp}.${raw JSON body}`.
+function verifySmavSaleEvent(req: express.Request): boolean {
+  const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
+  const ts = String(req.headers['x-smav-timestamp'] || '');
+  const supplied = String(req.headers['x-smav-signature'] || '');
+  if (secret.length < 32 || !/^\d{10}$/.test(ts) || !/^[a-f0-9]{64}$/i.test(supplied)) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const raw = (req as any).rawBody;
+  if (!raw) return false;
+  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${Buffer.isBuffer(raw) ? raw.toString('utf8') : raw}`).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(supplied, 'hex'), Buffer.from(expected, 'hex'));
+}
+
+
+// SMAV signed server-to-server sale notification receiver. Never expose this to the browser.
+app.post('/api/integrations/smav/sale-event', async (req, res) => {
+  if (!verifySmavSaleEvent(req)) return res.status(401).json({error:'Invalid SMAV signature'});
+  const e = req.body || {};
+  if (!/^[0-9a-f-]{36}$/i.test(String(e.event_id || '')) || !['salon'].includes(e.source_type) || !['receipt','feedback'].includes(e.event_type))
+    return res.status(400).json({error:'Invalid SMAV event'});
+  const configuredOutlet = (process.env.SMAV_SALON_OUTLET_ID || '').trim();
+  if (!configuredOutlet || e.outlet_id !== configuredOutlet) return res.status(403).json({error:'Outlet not allowed'});
+  const p = e.payload || {};
+  const key = String(e.source_key || '');
+  if (!key || key.length > 200 || !String(p.bill_number || '').trim()) return res.status(400).json({error:'Missing bill reference'});
+  const {createClient} = await import('@supabase/supabase-js');
+  const url = process.env.SUPABASE_URL, serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) return res.status(503).json({error:'Persistent event database unavailable'});
+  const db = createClient(url,serviceKey,{auth:{persistSession:false}});
+  const {data:old,error:oldError} = await db.from('smav_inbound_sales').select('*').eq('source_key',key).maybeSingle();
+  if (oldError) return res.status(503).json({error:oldError.message});
+  if (e.event_type === 'feedback' && !old?.native_order_id) return res.status(409).json({error:'Receipt must reconcile before feedback'});
+  if (e.event_type === 'receipt' && !old) {
+    const branchMap: Record<string,string> = JSON.parse(process.env.SMAV_SALON_BRANCH_MAP_JSON || '{}');
+    const branchCode = String(p.branch_code || p.branchCode || '').toUpperCase();
+    const branchId = branchMap[branchCode] || process.env.SMAV_SALON_DEFAULT_BRANCH_ID;
+    if (!branchId) return res.status(422).json({error:'Branch mapping missing'});
+    const items = Array.isArray(p.items) ? p.items : [];
+    if (!items.length || !p.customer_phone || !p.customer_name) return res.status(422).json({error:'Customer and items required'});
+    // Reserve the source key before native creation. A crashed reservation is recoverable by operator.
+    const {error:reserveError} = await db.from('smav_inbound_sales').insert({source_key:key,outlet_id:e.outlet_id,bill_number:String(p.bill_number),branch_id:branchId,status:'reserved'});
+    if (reserveError) return res.status(409).json({error:'Sale already being reconciled; retry later'});
+    try {
+      const total = Number(p.grand_total || 0);
+      const nativeItems = items.map((i:any)=>({item_name:String(i.item_name || i.itemName || i.serviceName || i.name || 'Service'),item_type:'service' as const,quantity:Number(i.quantity || 1),unit_price:Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0),total_price:Number(i.total_price ?? i.totalPrice ?? (Number(i.quantity || 1)*Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0))),staff_name:String(i.staff_name || i.stylistName || 'Station Stylist')}));
+      const native = await salonRepository.createOrder({branch_id:branchId,idempotency_key:key,customer_name:String(p.customer_name),customer_phone:String(p.customer_phone),items:nativeItems,subtotal:total,discount:0,tax_percent:0,tax_amount:0,tip_amount:0,grand_total:total,paid_amount:total,due_amount:0,payment_status:'Paid',primary_payment_mode:(p.payment_mode || 'UPI'),cashier_name:'SMAV POS',notes:`SMAV source bill ${p.bill_number}`,whatsapp_status:'pending',receipt_whatsapp_status:'pending',feedback_whatsapp_status:'scheduled'},'SMAV POS');
+      const {error:saveError} = await db.from('smav_inbound_sales').update({native_order_id:native.id,status:'recorded'}).eq('source_key',key);
+      if(saveError) throw new Error(saveError.message);
+    } catch(err:any) {
+      await db.from('smav_inbound_sales').update({status:'needs_reconciliation',last_error:String(err.message || err)}).eq('source_key',key);
+      return res.status(503).json({error:'Native order reconciliation requires review; no automatic replay'});
+    }
+  }
+  const {data:record,error:recordError} = await db.from('smav_inbound_sales').select('*').eq('source_key',key).single();
+  if (recordError || !record?.native_order_id) return res.status(503).json({error:'Sale not reconciled'});
+  const doneColumn = e.event_type === 'receipt' ? 'receipt_sent_at' : 'feedback_sent_at';
+  if(record[doneColumn]) return res.json({accepted:true,duplicate:true,native_order_id:record.native_order_id});
+  // Acquire an event-specific database claim. Retry on network errors only after checking delivery logs.
+  const {data:claimed,error:claimError} = await db.rpc('smav_claim_inbound_event',{p_source_key:key,p_event_type:e.event_type,p_event_id:e.event_id});
+  if(claimError) return res.status(503).json({error:claimError.message});
+  if(!claimed) return res.status(409).json({error:'Notification in progress or requires reconciliation'});
+  try {
+    const native = await salonRepository.getOrderById(record.native_order_id);
+    if (!native) throw new Error('Native order not found');
+    const branch = await salonRepository.getBranchById(record.branch_id);
+    const receipt = e.event_type === 'receipt';
+    const result = await sendBranchWhatsAppTemplate({branchId:record.branch_id,recipientPhone:native.customer_phone,orderId:native.id,jobType:receipt?'bill_receipt':'customer_feedback',templateName:receipt?'gl_bill_receipt':'glossylooks_customer_feedback',customData:{customerName:native.customer_name,billNumber:String(p.bill_number),billDate:new Date(p.billed_at || Date.now()).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),itemsSummary:native.items.map((i:any)=>`${i.item_name} (x${i.quantity})`).join(', '),grandTotal:String(native.grand_total),paymentMode:native.primary_payment_mode,branchName:branch?.name || 'The Glossy Looks'}});
+    if (!result.sent) throw new Error(result.error || 'WhatsApp not accepted by Meta');
+    await db.from('smav_inbound_sales').update({[doneColumn]:new Date().toISOString()}).eq('source_key',key);
+    await salonRepository.updateOrder(native.id,receipt?{receipt_whatsapp_status:'sent',receipt_whatsapp_message_id:result.messageId,receipt_whatsapp_sent_at:new Date().toISOString()}:{feedback_whatsapp_status:'sent',feedback_whatsapp_message_id:result.messageId,feedback_whatsapp_sent_at:new Date().toISOString()});
+    return res.json({accepted:true,native_order_id:native.id});
+  }catch(err:any){
+    await db.from('smav_inbound_sales').update({last_error:String(err.message || err).slice(0,500)}).eq('source_key',key);
+    return res.status(503).json({error:'WhatsApp dispatch failed; inspect message logs before retry'});
+  }
+});
+
 // Root API index
 app.get(['/api', '/api/'], (req, res) => {
   res.json({
