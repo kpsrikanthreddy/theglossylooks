@@ -112,21 +112,44 @@ app.use((req, _res, next) => {
 // SMAV sale event signature. The sender signs `${timestamp}.${raw JSON body}`.
 function verifySmavSaleEvent(req: express.Request): boolean {
   const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
-  const ts = String(req.headers['x-smav-timestamp'] || '');
-  const supplied = String(req.headers['x-smav-signature'] || '');
+  const ts = String(req.headers['x-smav-timestamp'] || '').trim();
+  const supplied = String(req.headers['x-smav-signature'] || '').trim();
   if (secret.length < 32 || !/^\d{10}$/.test(ts) || !/^[a-f0-9]{64}$/i.test(supplied)) return false;
   if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
-  const raw = (req as any).rawBody;
-  if (!raw) return false;
-  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${Buffer.isBuffer(raw) ? raw.toString('utf8') : raw}`).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(supplied, 'hex'), Buffer.from(expected, 'hex'));
+  const raw = (req as express.Request & { rawBody?: Buffer | string }).rawBody;
+  let rawText: string | null = null;
+  if (Buffer.isBuffer(raw)) {
+    rawText = raw.toString('utf8');
+  } else if (typeof raw === 'string') {
+    rawText = raw;
+  } else if (Buffer.isBuffer(req.body)) {
+    rawText = req.body.toString('utf8');
+  } else if (typeof req.body === 'string') {
+    rawText = req.body;
+  } else if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+    try {
+      rawText = JSON.stringify(req.body);
+    } catch {
+      rawText = null;
+    }
+  }
+  if (!rawText) return false;
+  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${rawText}`).digest('hex');
+  const suppliedBuf = Buffer.from(supplied, 'hex');
+  const expectedBuf = Buffer.from(expected, 'hex');
+  return suppliedBuf.length === expectedBuf.length && crypto.timingSafeEqual(suppliedBuf, expectedBuf);
 }
 
 
 // SMAV signed server-to-server sale notification receiver. Never expose this to the browser.
 app.post('/api/integrations/smav/sale-event', async (req, res) => {
   if (!verifySmavSaleEvent(req)) return res.status(401).json({error:'Invalid SMAV signature'});
-  const e = req.body || {};
+  let e: any = req.body || {};
+  if (typeof e === 'string') {
+    try { e = JSON.parse(e); } catch { e = {}; }
+  } else if (Buffer.isBuffer(e)) {
+    try { e = JSON.parse(e.toString('utf8')); } catch { e = {}; }
+  }
   if (!/^[0-9a-f-]{36}$/i.test(String(e.event_id || '')) || !['salon'].includes(e.source_type) || !['receipt','feedback'].includes(e.event_type))
     return res.status(400).json({error:'Invalid SMAV event'});
   const configuredOutlet = (process.env.SMAV_SALON_OUTLET_ID || '').trim();
@@ -142,7 +165,13 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
   if (oldError) return res.status(503).json({error:oldError.message});
   if (e.event_type === 'feedback' && !old?.native_order_id) return res.status(409).json({error:'Receipt must reconcile before feedback'});
   if (e.event_type === 'receipt' && !old) {
-    const branchMap: Record<string,string> = JSON.parse(process.env.SMAV_SALON_BRANCH_MAP_JSON || '{}');
+    let branchMap: Record<string,string> = {};
+    try {
+      const rawMap = (process.env.SMAV_SALON_BRANCH_MAP_JSON || '').trim();
+      if (rawMap) branchMap = JSON.parse(rawMap);
+    } catch {
+      branchMap = {};
+    }
     const branchCode = String(p.branch_code || p.branchCode || '').toUpperCase();
     const branchId = branchMap[branchCode] || process.env.SMAV_SALON_DEFAULT_BRANCH_ID;
     if (!branchId) return res.status(422).json({error:'Branch mapping missing'});
@@ -154,7 +183,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     try {
       const total = Number(p.grand_total || 0);
       const nativeItems = items.map((i:any)=>({item_name:String(i.item_name || i.itemName || i.serviceName || i.name || 'Service'),item_type:'service' as const,quantity:Number(i.quantity || 1),unit_price:Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0),total_price:Number(i.total_price ?? i.totalPrice ?? (Number(i.quantity || 1)*Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0))),staff_name:String(i.staff_name || i.stylistName || 'Station Stylist')}));
-      const native = await salonRepository.createOrder({branch_id:branchId,idempotency_key:key,customer_name:String(p.customer_name),customer_phone:String(p.customer_phone),items:nativeItems,subtotal:total,discount:0,tax_percent:0,tax_amount:0,tip_amount:0,grand_total:total,paid_amount:total,due_amount:0,payment_status:'Paid',primary_payment_mode:(p.payment_mode || 'UPI'),cashier_name:'SMAV POS',notes:`SMAV source bill ${p.bill_number}`,whatsapp_status:'pending',receipt_whatsapp_status:'pending',feedback_whatsapp_status:'scheduled'},'SMAV POS');
+      const native = await salonRepository.createOrder({branch_id:branchId,idempotency_key:key,customer_name:String(p.customer_name),customer_phone:String(p.customer_phone),items:nativeItems,subtotal:total,discount:0,tax_percent:0,tax_amount:0,tip_amount:0,grand_total:total,paid_amount:total,due_amount:0,payment_status:'Paid',primary_payment_mode:(p.payment_mode || 'UPI'),cashier_name:'SMAV POS',notes:`SMAV source bill ${p.bill_number}`,whatsapp_status:'queued',receipt_whatsapp_status:'queued',feedback_whatsapp_status:'scheduled'},'SMAV POS');
       const {error:saveError} = await db.from('smav_inbound_sales').update({native_order_id:native.id,status:'recorded'}).eq('source_key',key);
       if(saveError) throw new Error(saveError.message);
     } catch(err:any) {
