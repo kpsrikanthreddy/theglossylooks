@@ -40,7 +40,8 @@ import {
   Wifi,
   ShieldCheck,
   CheckCircle,
-  Trash2
+  Trash2,
+  Loader2
 } from 'lucide-react';
 import {
   WhatsAppConversation,
@@ -51,6 +52,9 @@ import {
   AdminUser
 } from '../../../types/salon';
 import { api } from '../../../lib/api';
+import { useToast, getSafeErrorMessage } from '../../common/ToastProvider';
+import { ActionButton } from '../../common/ActionButton';
+import { useAsyncAction } from '../../../hooks/useAsyncAction';
 
 interface WhatsAppInboxProps {
   currentUser: AdminUser;
@@ -66,6 +70,17 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
   // Access control check (defense in depth)
   const isAuthorized = currentUser.role === 'owner' || currentUser.role === 'manager';
 
+  const toast = useToast();
+
+  // Reusable async action controllers with synchronous duplicate-click locks
+  const sendMessageAction = useAsyncAction();
+  const sendTemplateAction = useAsyncAction();
+  const toggleStatusAction = useAsyncAction();
+  const deleteConversationAction = useAsyncAction();
+  const loadOlderAction = useAsyncAction();
+  const diagnosticsAction = useAsyncAction();
+  const refreshInboxAction = useAsyncAction();
+
   // State
   const [conversations, setConversations] = useState<WhatsAppConversation[]>([]);
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
@@ -75,7 +90,6 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<WhatsAppInboxFilter>('all');
   const [messageInput, setMessageInput] = useState('');
-  const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
   // Linked Customer CRM State
@@ -88,7 +102,7 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
   const [selectedTemplateName, setSelectedTemplateName] = useState('');
   const [templateCustomName, setTemplateCustomName] = useState('');
   const [templateService, setTemplateService] = useState('Hair & Bridal Styling');
-  const [isSendingTemplate, setIsSendingTemplate] = useState(false);
+  const [templateModalError, setTemplateModalError] = useState<string | null>(null);
 
   // Mobile View state (toggle between list and chat on small screens)
   const [isMobileChatOpen, setIsMobileChatOpen] = useState(false);
@@ -98,7 +112,6 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
 
   // Active conversation caching so chat window NEVER collapses during polling or re-indexing
   const [currentActiveConversation, setCurrentActiveConversation] = useState<WhatsAppConversation | null>(null);
-  const [isDeletingConversation, setIsDeletingConversation] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
 
   // Selected conversation object with fallback to currentActiveConversation
@@ -128,35 +141,48 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
 
   // Pagination State
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
-  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
 
   // Webhook & Database Diagnostics State
   const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState(false);
   const [diagnosticsData, setDiagnosticsData] = useState<WhatsAppInboxDiagnostics | null>(null);
-  const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState(false);
   const [hasCopiedWebhookUrl, setHasCopiedWebhookUrl] = useState(false);
 
-  const fetchDiagnostics = async () => {
-    setIsLoadingDiagnostics(true);
-    try {
-      const diag = await api.getWhatsAppInboxDiagnostics();
-      setDiagnosticsData(diag);
-    } catch (err: any) {
-      console.warn('Failed to fetch webhook diagnostics:', err.message);
-    } finally {
-      setIsLoadingDiagnostics(false);
-    }
+  const fetchDiagnostics = async (notifySuccess = false) => {
+    await diagnosticsAction.run(
+      async () => {
+        const diag = await api.getWhatsAppInboxDiagnostics();
+        setDiagnosticsData(diag);
+        return diag;
+      },
+      {
+        successMessage: notifySuccess ? 'Diagnostics refreshed' : undefined,
+        errorFallback: 'Failed to load webhook diagnostics.'
+      }
+    );
   };
 
   const handleCopyWebhookUrl = () => {
     const url = diagnosticsData?.meta_webhook_callback_url || 'https://www.glossylooks.in/api/whatsapp/webhook';
     navigator.clipboard?.writeText(url);
     setHasCopiedWebhookUrl(true);
+    toast.info('Webhook URL copied to clipboard');
     setTimeout(() => setHasCopiedWebhookUrl(false), 2500);
   };
 
+  const handleManualRefreshConversations = async () => {
+    await refreshInboxAction.run(
+      async () => {
+        await fetchConversations(false, true);
+      },
+      {
+        successMessage: 'Inbox refreshed',
+        errorFallback: 'Failed to refresh conversations.'
+      }
+    );
+  };
+
   // 1. Fetch Conversations from Supabase
-  const fetchConversations = async (silent = false) => {
+  const fetchConversations = async (silent = false, throwOnError = false) => {
     if (!silent) setIsLoadingConversations(true);
     try {
       const data = await api.getWhatsAppConversations('all', searchQuery);
@@ -189,6 +215,7 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
       }
     } catch (err: any) {
       console.warn('Failed to load conversations:', err.message);
+      if (throwOnError) throw err;
     } finally {
       if (!silent) setIsLoadingConversations(false);
     }
@@ -260,25 +287,27 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
 
   // 2b. Load older messages (pagination)
   const handleLoadOlderMessages = async () => {
-    if (!selectedConvId || isLoadingOlder || messages.length === 0) return;
-    setIsLoadingOlder(true);
-    try {
-      const oldestTimestamp = messages[0].created_at;
-      const res = await api.getWhatsAppMessages(selectedConvId, 50, oldestTimestamp);
-      const olderList: WhatsAppMessage[] = Array.isArray(res) ? res : (res?.messages || []);
-      if (olderList.length > 0) {
-        setMessages(prev => {
-          const existingIds = new Set(prev.map(m => m.id));
-          const uniqueOlder = olderList.filter(m => !existingIds.has(m.id));
-          return [...uniqueOlder, ...prev];
-        });
+    const targetConvId = activeConversation?.id || selectedConvId;
+    if (!targetConvId || messages.length === 0) return;
+
+    await loadOlderAction.run(
+      async () => {
+        const oldestTimestamp = messages[0].created_at;
+        const res = await api.getWhatsAppMessages(targetConvId, 50, oldestTimestamp);
+        const olderList: WhatsAppMessage[] = Array.isArray(res) ? res : (res?.messages || []);
+        if (olderList.length > 0) {
+          setMessages(prev => {
+            const existingIds = new Set(prev.map(m => m.id));
+            const uniqueOlder = olderList.filter(m => !existingIds.has(m.id));
+            return [...uniqueOlder, ...prev];
+          });
+        }
+        setHasMoreMessages(Boolean((res as any)?.has_more && olderList.length >= 50));
+      },
+      {
+        errorFallback: 'Failed to load older messages.'
       }
-      setHasMoreMessages(Boolean((res as any)?.has_more && olderList.length >= 50));
-    } catch (err: any) {
-      console.warn('Failed to load older messages:', err.message);
-    } finally {
-      setIsLoadingOlder(false);
-    }
+    );
   };
 
   // 3. Load available WhatsApp templates
@@ -404,118 +433,172 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
   // 5. Send Manual Message
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedConvId || !messageInput.trim() || isSending) return;
+    const targetConvId = activeConversation?.id || selectedConvId;
+    if (!targetConvId || !messageInput.trim()) return;
 
     const textToSend = messageInput.trim();
-    setMessageInput('');
-    setIsSending(true);
-    setSendError(null);
-
-    // Optimistic message representation
     const tempId = `temp-${Date.now()}`;
-    const optimisticMsg: WhatsAppMessage = {
-      id: tempId,
-      salon_id: activeConversation?.salon_id || 'tgl-gachibowli-main',
-      conversation_id: selectedConvId,
-      direction: 'OUTBOUND',
-      message_type: 'text',
-      text_body: textToSend,
-      status: 'sending',
-      created_at: new Date().toISOString()
-    };
-    setMessages(prev => [...prev, optimisticMsg]);
 
-    try {
-      const res = await api.sendWhatsAppManualMessage(selectedConvId, textToSend);
-      // Replace optimistic message with actual message
-      setMessages(prev => prev.map(m => (m.id === tempId ? res.message : m)));
-      if (res.conversation) {
-        setCurrentActiveConversation(res.conversation);
-        setConversations(prev =>
-          prev.map(c => (c.id === selectedConvId || c.id === res.conversation?.id ? { ...c, ...res.conversation } : c))
-        );
+    await sendMessageAction.run(
+      async () => {
+        setMessageInput('');
+        setSendError(null);
+
+        const optimisticMsg: WhatsAppMessage = {
+          id: tempId,
+          salon_id: activeConversation?.salon_id || 'tgl-gachibowli-main',
+          conversation_id: targetConvId,
+          direction: 'OUTBOUND',
+          message_type: 'text',
+          text_body: textToSend,
+          status: 'sending',
+          created_at: new Date().toISOString()
+        };
+        setMessages(prev => [...prev, optimisticMsg]);
+
+        const res = await api.sendWhatsAppManualMessage(targetConvId, textToSend);
+        if (!res || (res as any).success === false) {
+          throw new Error((res as any)?.error || 'Failed to submit WhatsApp message.');
+        }
+
+        // Replace optimistic message with actual message
+        if (res.message) {
+          setMessages(prev => prev.map(m => (m.id === tempId ? res.message : m)));
+        }
+        if (res.conversation) {
+          setCurrentActiveConversation(res.conversation);
+          setConversations(prev =>
+            prev.map(c => (c.id === targetConvId || c.id === res.conversation?.id ? { ...c, ...res.conversation } : c))
+          );
+        }
+        return res;
+      },
+      {
+        successMessage: 'WhatsApp message submitted successfully',
+        errorFallback: 'Failed to submit WhatsApp message. Please try again.',
+        onError: (msg) => {
+          setSendError(msg);
+          setMessageInput(prev => prev || textToSend);
+          setMessages(prev =>
+            prev.map(m => (m.id === tempId ? { ...m, status: 'failed', error_message: msg } : m))
+          );
+        }
       }
-    } catch (err: any) {
-      setSendError(err.message || 'Failed to deliver message via WhatsApp.');
-      // Mark optimistic message as failed
-      setMessages(prev =>
-        prev.map(m => (m.id === tempId ? { ...m, status: 'failed', error_message: err.message } : m))
-      );
-    } finally {
-      setIsSending(false);
-    }
+    );
   };
 
   // 6. Send Approved Template
   const handleSendTemplate = async () => {
-    if (!selectedConvId || !selectedTemplateName || isSendingTemplate) return;
+    const targetConvId = activeConversation?.id || selectedConvId;
+    if (!targetConvId) {
+      const msg = 'No active conversation selected.';
+      setTemplateModalError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!selectedTemplateName) {
+      const msg = 'Please select an approved WhatsApp template.';
+      setTemplateModalError(msg);
+      toast.warning(msg);
+      return;
+    }
 
-    setIsSendingTemplate(true);
+    setTemplateModalError(null);
     setSendError(null);
 
-    try {
-      const customerName = templateCustomName || activeConversation?.customer_name || 'Valued Client';
-      const res = await api.sendWhatsAppTemplateMessage(selectedConvId, {
-        template_name: selectedTemplateName,
-        parameters: {
-          customerName,
-          service: templateService
-        },
-        custom_body_text: `[Approved Template: ${selectedTemplateName}] Sent to ${customerName}`
-      });
+    await sendTemplateAction.run(
+      async () => {
+        const customerName = templateCustomName.trim() || activeConversation?.customer_name || 'Valued Client';
+        const res = await api.sendWhatsAppTemplateMessage(targetConvId, {
+          template_name: selectedTemplateName,
+          parameters: {
+            customerName,
+            service: templateService
+          },
+          custom_body_text: `[Approved Template: ${selectedTemplateName}] Sent to ${customerName}`
+        });
 
-      setMessages(prev => [...prev, res.message]);
-      if (res.conversation) {
-        setCurrentActiveConversation(res.conversation);
-        setConversations(prev =>
-          prev.map(c => (c.id === selectedConvId || c.id === res.conversation?.id ? { ...c, ...res.conversation } : c))
-        );
+        if (!res || (res as any).success === false) {
+          throw new Error((res as any)?.error || 'Failed to submit WhatsApp template.');
+        }
+
+        if (res.message) {
+          setMessages(prev => {
+            if (prev.some(m => m.id === res.message.id || (m.meta_message_id && m.meta_message_id === res.message.meta_message_id))) {
+              return prev;
+            }
+            return [...prev, res.message];
+          });
+        }
+        if (res.conversation) {
+          setCurrentActiveConversation(res.conversation);
+          setConversations(prev =>
+            prev.map(c => (c.id === targetConvId || c.id === res.conversation?.id ? { ...c, ...res.conversation } : c))
+          );
+        }
+
+        // Close modal only after confirmed API submission; toast remains visible
+        setTemplateModalError(null);
+        setIsTemplateModalOpen(false);
+        return res;
+      },
+      {
+        successMessage: 'WhatsApp template submitted successfully',
+        errorFallback: 'Failed to submit WhatsApp template. Please check template configuration and try again.',
+        onError: (msg) => {
+          // Keep modal open and preserve entered values on failure
+          setTemplateModalError(msg);
+        }
       }
-      setIsTemplateModalOpen(false);
-    } catch (err: any) {
-      setSendError(err.message || 'Failed to dispatch WhatsApp template.');
-    } finally {
-      setIsSendingTemplate(false);
-    }
+    );
   };
 
   // 7. Toggle Conversation Status (OPEN/CLOSED)
   const handleToggleStatus = async () => {
-    if (!selectedConvId || !activeConversation) return;
+    const targetConvId = activeConversation?.id || selectedConvId;
+    if (!targetConvId || !activeConversation) return;
     const newStatus = activeConversation.status === 'OPEN' ? 'CLOSED' : 'OPEN';
-    try {
-      const res = await api.updateWhatsAppConversationStatus(selectedConvId, { status: newStatus });
-      setCurrentActiveConversation(prev => (prev ? { ...prev, status: newStatus } : null));
-      setConversations(prev =>
-        prev.map(c => (c.id === selectedConvId ? { ...c, status: newStatus } : c))
-      );
-    } catch (err: any) {
-      console.warn('Failed to update conversation status:', err.message);
-    }
+
+    await toggleStatusAction.run(
+      async () => {
+        await api.updateWhatsAppConversationStatus(targetConvId, { status: newStatus });
+        setCurrentActiveConversation(prev => (prev ? { ...prev, status: newStatus } : null));
+        setConversations(prev =>
+          prev.map(c => (c.id === targetConvId ? { ...c, status: newStatus } : c))
+        );
+      },
+      {
+        successMessage: newStatus === 'CLOSED' ? 'Conversation closed' : 'Conversation reopened',
+        errorFallback: 'Failed to update conversation status.'
+      }
+    );
   };
 
   // 7b. Owner-only Delete Conversation (Permanent Supabase Deletion)
   const handleDeleteConversation = async () => {
-    if (!activeConversation || isDeletingConversation) return;
-    setIsDeletingConversation(true);
-    try {
-      await api.deleteWhatsAppConversation(activeConversation.id);
-      const targetId = activeConversation.id;
-      const targetPhone10 = (activeConversation.customer_phone || '').replace(/\D/g, '').slice(-10);
+    if (!activeConversation) return;
 
-      setConversations(prev => prev.filter(
-        c => c.id !== targetId && (c.customer_phone || '').replace(/\D/g, '').slice(-10) !== targetPhone10
-      ));
-      setSelectedConvId(null);
-      setCurrentActiveConversation(null);
-      setMessages([]);
-      setIsMobileChatOpen(false);
-      setIsDeleteConfirmOpen(false);
-    } catch (err: any) {
-      setSendError(err.message || 'Failed to delete conversation.');
-    } finally {
-      setIsDeletingConversation(false);
-    }
+    await deleteConversationAction.run(
+      async () => {
+        const targetId = activeConversation.id;
+        const targetPhone10 = (activeConversation.customer_phone || '').replace(/\D/g, '').slice(-10);
+        await api.deleteWhatsAppConversation(targetId);
+
+        setConversations(prev => prev.filter(
+          c => c.id !== targetId && (c.customer_phone || '').replace(/\D/g, '').slice(-10) !== targetPhone10
+        ));
+        setSelectedConvId(null);
+        setCurrentActiveConversation(null);
+        setMessages([]);
+        setIsMobileChatOpen(false);
+        setIsDeleteConfirmOpen(false);
+      },
+      {
+        successMessage: 'Conversation deleted permanently',
+        errorFallback: 'Failed to delete conversation.',
+        onError: (msg) => setSendError(msg)
+      }
+    );
   };
 
   // Format timestamp
@@ -618,11 +701,12 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                   <span className="hidden sm:inline text-[10px] text-emerald-800 font-semibold">Diagnostics</span>
                 </button>
                 <button
-                  onClick={() => fetchConversations()}
-                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors border border-slate-200"
+                  onClick={handleManualRefreshConversations}
+                  disabled={refreshInboxAction.isLoading || isLoadingConversations}
+                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors border border-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   title="Refresh Conversations"
                 >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingConversations ? 'animate-spin' : ''}`} />
+                  <RefreshCw className={`w-3.5 h-3.5 ${refreshInboxAction.isLoading || isLoadingConversations ? 'animate-spin' : ''}`} />
                 </button>
               </div>
             </div>
@@ -712,13 +796,15 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                   <MessageSquare className="w-8 h-8 mx-auto mb-2 text-slate-300" />
                   <p className="font-semibold text-slate-600">No conversations found</p>
                   <p className="text-[11px] mt-1">Customer WhatsApp inquiries will automatically appear here.</p>
-                  <button
-                    onClick={() => fetchConversations()}
+                  <ActionButton
+                    onClick={handleManualRefreshConversations}
+                    loading={refreshInboxAction.isLoading}
+                    loadingText="Refreshing..."
+                    icon={<RefreshCw className="w-3 h-3 text-[#5B132B]" />}
                     className="mt-3 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors inline-flex items-center gap-1.5"
                   >
-                    <RefreshCw className="w-3 h-3 text-[#5B132B]" />
                     Refresh Inbox
-                  </button>
+                  </ActionButton>
                 </div>
               )
             ) : (
@@ -882,16 +968,18 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                     <span>CRM Panel</span>
                   </button>
 
-                  <button
+                  <ActionButton
                     onClick={handleToggleStatus}
+                    loading={toggleStatusAction.isLoading}
+                    loadingText="Updating..."
+                    icon={<Archive className="w-3.5 h-3.5" />}
                     className="px-2.5 py-1.5 text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-lg transition-colors flex items-center gap-1"
                     title={activeConversation.status === 'OPEN' ? 'Close Conversation' : 'Reopen Conversation'}
                   >
-                    <Archive className="w-3.5 h-3.5" />
                     <span className="hidden sm:inline">
                       {activeConversation.status === 'OPEN' ? 'Close' : 'Reopen'}
                     </span>
-                  </button>
+                  </ActionButton>
 
                   {currentUser.role === 'owner' && (
                     <button
@@ -913,20 +1001,14 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                     {/* Load Older Messages Pagination Header */}
                     {hasMoreMessages && (
                       <div className="flex justify-center pb-2">
-                        <button
+                        <ActionButton
                           onClick={handleLoadOlderMessages}
-                          disabled={isLoadingOlder}
+                          loading={loadOlderAction.isLoading}
+                          loadingText="Loading older messages..."
                           className="text-[11px] font-semibold text-[#5B132B] hover:text-[#3B0C1C] bg-white border border-slate-200 px-3.5 py-1.5 rounded-full shadow-2xs hover:bg-slate-50 transition-colors flex items-center gap-1.5"
                         >
-                          {isLoadingOlder ? (
-                            <>
-                              <RefreshCw className="w-3 h-3 animate-spin text-[#5B132B]" />
-                              <span>Loading older messages...</span>
-                            </>
-                          ) : (
-                            <span>Load older messages</span>
-                          )}
-                        </button>
+                          <span>Load older messages</span>
+                        </ActionButton>
                       </div>
                     )}
 
@@ -1080,7 +1162,7 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                         type="text"
                         value={messageInput}
                         onChange={e => setMessageInput(e.target.value)}
-                        disabled={!isWindowOpen || isSending}
+                        disabled={!isWindowOpen || sendMessageAction.isLoading}
                         placeholder={
                           isWindowOpen
                             ? 'Type your WhatsApp reply...'
@@ -1094,18 +1176,23 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                       />
 
                       {isWindowOpen ? (
-                        <button
+                        <ActionButton
                           type="submit"
-                          disabled={!messageInput.trim() || isSending}
-                          className="px-4 py-2.5 bg-[#5B132B] hover:bg-[#430D1F] text-white font-bold rounded-xl text-xs transition-colors shadow-md disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0"
+                          loading={sendMessageAction.isLoading}
+                          loadingText="Sending..."
+                          disabled={!messageInput.trim()}
+                          icon={<Send className="w-3.5 h-3.5" />}
+                          className="px-4 py-2.5 bg-[#5B132B] hover:bg-[#430D1F] text-white font-bold rounded-xl text-xs transition-colors shadow-md flex items-center gap-1.5 shrink-0"
                         >
-                          <Send className="w-3.5 h-3.5" />
                           <span className="hidden sm:inline">Send</span>
-                        </button>
+                        </ActionButton>
                       ) : (
                         <button
                           type="button"
-                          onClick={() => setIsTemplateModalOpen(true)}
+                          onClick={() => {
+                            setTemplateModalError(null);
+                            setIsTemplateModalOpen(true);
+                          }}
                           className="px-4 py-2.5 bg-gradient-to-r from-[#D4AF37] to-[#B38F24] hover:brightness-105 text-[#120B0F] font-bold rounded-xl text-xs transition-all shadow-md flex items-center gap-1.5 shrink-0"
                         >
                           <Sparkles className="w-3.5 h-3.5" />
@@ -1248,8 +1335,13 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-200 text-slate-800 relative">
             <button
-              onClick={() => setIsTemplateModalOpen(false)}
-              className="absolute right-4 top-4 p-1 text-slate-400 hover:text-slate-600 rounded-full"
+              type="button"
+              disabled={sendTemplateAction.isLoading}
+              onClick={() => {
+                setTemplateModalError(null);
+                setIsTemplateModalOpen(false);
+              }}
+              className="absolute right-4 top-4 p-1 text-slate-400 hover:text-slate-600 rounded-full disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <X className="w-5 h-5" />
             </button>
@@ -1267,8 +1359,12 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                 <label className="block text-slate-700 font-semibold mb-1">Select Approved Template</label>
                 <select
                   value={selectedTemplateName}
-                  onChange={e => setSelectedTemplateName(e.target.value)}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B]"
+                  disabled={sendTemplateAction.isLoading}
+                  onChange={e => {
+                    setSelectedTemplateName(e.target.value);
+                    if (templateModalError) setTemplateModalError(null);
+                  }}
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B] disabled:opacity-60"
                 >
                   <option value="">-- Choose Meta Template --</option>
                   {availableTemplates.map((t: any, idx: number) => (
@@ -1283,10 +1379,14 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                 <label className="block text-slate-700 font-semibold mb-1">Customer Recipient Name</label>
                 <input
                   type="text"
+                  disabled={sendTemplateAction.isLoading}
                   value={templateCustomName || activeConversation?.customer_name || ''}
-                  onChange={e => setTemplateCustomName(e.target.value)}
+                  onChange={e => {
+                    setTemplateCustomName(e.target.value);
+                    if (templateModalError) setTemplateModalError(null);
+                  }}
                   placeholder="e.g. Sneha Reddy"
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B]"
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B] disabled:opacity-60"
                 />
               </div>
 
@@ -1294,10 +1394,14 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                 <label className="block text-slate-700 font-semibold mb-1">Service / Note Parameter</label>
                 <input
                   type="text"
+                  disabled={sendTemplateAction.isLoading}
                   value={templateService}
-                  onChange={e => setTemplateService(e.target.value)}
+                  onChange={e => {
+                    setTemplateService(e.target.value);
+                    if (templateModalError) setTemplateModalError(null);
+                  }}
                   placeholder="e.g. Signature Bridal Makeup"
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B]"
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 outline-none focus:border-[#5B132B] disabled:opacity-60"
                 />
               </div>
 
@@ -1309,32 +1413,36 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                 </span>
               </div>
 
+              {templateModalError && (
+                <div className="p-3 bg-rose-50 rounded-xl border border-rose-200 text-rose-800 text-[11px] flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
+                  <span className="font-medium leading-relaxed">{templateModalError}</span>
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setIsTemplateModalOpen(false)}
-                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors"
+                  disabled={sendTemplateAction.isLoading}
+                  onClick={() => {
+                    setTemplateModalError(null);
+                    setIsTemplateModalOpen(false);
+                  }}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Cancel
                 </button>
-                <button
+                <ActionButton
                   type="button"
                   onClick={handleSendTemplate}
-                  disabled={!selectedTemplateName || isSendingTemplate}
-                  className="px-5 py-2 bg-[#5B132B] hover:bg-[#430D1F] text-white font-bold rounded-xl transition-colors flex items-center gap-1.5 shadow-md disabled:opacity-50"
+                  loading={sendTemplateAction.isLoading}
+                  loadingText="Sending..."
+                  disabled={!selectedTemplateName}
+                  icon={<Send className="w-3.5 h-3.5" />}
+                  className="px-5 py-2 bg-[#5B132B] hover:bg-[#430D1F] text-white font-bold rounded-xl transition-colors flex items-center gap-1.5 shadow-md"
                 >
-                  {isSendingTemplate ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      <span>Sending Template...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Send className="w-3.5 h-3.5" />
-                      <span>Dispatch Template</span>
-                    </>
-                  )}
-                </button>
+                  <span>Dispatch Template</span>
+                </ActionButton>
               </div>
             </div>
           </div>
@@ -1364,9 +1472,9 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
               </div>
             </div>
 
-            {isLoadingDiagnostics ? (
+            {diagnosticsAction.isLoading && !diagnosticsData ? (
               <div className="py-12 text-center text-xs text-slate-400">
-                <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-[#5B132B]" />
+                <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2 text-[#5B132B]" />
                 <span>Checking diagnostics...</span>
               </div>
             ) : (
@@ -1489,14 +1597,16 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
                 </div>
 
                 <div className="flex justify-end gap-2 pt-2">
-                  <button
+                  <ActionButton
                     type="button"
-                    onClick={() => fetchDiagnostics()}
+                    onClick={() => fetchDiagnostics(true)}
+                    loading={diagnosticsAction.isLoading}
+                    loadingText="Checking..."
+                    icon={<RefreshCw className="w-3.5 h-3.5" />}
                     className="px-4 py-2 text-xs font-semibold text-[#5B132B] hover:bg-amber-50 rounded-xl transition-colors border border-amber-200/80 flex items-center gap-1.5"
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
                     <span>Refresh Diagnostics</span>
-                  </button>
+                  </ActionButton>
                   <button
                     type="button"
                     onClick={() => setIsDiagnosticsOpen(false)}
@@ -1529,27 +1639,21 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                disabled={isDeletingConversation}
+                disabled={deleteConversationAction.isLoading}
                 onClick={() => setIsDeleteConfirmOpen(false)}
-                className="flex-1 py-2.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+                className="flex-1 py-2.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
-              <button
+              <ActionButton
                 type="button"
-                disabled={isDeletingConversation}
+                loading={deleteConversationAction.isLoading}
+                loadingText="Deleting..."
                 onClick={handleDeleteConversation}
                 className="flex-1 py-2.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition-colors shadow-xs flex items-center justify-center gap-1.5"
               >
-                {isDeletingConversation ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Deleting...</span>
-                  </>
-                ) : (
-                  <span>Delete</span>
-                )}
-              </button>
+                <span>Delete</span>
+              </ActionButton>
             </div>
           </div>
         </div>

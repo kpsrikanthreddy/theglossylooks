@@ -34,6 +34,9 @@ import {
   User,
   WhatsAppMessageLog
 } from '../../types/salon';
+import { useToast, getSafeErrorMessage } from '../common/ToastProvider';
+import { ActionButton } from '../common/ActionButton';
+import { useAsyncAction } from '../../hooks/useAsyncAction';
 
 type MetaSdk = {
   init: (options: { appId: string; cookie?: boolean; xfbml?: boolean; version: string }) => void;
@@ -162,6 +165,19 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
   isManager = false,
   assignedBranchId
 }) => {
+  const toast = useToast();
+
+  // Reusable async action controllers with synchronous duplicate-click locks
+  const testConnAction = useAsyncAction();
+  const disconnectAction = useAsyncAction();
+  const saveBranchAction = useAsyncAction();
+  const createBranchAction = useAsyncAction();
+  const testTemplateAction = useAsyncAction();
+  const simulateFeedbackAction = useAsyncAction();
+  const refreshLogsAction = useAsyncAction();
+  const refreshStatusAction = useAsyncAction();
+  const connectLockRef = useRef(false);
+
   // Branches list & current active branch
   const [branches, setBranches] = useState<SalonBranch[]>([]);
   const [selectedBranchId, setSelectedBranchId] = useState<string>('');
@@ -173,17 +189,18 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
   // Async action flags
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState(false);
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [disconnecting, setDisconnecting] = useState(false);
   const [showDisconnectModal, setShowDisconnectModal] = useState(false);
   const [showAddBranchModal, setShowAddBranchModal] = useState(false);
   const [showEditBranchModal, setShowEditBranchModal] = useState(false);
   const [phoneCandidates, setPhoneCandidates] = useState<MetaPhoneCandidate[]>([]);
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  // Status feedback
+  // Status feedback & modal errors
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
+  const [addBranchError, setAddBranchError] = useState('');
+  const [editBranchError, setEditBranchError] = useState('');
+  const [disconnectError, setDisconnectError] = useState('');
 
   // Diagnostic state
   const [diagnostics, setDiagnostics] = useState<DiagnosticState>({
@@ -202,7 +219,6 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
   const [editBranchCity, setEditBranchCity] = useState('');
   const [editBranchPhone, setEditBranchPhone] = useState('');
   const [editBranchManagerId, setEditBranchManagerId] = useState('');
-  const [savingBranch, setSavingBranch] = useState(false);
 
   // New branch form state
   const [newBranchName, setNewBranchName] = useState('');
@@ -212,17 +228,14 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
   const [newBranchPhone, setNewBranchPhone] = useState('');
   const [newBranchWhatsAppNumber, setNewBranchWhatsAppNumber] = useState('');
   const [newBranchManagerId, setNewBranchManagerId] = useState('');
-  const [creatingBranch, setCreatingBranch] = useState(false);
 
   // Template Test & Webhook Simulation State (Owner only)
   const [testRecipient, setTestRecipient] = useState('');
   const [testTemplate, setTestTemplate] = useState('gl_appointment_confirmation');
-  const [sendingTestTemplate, setSendingTestTemplate] = useState(false);
   const [testSendResult, setTestSendResult] = useState<any>(null);
-  const [simulatingFeedback, setSimulatingFeedback] = useState(false);
+  const [activeSimRating, setActiveSimRating] = useState<'good' | 'average' | 'bad' | null>(null);
   const [simulationResult, setSimulationResult] = useState<any>(null);
   const [branchLogs, setBranchLogs] = useState<WhatsAppMessageLog[]>([]);
-  const [loadingBranchLogs, setLoadingBranchLogs] = useState(false);
 
   // References for Meta listeners and timeouts
   const latestCapturedMetaIds = useRef<{ waba_id: string; phone_number_id: string } | null>(null);
@@ -317,60 +330,100 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
     }
   };
 
-  const loadBranchLogs = async (branchId: string) => {
-    try {
-      setLoadingBranchLogs(true);
-      const logs = await api.getWhatsAppMessageLogs(undefined, branchId);
-      setBranchLogs(logs || []);
-    } catch {
-      // safe ignore
-    } finally {
-      setLoadingBranchLogs(false);
-    }
+  const loadBranchLogs = async (branchId: string, notify = false) => {
+    await refreshLogsAction.run(
+      async () => {
+        const logs = await api.getWhatsAppMessageLogs(undefined, branchId);
+        setBranchLogs(logs || []);
+        return logs;
+      },
+      {
+        successMessage: notify ? 'Recent WhatsApp logs refreshed' : undefined,
+        showErrorToast: notify,
+        errorFallback: 'Failed to refresh WhatsApp logs.'
+      }
+    );
+  };
+
+  const handleRefreshStatus = async () => {
+    if (!selectedBranchId) return;
+    await refreshStatusAction.run(
+      async () => {
+        await loadBranchWhatsApp(selectedBranchId);
+      },
+      {
+        successMessage: 'Branch WhatsApp status refreshed',
+        errorFallback: 'Failed to refresh branch WhatsApp status.'
+      }
+    );
   };
 
   const handleSendTestTemplate = async () => {
     if (!selectedBranch) return;
     const phone = testRecipient.trim() || selectedBranch.phone || selectedBranch.whatsapp_number;
-    setSendingTestTemplate(true);
     setTestSendResult(null);
-    try {
-      const res = await api.sendWhatsAppTestTemplate({
-        branch_id: selectedBranch.id,
-        recipient: phone,
-        template_name: testTemplate
-      });
-      setTestSendResult(res);
-      await loadBranchLogs(selectedBranch.id);
-    } catch (err: any) {
-      setTestSendResult({
-        success: false,
-        error: err.message || 'Test send failed'
-      });
-    } finally {
-      setSendingTestTemplate(false);
-    }
+
+    await testTemplateAction.run(
+      async () => {
+        const res = await api.sendWhatsAppTestTemplate({
+          branch_id: selectedBranch.id,
+          recipient: phone,
+          template_name: testTemplate
+        });
+        setTestSendResult(res);
+        await loadBranchLogs(selectedBranch.id);
+
+        if (res.success) {
+          toast.success('WhatsApp test template submitted successfully');
+        } else if (res.status === 'pending_approval') {
+          toast.warning(res.error || 'Template is pending Meta approval.');
+        } else {
+          toast.error(res.error || 'Failed to submit WhatsApp test template.');
+        }
+        return res;
+      },
+      {
+        errorFallback: 'Failed to submit WhatsApp test template.',
+        onError: (msg) => {
+          setTestSendResult({
+            success: false,
+            error: msg
+          });
+        }
+      }
+    );
   };
 
   const handleSimulateFeedback = async (rating: 'good' | 'average' | 'bad') => {
     if (!selectedBranch) return;
     const phone = testRecipient.trim() || selectedBranch.phone || '9154744608';
-    setSimulatingFeedback(true);
+    setActiveSimRating(rating);
     setSimulationResult(null);
+
     try {
-      const res = await api.simulateWhatsAppFeedbackReply({
-        phone,
-        rating,
-        text: rating === 'good' ? 'Great haircut & makeup! Very polite staff.' : rating === 'average' ? 'Wait time was a bit longer than expected.' : 'Service was not as described.'
-      });
-      setSimulationResult(res);
-    } catch (err: any) {
-      setSimulationResult({
-        success: false,
-        message: err.message
-      });
+      await simulateFeedbackAction.run(
+        async () => {
+          const res = await api.simulateWhatsAppFeedbackReply({
+            phone,
+            rating,
+            text: rating === 'good' ? 'Great haircut & makeup! Very polite staff.' : rating === 'average' ? 'Wait time was a bit longer than expected.' : 'Service was not as described.'
+          });
+          setSimulationResult(res);
+          return res;
+        },
+        {
+          successMessage: `Simulated "${rating}" feedback reply processed`,
+          errorFallback: 'Failed to run feedback simulation.',
+          onError: (msg) => {
+            setSimulationResult({
+              success: false,
+              message: msg
+            });
+          }
+        }
+      );
     } finally {
-      setSimulatingFeedback(false);
+      setActiveSimRating(null);
     }
   };
 
@@ -401,6 +454,7 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
   // 2. Submit connection credentials to server
   const submitConnection = (data: { wabaId?: string; phoneNumberId?: string; code?: string }) => {
     if (!selectedBranchId) return;
+    connectLockRef.current = true;
     setConnecting(true);
     setErrorMessage('');
     setSuccessMessage('');
@@ -415,7 +469,9 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
       .then(res => {
         if (res.selection_required && res.candidates?.length) {
           setPhoneCandidates(res.candidates);
-          setErrorMessage(res.message || 'Multiple numbers found. Please select this branch’s phone number.');
+          const warnMsg = res.message || 'Multiple numbers found. Please select this branch’s phone number.';
+          setErrorMessage(warnMsg);
+          toast.warning(warnMsg);
           return;
         }
 
@@ -434,35 +490,46 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
           graphVerified: 'success',
           summary: diagSummary
         });
-        setSuccessMessage(`WhatsApp Business Coexistence connected and verified with Meta Graph API for ${selectedBranch?.name}!`);
+        const okMsg = `WhatsApp Business Coexistence connected and verified with Meta Graph API for ${selectedBranch?.name}!`;
+        setSuccessMessage(okMsg);
+        toast.success(okMsg);
       })
       .catch(err => {
-        setIntegration(prev => prev ? { ...prev, status: 'failed', error_message: err.message } : null);
+        const msg = getSafeErrorMessage(err, 'Connection incomplete — Meta IDs were not received or failed Graph verification.');
+        setIntegration(prev => prev ? { ...prev, status: 'failed', error_message: msg } : null);
         setDiagnostics(prev => ({
           ...prev,
           oauthCode: data.code ? 'success' : prev.oauthCode,
           wabaReceived: data.wabaId ? 'success' : prev.wabaReceived,
           phoneReceived: data.phoneNumberId ? 'success' : prev.phoneReceived,
           graphVerified: 'failed',
-          summary: err.message || 'Meta could not verify the WhatsApp account.'
+          summary: msg
         }));
-        setErrorMessage(err.message || 'Connection incomplete — Meta IDs were not received or failed Graph verification.');
+        setErrorMessage(msg);
+        toast.error(msg);
       })
       .finally(() => {
+        connectLockRef.current = false;
         setConnecting(false);
       });
   };
 
   // 3. Launch official Meta Embedded Signup for Coexistence
   const handleGenerateMetaPairingQR = async () => {
-    if (!selectedBranchId || !selectedBranch) return;
+    if (!selectedBranchId || !selectedBranch || connectLockRef.current) return;
+    connectLockRef.current = true;
+    setConnecting(true);
     setErrorMessage('');
     setSuccessMessage('');
     latestCapturedMetaIds.current = null;
     latestAuthCode.current = null;
 
     if (!config?.meta_app_id || !config?.config_id) {
-      setErrorMessage('Meta App ID or Embedded Signup Config ID is not configured on the server.');
+      const msg = 'Meta App ID or Embedded Signup Config ID is not configured on the server.';
+      setErrorMessage(msg);
+      toast.error(msg);
+      connectLockRef.current = false;
+      setConnecting(false);
       return;
     }
     try {
@@ -470,7 +537,11 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
       // This is deliberately awaited so the first button click works too.
       await loadMetaSdk(config.meta_app_id);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Meta JavaScript SDK could not be loaded. Check browser privacy extensions and retry.');
+      const msg = getSafeErrorMessage(err, 'Meta JavaScript SDK could not be loaded. Check browser privacy extensions and retry.');
+      setErrorMessage(msg);
+      toast.error(msg);
+      connectLockRef.current = false;
+      setConnecting(false);
       return;
     }
 
@@ -553,6 +624,7 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
       if (signupTimeout.current !== null) window.clearTimeout(signupTimeout.current);
       signupTimeout.current = window.setTimeout(() => {
         if (connectionSubmitted) return;
+        connectLockRef.current = false;
         setConnecting(false);
         setDiagnostics(prev => ({
           ...prev,
@@ -563,7 +635,9 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
           graphVerified: 'failed',
           summary: 'Connection incomplete — Meta IDs were not received. Please scan the QR code in WhatsApp Business and complete pairing.'
         }));
-        setErrorMessage('Connection incomplete — Meta IDs were not received. Please retry the pairing flow.');
+        const msg = 'Connection incomplete — Meta IDs were not received. Please retry the pairing flow.';
+        setErrorMessage(msg);
+        toast.warning(msg);
         clearMessageListener();
       }, 10000);
     };
@@ -603,15 +677,19 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
         if (!connectionSubmitted) scheduleIncompleteError();
       } else if (payload.event === 'CANCEL') {
         clearMessageListener();
+        connectLockRef.current = false;
         setConnecting(false);
         setDiagnostics(prev => ({ ...prev, finishEvent: 'failed', summary: 'Meta Embedded Signup was cancelled.' }));
         setErrorMessage('Meta Embedded Signup was cancelled by user.');
+        toast.info('Meta Embedded Signup was cancelled.');
       } else if (payload.event === 'ERROR') {
         clearMessageListener();
         const msg = typeof payload.data?.error_message === 'string' ? payload.data.error_message : 'WhatsApp Embedded Signup encountered an error.';
+        connectLockRef.current = false;
         setConnecting(false);
         setDiagnostics(prev => ({ ...prev, finishEvent: 'failed', summary: `Meta error: ${msg}` }));
         setErrorMessage(msg);
+        toast.error(msg);
       }
     };
 
@@ -659,60 +737,77 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
       );
     } catch (err: any) {
       clearMessageListener();
+      connectLockRef.current = false;
       setConnecting(false);
-      setErrorMessage(`Failed to launch Meta Embedded Signup: ${err.message}`);
+      const msg = `Failed to launch Meta Embedded Signup: ${getSafeErrorMessage(err)}`;
+      setErrorMessage(msg);
+      toast.error(msg);
     }
   };
 
   // 4. Test WhatsApp connection with Meta Graph API
   const handleTestConnection = async () => {
     if (!selectedBranchId) return;
-    try {
-      setTestingConnection(true);
-      setErrorMessage('');
-      setSuccessMessage('');
-      const res = await api.testBranchWhatsApp(selectedBranchId, currentUserName);
-      setIntegration(res.integration);
-      setDiagnostics({
-        finishEvent: 'success',
-        oauthCode: 'success',
-        wabaReceived: 'success',
-        phoneReceived: 'success',
-        graphVerified: 'success',
-        summary: res.diagnostics || 'FINISH event received / WABA ID received / Phone Number ID received / Graph verification passed.'
-      });
-      setSuccessMessage(`WhatsApp connection verified successfully with Meta Graph API for ${selectedBranch?.name}!`);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Meta verification test failed. Please reconnect via Embedded Signup.');
-      if (selectedBranchId) loadBranchWhatsApp(selectedBranchId);
-    } finally {
-      setTestingConnection(false);
-    }
+    await testConnAction.run(
+      async () => {
+        setErrorMessage('');
+        setSuccessMessage('');
+        const res = await api.testBranchWhatsApp(selectedBranchId, currentUserName);
+        setIntegration(res.integration);
+        setDiagnostics({
+          finishEvent: 'success',
+          oauthCode: 'success',
+          wabaReceived: 'success',
+          phoneReceived: 'success',
+          graphVerified: 'success',
+          summary: res.diagnostics || 'FINISH event received / WABA ID received / Phone Number ID received / Graph verification passed.'
+        });
+        const okMsg = `WhatsApp connection verified successfully with Meta Graph API for ${selectedBranch?.name}!`;
+        setSuccessMessage(okMsg);
+        return okMsg;
+      },
+      {
+        successMessage: (msg) => msg,
+        errorFallback: 'Meta verification test failed. Please reconnect via Embedded Signup.',
+        onError: (msg) => {
+          setErrorMessage(msg);
+          if (selectedBranchId) loadBranchWhatsApp(selectedBranchId);
+        }
+      }
+    );
   };
 
   // 5. Disconnect WhatsApp integration
   const handleConfirmDisconnect = async () => {
     if (!selectedBranchId) return;
-    try {
-      setDisconnecting(true);
-      setErrorMessage('');
-      const res = await api.disconnectBranchWhatsApp(selectedBranchId, currentUserName);
-      setIntegration(res.integration);
-      setShowDisconnectModal(false);
-      setDiagnostics({
-        finishEvent: 'pending',
-        oauthCode: 'pending',
-        wabaReceived: 'pending',
-        phoneReceived: 'pending',
-        graphVerified: 'pending',
-        summary: 'Disconnected'
-      });
-      setSuccessMessage(`WhatsApp Business has been disconnected for ${selectedBranch?.name}. Message history retained.`);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to disconnect WhatsApp integration.');
-    } finally {
-      setDisconnecting(false);
-    }
+    setDisconnectError('');
+    await disconnectAction.run(
+      async () => {
+        setErrorMessage('');
+        const res = await api.disconnectBranchWhatsApp(selectedBranchId, currentUserName);
+        setIntegration(res.integration);
+        setShowDisconnectModal(false);
+        setDiagnostics({
+          finishEvent: 'pending',
+          oauthCode: 'pending',
+          wabaReceived: 'pending',
+          phoneReceived: 'pending',
+          graphVerified: 'pending',
+          summary: 'Disconnected'
+        });
+        const okMsg = `WhatsApp Business has been disconnected for ${selectedBranch?.name}. Message history retained.`;
+        setSuccessMessage(okMsg);
+        return okMsg;
+      },
+      {
+        successMessage: (msg) => msg,
+        errorFallback: 'Failed to disconnect WhatsApp integration.',
+        onError: (msg) => {
+          setDisconnectError(msg);
+          setErrorMessage(msg);
+        }
+      }
+    );
   };
 
   // 6. Save edited branch settings (Configured WhatsApp Number, Address, Name)
@@ -722,30 +817,40 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
     const cleanNumber = editBranchNumber.replace(/\D/g, '').slice(-10);
     const indianMobileRegex = /^[6-9]\d{9}$/;
     if (!indianMobileRegex.test(cleanNumber)) {
-      setErrorMessage('Please enter a valid 10-digit Indian mobile number (e.g., 9491914422) starting with 6, 7, 8, or 9.');
+      const msg = 'Please enter a valid 10-digit Indian mobile number (e.g., 9491914422) starting with 6, 7, 8, or 9.';
+      setEditBranchError(msg);
+      toast.warning(msg);
       return;
     }
 
-    try {
-      setSavingBranch(true);
-      setErrorMessage('');
-      const updated = await api.updateBranch(selectedBranchId, {
-        name: editBranchName.trim(),
-        whatsapp_number: cleanNumber,
-        address: editBranchAddress.trim(),
-        city: editBranchCity.trim(),
-        phone: editBranchPhone.replace(/\D/g, '').slice(-10) || cleanNumber,
-        ...(isOwner && { manager_id: editBranchManagerId || undefined })
-      }, currentUserName);
+    setEditBranchError('');
+    await saveBranchAction.run(
+      async () => {
+        setErrorMessage('');
+        const updated = await api.updateBranch(selectedBranchId, {
+          name: editBranchName.trim(),
+          whatsapp_number: cleanNumber,
+          address: editBranchAddress.trim(),
+          city: editBranchCity.trim(),
+          phone: editBranchPhone.replace(/\D/g, '').slice(-10) || cleanNumber,
+          ...(isOwner && { manager_id: editBranchManagerId || undefined })
+        }, currentUserName);
 
-      setShowEditBranchModal(false);
-      setSuccessMessage(`Branch details and configured WhatsApp number for ${updated.name} updated!`);
-      await loadBranchesAndStatus(selectedBranchId);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to save branch settings.');
-    } finally {
-      setSavingBranch(false);
-    }
+        setShowEditBranchModal(false);
+        const okMsg = `Branch details and configured WhatsApp number for ${updated.name} updated!`;
+        setSuccessMessage(okMsg);
+        await loadBranchesAndStatus(selectedBranchId);
+        return okMsg;
+      },
+      {
+        successMessage: (msg) => msg,
+        errorFallback: 'Failed to save branch settings.',
+        onError: (msg) => {
+          setEditBranchError(msg);
+          setErrorMessage(msg);
+        }
+      }
+    );
   };
 
   // 7. Create new branch (Owner only)
@@ -755,50 +860,63 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
     const cleanNumber = newBranchWhatsAppNumber.replace(/\D/g, '').slice(-10);
     const indianMobileRegex = /^[6-9]\d{9}$/;
     if (!indianMobileRegex.test(cleanNumber)) {
-      setErrorMessage('Please enter a valid 10-digit Indian mobile number for WhatsApp (e.g. 9491914422).');
+      const msg = 'Please enter a valid 10-digit Indian mobile number for WhatsApp (e.g. 9491914422).';
+      setAddBranchError(msg);
+      toast.warning(msg);
       return;
     }
 
     if (!newBranchName.trim() || !newBranchAddress.trim()) {
-      setErrorMessage('Branch name and address are required.');
+      const msg = 'Branch name and address are required.';
+      setAddBranchError(msg);
+      toast.warning(msg);
       return;
     }
 
-    try {
-      setCreatingBranch(true);
-      setErrorMessage('');
-      const created = await api.createBranch({
-        name: newBranchName.trim(),
-        code: newBranchCode.trim().toUpperCase() || undefined,
-        address: newBranchAddress.trim(),
-        city: newBranchCity.trim() || 'Hyderabad, Telangana',
-        phone: newBranchPhone.replace(/\D/g, '').slice(-10) || cleanNumber,
-        whatsapp_number: cleanNumber,
-        manager_id: newBranchManagerId || undefined,
-        is_active: true
-      }, currentUserName);
+    setAddBranchError('');
+    await createBranchAction.run(
+      async () => {
+        setErrorMessage('');
+        const created = await api.createBranch({
+          name: newBranchName.trim(),
+          code: newBranchCode.trim().toUpperCase() || undefined,
+          address: newBranchAddress.trim(),
+          city: newBranchCity.trim() || 'Hyderabad, Telangana',
+          phone: newBranchPhone.replace(/\D/g, '').slice(-10) || cleanNumber,
+          whatsapp_number: cleanNumber,
+          manager_id: newBranchManagerId || undefined,
+          is_active: true
+        }, currentUserName);
 
-      setShowAddBranchModal(false);
-      // Reset form
-      setNewBranchName('');
-      setNewBranchCode('');
-      setNewBranchAddress('');
-      setNewBranchPhone('');
-      setNewBranchWhatsAppNumber('');
-      setNewBranchManagerId('');
-      setSuccessMessage(`New branch '${created.name}' created with configured WhatsApp number ${cleanNumber}!`);
-      await loadBranchesAndStatus(created.id);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to create salon branch.');
-    } finally {
-      setCreatingBranch(false);
-    }
+        setShowAddBranchModal(false);
+        // Reset form
+        setNewBranchName('');
+        setNewBranchCode('');
+        setNewBranchAddress('');
+        setNewBranchPhone('');
+        setNewBranchWhatsAppNumber('');
+        setNewBranchManagerId('');
+        const okMsg = `New branch '${created.name}' created with configured WhatsApp number ${cleanNumber}!`;
+        setSuccessMessage(okMsg);
+        await loadBranchesAndStatus(created.id);
+        return okMsg;
+      },
+      {
+        successMessage: (msg) => msg,
+        errorFallback: 'Failed to create salon branch.',
+        onError: (msg) => {
+          setAddBranchError(msg);
+          setErrorMessage(msg);
+        }
+      }
+    );
   };
 
   const copyToClipboard = (text: string, field: string) => {
     if (!text) return;
     navigator.clipboard.writeText(text);
     setCopiedField(field);
+    toast.info('Copied to clipboard');
     setTimeout(() => setCopiedField(null), 2000);
   };
 
@@ -847,7 +965,10 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
             {isOwner && (
               <button
                 type="button"
-                onClick={() => setShowAddBranchModal(true)}
+                onClick={() => {
+                  setAddBranchError('');
+                  setShowAddBranchModal(true);
+                }}
                 className="py-2.5 px-4 bg-[#D4AF37] hover:bg-[#b5952f] text-slate-950 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all"
               >
                 <Plus className="w-4 h-4" />
@@ -856,12 +977,12 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
             )}
             <button
               type="button"
-              onClick={() => selectedBranchId && loadBranchWhatsApp(selectedBranchId)}
-              disabled={loading}
-              className="p-2.5 bg-white/10 hover:bg-white/15 text-white rounded-xl text-xs transition-colors"
+              onClick={handleRefreshStatus}
+              disabled={loading || refreshStatusAction.isLoading}
+              className="p-2.5 bg-white/10 hover:bg-white/15 text-white rounded-xl text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title="Refresh Status"
             >
-              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-4 h-4 ${loading || refreshStatusAction.isLoading ? 'animate-spin' : ''}`} />
             </button>
           </div>
         </div>
@@ -959,7 +1080,10 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
 
                 <button
                   type="button"
-                  onClick={() => setShowEditBranchModal(true)}
+                  onClick={() => {
+                    setEditBranchError('');
+                    setShowEditBranchModal(true);
+                  }}
                   className="py-1.5 px-3 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
                 >
                   <Edit3 className="w-3.5 h-3.5 text-slate-500" />
@@ -1033,50 +1157,40 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3 pt-1">
-                  <button
+                  <ActionButton
                     type="button"
                     onClick={handleGenerateMetaPairingQR}
-                    disabled={connecting || !config?.is_configured}
+                    loading={connecting}
+                    loadingText="Connecting..."
+                    disabled={!config?.is_configured}
+                    icon={<QrCode className="w-4 h-4" />}
+                    spinnerClassName="w-4 h-4"
                     className="py-3 px-6 bg-[#25D366] hover:bg-[#20ba59] disabled:bg-slate-300 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-2 shadow-sm transition-all"
                   >
-                    {connecting ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span>Pairing via Meta Coexistence...</span>
-                      </>
-                    ) : (
-                      <>
-                        <QrCode className="w-4 h-4" />
-                        <span>{isConnected ? 'Reconnect / Generate New Meta QR' : 'Generate Meta Pairing QR'}</span>
-                      </>
-                    )}
-                  </button>
+                    <span>{isConnected ? 'Reconnect / Generate New Meta QR' : 'Generate Meta Pairing QR'}</span>
+                  </ActionButton>
 
                   {isConnected && (
-                    <button
+                    <ActionButton
                       type="button"
                       onClick={handleTestConnection}
-                      disabled={testingConnection}
+                      loading={testConnAction.isLoading}
+                      loadingText="Testing..."
+                      icon={<CheckCircle2 className="w-4 h-4 text-emerald-600" />}
+                      spinnerClassName="w-4 h-4 text-[#5B132B]"
                       className="py-3 px-4 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition-colors"
                     >
-                      {testingConnection ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin text-[#5B132B]" />
-                          <span>Verifying with Graph API...</span>
-                        </>
-                      ) : (
-                        <>
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                          <span>Test WhatsApp Connection</span>
-                        </>
-                      )}
-                    </button>
+                      <span>Test WhatsApp Connection</span>
+                    </ActionButton>
                   )}
 
                   {isConnected && (
                     <button
                       type="button"
-                      onClick={() => setShowDisconnectModal(true)}
+                      onClick={() => {
+                        setDisconnectError('');
+                        setShowDisconnectModal(true);
+                      }}
                       className="py-3 px-4 text-rose-600 hover:bg-rose-50 border border-rose-200 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition-colors ml-auto"
                     >
                       <Power className="w-4 h-4" />
@@ -1285,24 +1399,17 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                     </span>
                   </div>
 
-                  <button
+                  <ActionButton
                     type="button"
-                    disabled={sendingTestTemplate}
+                    loading={testTemplateAction.isLoading}
+                    loadingText="Sending..."
                     onClick={handleSendTestTemplate}
-                    className="w-full py-2.5 px-4 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold flex items-center justify-center gap-2 transition-colors disabled:opacity-60 shadow-xs"
+                    icon={<Send className="w-4 h-4 text-[#D4AF37]" />}
+                    spinnerClassName="w-4 h-4"
+                    className="w-full py-2.5 px-4 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold flex items-center justify-center gap-2 transition-colors shadow-xs"
                   >
-                    {sendingTestTemplate ? (
-                      <>
-                        <RefreshCw className="w-4 h-4 animate-spin" />
-                        <span>Sending via Meta Cloud API...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Send className="w-4 h-4 text-[#D4AF37]" />
-                        <span>Dispatch Test Template Now</span>
-                      </>
-                    )}
-                  </button>
+                    <span>Dispatch Test Template Now</span>
+                  </ActionButton>
 
                   {testSendResult && (
                     <div className={`p-3 rounded-xl border text-xs ${
@@ -1320,10 +1427,10 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                         )}
                         <span>
                           {testSendResult.success
-                            ? 'Template Sent Successfully via Meta Graph API!'
+                            ? 'Template Submitted to Meta Graph API'
                             : testSendResult.status === 'pending_approval'
                             ? 'Status: Pending Meta Approval (App Review Sandbox)'
-                            : 'Test Delivery Failed'}
+                            : 'Test Template Submission Failed'}
                         </span>
                       </div>
                       {testSendResult.message_id && (
@@ -1369,32 +1476,50 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                   <div className="grid grid-cols-3 gap-2">
                     <button
                       type="button"
-                      disabled={simulatingFeedback}
+                      disabled={simulateFeedbackAction.isLoading}
                       onClick={() => handleSimulateFeedback('good')}
-                      className="py-2.5 px-3 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60"
+                      className="py-2.5 px-3 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <span>👍 &ldquo;Good&rdquo;</span>
-                      <span className="text-[9px] font-normal text-emerald-600">→ Review link</span>
+                      {activeSimRating === 'good' && simulateFeedbackAction.isLoading ? (
+                        <span className="inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Simulating...</span>
+                      ) : (
+                        <>
+                          <span>👍 &ldquo;Good&rdquo;</span>
+                          <span className="text-[9px] font-normal text-emerald-600">→ Review link</span>
+                        </>
+                      )}
                     </button>
 
                     <button
                       type="button"
-                      disabled={simulatingFeedback}
+                      disabled={simulateFeedbackAction.isLoading}
                       onClick={() => handleSimulateFeedback('average')}
-                      className="py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60"
+                      className="py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <span>😐 &ldquo;Average&rdquo;</span>
-                      <span className="text-[9px] font-normal text-amber-600">→ Manager alert</span>
+                      {activeSimRating === 'average' && simulateFeedbackAction.isLoading ? (
+                        <span className="inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Simulating...</span>
+                      ) : (
+                        <>
+                          <span>😐 &ldquo;Average&rdquo;</span>
+                          <span className="text-[9px] font-normal text-amber-600">→ Manager alert</span>
+                        </>
+                      )}
                     </button>
 
                     <button
                       type="button"
-                      disabled={simulatingFeedback}
+                      disabled={simulateFeedbackAction.isLoading}
                       onClick={() => handleSimulateFeedback('bad')}
-                      className="py-2.5 px-3 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60"
+                      className="py-2.5 px-3 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl font-bold flex flex-col items-center gap-1 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <span>👎 &ldquo;Bad&rdquo;</span>
-                      <span className="text-[9px] font-normal text-rose-600">→ Manager alert</span>
+                      {activeSimRating === 'bad' && simulateFeedbackAction.isLoading ? (
+                        <span className="inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Simulating...</span>
+                      ) : (
+                        <>
+                          <span>👎 &ldquo;Bad&rdquo;</span>
+                          <span className="text-[9px] font-normal text-rose-600">→ Manager alert</span>
+                        </>
+                      )}
                     </button>
                   </div>
 
@@ -1422,14 +1547,16 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
 
                   {/* Branch Message Logs Trigger */}
                   <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
-                    <button
+                    <ActionButton
                       type="button"
-                      onClick={() => selectedBranch && loadBranchLogs(selectedBranch.id)}
+                      loading={refreshLogsAction.isLoading}
+                      loadingText="Refreshing..."
+                      icon={<RefreshCw className="w-3.5 h-3.5" />}
+                      onClick={() => selectedBranch && loadBranchLogs(selectedBranch.id, true)}
                       className="text-xs text-[#5B132B] hover:underline font-semibold flex items-center gap-1"
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${loadingBranchLogs ? 'animate-spin' : ''}`} />
                       <span>Refresh Recent Logs for {selectedBranch.name}</span>
-                    </button>
+                    </ActionButton>
                     <span className="text-[10px] text-slate-400">
                       {branchLogs.length} logs recorded
                     </span>
@@ -1569,19 +1696,29 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
               </select>
             </div>
 
+            {addBranchError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span className="font-medium">{addBranchError}</span>
+              </div>
+            )}
+
             <div className="flex gap-2 pt-3 border-t border-slate-100">
-              <button
+              <ActionButton
                 type="submit"
-                disabled={creatingBranch}
+                loading={createBranchAction.isLoading}
+                loadingText="Saving..."
+                icon={<Save className="w-4 h-4" />}
+                spinnerClassName="w-4 h-4"
                 className="flex-1 py-2.5 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 shadow-xs"
               >
-                {creatingBranch ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                 <span>Create Branch</span>
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={createBranchAction.isLoading}
                 onClick={() => setShowAddBranchModal(false)}
-                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs"
+                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -1694,19 +1831,29 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
               </div>
             )}
 
+            {editBranchError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span className="font-medium">{editBranchError}</span>
+              </div>
+            )}
+
             <div className="flex gap-2 pt-3 border-t border-slate-100">
-              <button
+              <ActionButton
                 type="submit"
-                disabled={savingBranch}
+                loading={saveBranchAction.isLoading}
+                loadingText="Saving..."
+                icon={<Save className="w-4 h-4" />}
+                spinnerClassName="w-4 h-4"
                 className="flex-1 py-2.5 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 shadow-xs"
               >
-                {savingBranch ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                 <span>Save Changes</span>
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={saveBranchAction.isLoading}
                 onClick={() => setShowEditBranchModal(false)}
-                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs"
+                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -1732,20 +1879,30 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
               </p>
             </div>
 
+            {disconnectError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span className="font-medium">{disconnectError}</span>
+              </div>
+            )}
+
             <div className="flex gap-2 pt-2">
-              <button
+              <ActionButton
                 type="button"
                 onClick={handleConfirmDisconnect}
-                disabled={disconnecting}
+                loading={disconnectAction.isLoading}
+                loadingText="Disconnecting..."
+                icon={<Power className="w-4 h-4" />}
+                spinnerClassName="w-4 h-4"
                 className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 shadow-xs"
               >
-                {disconnecting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Power className="w-4 h-4" />}
                 <span>Confirm Disconnect</span>
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={disconnectAction.isLoading}
                 onClick={() => setShowDisconnectModal(false)}
-                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs"
+                className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -1772,8 +1929,10 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                     <div className="font-mono font-bold text-slate-900">{cand.display_phone_number || cand.phone_number_id}</div>
                     <div className="text-[10px] text-slate-400">ID: {cand.phone_number_id} · {cand.verified_name || 'Salon'}</div>
                   </div>
-                  <button
+                  <ActionButton
                     type="button"
+                    loading={connecting}
+                    loadingText="Connecting..."
                     onClick={() => {
                       submitConnection({
                         wabaId: cand.waba_id,
@@ -1781,10 +1940,10 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                       });
                       setPhoneCandidates([]);
                     }}
-                    className="py-1.5 px-3 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold text-xs"
+                    className="py-1.5 px-3 bg-[#5B132B] hover:bg-[#430D1F] text-white rounded-xl font-bold text-xs inline-flex items-center gap-1"
                   >
                     Select
-                  </button>
+                  </ActionButton>
                 </div>
               ))}
             </div>

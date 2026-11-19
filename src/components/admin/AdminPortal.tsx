@@ -90,6 +90,9 @@ import {
   DailySalesReportLog
 } from '../../types/salon';
 import { api } from '../../lib/api';
+import { useToast, getSafeErrorMessage } from '../common/ToastProvider';
+import { ActionButton } from '../common/ActionButton';
+import { useAsyncAction, useKeyedAsyncAction } from '../../hooks/useAsyncAction';
 
 interface AdminPortalProps {
   onBackToWebsite: () => void;
@@ -124,11 +127,49 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     return null;
   });
 
+  const toast = useToast();
+
+  // Reusable async action controllers (synchronous ref locks + guaranteed try/catch/finally)
+  const loginAction = useAsyncAction();
+  const posCheckoutAction = useAsyncAction();
+  const posFeedbackAction = useAsyncAction();
+  const posRetryReceiptAction = useAsyncAction();
+  const posRetryFeedbackAction = useAsyncAction();
+  const whatsAppConfirmAction = useAsyncAction();
+  const dailyReportAction = useAsyncAction();
+  const refreshHistoryAction = useAsyncAction();
+  const refreshCrmAction = useAsyncAction();
+  const stockMovementAction = useAsyncAction();
+  const customerSaveAction = useAsyncAction();
+  const serviceSaveAction = useAsyncAction();
+  const galleryUploadAction = useAsyncAction();
+  const staffSaveAction = useAsyncAction();
+  const adminUserSaveAction = useAsyncAction();
+  const resetPasswordAction = useAsyncAction();
+  const userStatusToggleAction = useAsyncAction();
+  const orderEditAction = useAsyncAction();
+  const confirmDialogAction = useAsyncAction();
+  const rowAction = useKeyedAsyncAction();
+
+  // In-portal confirmation & reason input modal (replaces blocking browser confirm/prompt)
+  const [confirmActionModal, setConfirmActionModal] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: string;
+    confirmLabel: string;
+    loadingLabel: string;
+    inputLabel?: string;
+    inputPlaceholder?: string;
+    inputRequired?: boolean;
+    onConfirm: (inputValue?: string) => Promise<void>;
+  } | null>(null);
+  const [confirmActionInput, setConfirmActionInput] = useState('');
+  const [confirmActionError, setConfirmActionError] = useState('');
+
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
-  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // Active module navigation
   type AdminTab =
@@ -308,7 +349,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [dailySalesHistory, setDailySalesHistory] = useState<DailySalesReportLog[]>([]);
   const [alreadySentToday, setAlreadySentToday] = useState(false);
   const [todayKolkataDate, setTodayKolkataDate] = useState('');
-  const [sendingDailyStylistReports, setSendingDailyStylistReports] = useState(false);
   const [dailyReportsStatusMsg, setDailyReportsStatusMsg] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [resendConfirmModalOpen, setResendConfirmModalOpen] = useState(false);
   const [showDailySalesHistorySection, setShowDailySalesHistorySection] = useState(true);
@@ -334,14 +374,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [posBranchId, setPosBranchId] = useState('tgl-gachibowli-main');
   const [posNotes, setPosNotes] = useState('');
   const [posSuccessOrder, setPosSuccessOrder] = useState<Order | null>(null);
-  const [isGeneratingBill, setIsGeneratingBill] = useState(false);
   const [posBillingStatus, setPosBillingStatus] = useState<string | null>(null);
   const [posBillingError, setPosBillingError] = useState<string | null>(null);
-  const [posFeedbackSending, setPosFeedbackSending] = useState(false);
   const [posFeedbackStatus, setPosFeedbackStatus] = useState<'sent' | 'queued' | 'failed' | null>(null);
   const [posFeedbackMessage, setPosFeedbackMessage] = useState<string | null>(null);
-  const [posRetryingReceipt, setPosRetryingReceipt] = useState(false);
-  const [posRetryingFeedback, setPosRetryingFeedback] = useState(false);
   const [posIdempotencyKey, setPosIdempotencyKey] = useState<string>(() => `pos-idem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const [posSearch, setPosSearch] = useState('');
   const [posCategoryFilter, setPosCategoryFilter] = useState('all');
@@ -372,7 +408,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     appointment: Appointment | null;
     force?: boolean;
   }>({ isOpen: false, appointment: null });
-  const [whatsAppSending, setWhatsAppSending] = useState(false);
   const [whatsAppSendResult, setWhatsAppSendResult] = useState<{
     success: boolean;
     warning?: string;
@@ -441,7 +476,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     order?: Order | null;
     payment?: PaymentRecord | null;
   }>({ isOpen: false, order: null, payment: null });
-  const [orderEditSaving, setOrderEditSaving] = useState(false);
   const [orderEditError, setOrderEditError] = useState<string | null>(null);
   const [editOrderDiscount, setEditOrderDiscount] = useState<number>(0);
   const [editOrderPaymentMode, setEditOrderPaymentMode] = useState<Order['primary_payment_mode']>('Cash');
@@ -450,7 +484,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [editOrderCustomerPhone, setEditOrderCustomerPhone] = useState('');
   const [editOrderNotes, setEditOrderNotes] = useState('');
 
-  const loadDetailedReports = async (period: 'today' | 'yesterday' | 'this_week' | 'this_month' | 'custom', start?: string, end?: string) => {
+  const loadDetailedReports = async (period: 'today' | 'yesterday' | 'this_week' | 'this_month' | 'custom', start?: string, end?: string, notify = false) => {
     try {
       setLoadingReports(true);
       const res = await api.getDetailedReports({
@@ -459,24 +493,34 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         endDate: period === 'custom' ? end : undefined
       });
       setDetailedReports(res);
+      if (notify) {
+        toast.success('Sales report updated');
+      }
       // Also refresh daily stylist sales report history
       loadDailySalesHistory().catch(() => {});
     } catch (err) {
       console.error('Failed to load detailed reports:', err);
+      toast.error(getSafeErrorMessage(err, 'Failed to load sales report.'));
     } finally {
       setLoadingReports(false);
     }
   };
 
-  const loadDailySalesHistory = async () => {
-    try {
-      const res = await api.getDailyStylistSalesHistory();
-      setDailySalesHistory(res.reports || []);
-      setAlreadySentToday(res.alreadySentToday);
-      setTodayKolkataDate(res.todayDate);
-    } catch (err) {
-      console.warn('Could not load daily sales history:', err);
-    }
+  const loadDailySalesHistory = async (notify = false) => {
+    await refreshHistoryAction.run(
+      async () => {
+        const res = await api.getDailyStylistSalesHistory();
+        setDailySalesHistory(res.reports || []);
+        setAlreadySentToday(res.alreadySentToday);
+        setTodayKolkataDate(res.todayDate);
+        return res;
+      },
+      {
+        successMessage: notify ? 'Daily sales report history refreshed' : undefined,
+        showErrorToast: notify,
+        errorFallback: 'Failed to refresh daily sales report history.'
+      }
+    );
   };
 
   const handleTriggerDailyStylistReport = async (force: boolean = false) => {
@@ -485,35 +529,42 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       return;
     }
 
-    setResendConfirmModalOpen(false);
-    setSendingDailyStylistReports(true);
     setDailyReportsStatusMsg(null);
 
-    try {
-      const res = await api.sendDailyStylistSalesReport({ force });
-      if (res.success) {
+    await dailyReportAction.run(
+      async () => {
+        const res = await api.sendDailyStylistSalesReport({ force });
+        if (!res.success) {
+          throw new Error(res.error || 'Failed to submit daily stylist sales WhatsApp reports.');
+        }
+
         const sentCount = res.sent?.length || 0;
         const skippedCount = res.skipped?.length || 0;
         const failedCount = res.failed?.length || 0;
+        const summary = `Daily stylist sales WhatsApp reports submitted: ${sentCount} submitted${skippedCount > 0 ? `, ${skippedCount} skipped (already sent)` : ''}${failedCount > 0 ? `, ${failedCount} failed` : ''}.`;
+        setResendConfirmModalOpen(false);
         setDailyReportsStatusMsg({
           type: 'success',
-          text: `Daily sales WhatsApp reports processed: ${sentCount} delivered${skippedCount > 0 ? `, ${skippedCount} skipped (already sent)` : ''}${failedCount > 0 ? `, ${failedCount} delivery errors` : ''}.`
+          text: summary
         });
         await loadDailySalesHistory();
-      } else {
-        setDailyReportsStatusMsg({
-          type: 'error',
-          text: res.error || 'Failed to dispatch daily sales WhatsApp reports.'
-        });
+        if (failedCount > 0 && sentCount === 0) {
+          toast.warning(summary);
+        } else {
+          toast.success(summary);
+        }
+        return res;
+      },
+      {
+        errorFallback: 'Failed to submit daily stylist sales reports.',
+        onError: (msg) => {
+          setDailyReportsStatusMsg({
+            type: 'error',
+            text: msg
+          });
+        }
       }
-    } catch (err: any) {
-      setDailyReportsStatusMsg({
-        type: 'error',
-        text: err.message || 'Error triggering daily stylist sales reports.'
-      });
-    } finally {
-      setSendingDailyStylistReports(false);
-    }
+    );
   };
 
   const loadAllData = async () => {
@@ -655,29 +706,33 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError('');
-    setIsLoggingIn(true);
-    try {
-      const res = await api.loginAdmin(loginIdentifier.trim(), loginPassword);
-      sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
-      localStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
-      setCurrentUser(res.user);
-      
-      // Auto-route to role module
-      if (res.user.role === 'receptionist') handleNavigateTab('pos');
-      else if (res.user.role === 'stylist') handleNavigateTab('appointments');
-      else if (res.user.role === 'inventory_staff') handleNavigateTab('inventory');
-      else handleNavigateTab('dashboard');
-    } catch (err: any) {
-      setLoginError(err.message || 'Invalid admin credentials or account deactivated.');
-    } finally {
-      setIsLoggingIn(false);
-    }
+    await loginAction.run(
+      async () => {
+        const res = await api.loginAdmin(loginIdentifier.trim(), loginPassword);
+        sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
+        localStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
+        setCurrentUser(res.user);
+
+        // Auto-route to role module
+        if (res.user.role === 'receptionist') handleNavigateTab('pos');
+        else if (res.user.role === 'stylist') handleNavigateTab('appointments');
+        else if (res.user.role === 'inventory_staff') handleNavigateTab('inventory');
+        else handleNavigateTab('dashboard');
+        return res;
+      },
+      {
+        successMessage: (res) => `Signed in as ${res.user.name}`,
+        errorFallback: 'Invalid admin credentials or account deactivated.',
+        onError: (msg) => setLoginError(msg)
+      }
+    );
   };
 
   const handleLogout = () => {
     sessionStorage.removeItem('the_glossy_looks_admin_session');
     localStorage.removeItem('the_glossy_looks_admin_session');
     setCurrentUser(null);
+    toast.info('Signed out successfully');
   };
 
   const handleOpenWhatsAppConfirm = (apt: Appointment) => {
@@ -688,23 +743,39 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const handleSendWhatsAppConfirm = async (force: boolean = false) => {
     if (!whatsAppConfirmModal.appointment) return;
     const aptId = whatsAppConfirmModal.appointment.id;
-    setWhatsAppSending(true);
     setWhatsAppSendResult(null);
-    try {
-      const res = await api.sendAppointmentWhatsAppConfirmation(aptId, force);
-      setWhatsAppSendResult(res);
-      if (res.success || res.status) {
-        const updatedApts = await api.getAppointments();
-        setAppointments(updatedApts);
+
+    await whatsAppConfirmAction.run(
+      async () => {
+        const res = await api.sendAppointmentWhatsAppConfirmation(aptId, force);
+        setWhatsAppSendResult(res);
+        if (res.success || res.status) {
+          const updatedApts = await api.getAppointments();
+          setAppointments(updatedApts);
+        }
+
+        if (res.success) {
+          toast.success('WhatsApp confirmation template submitted successfully');
+          setWhatsAppConfirmModal({ isOpen: false, appointment: null });
+        } else if (res.duplicate_prevented) {
+          toast.warning(res.warning || 'A confirmation was already submitted for this booking. Click "Send Again (Force)" to resend.');
+        } else if (res.status === 'pending_approval') {
+          toast.warning(res.error || 'Template is pending Meta approval.');
+        } else {
+          toast.error(res.error || 'Failed to submit WhatsApp confirmation template.');
+        }
+        return res;
+      },
+      {
+        errorFallback: 'Failed to submit WhatsApp confirmation template.',
+        onError: (msg) => {
+          setWhatsAppSendResult({
+            success: false,
+            error: msg
+          });
+        }
       }
-    } catch (err: any) {
-      setWhatsAppSendResult({
-        success: false,
-        error: err.message || 'Failed to send WhatsApp confirmation'
-      });
-    } finally {
-      setWhatsAppSending(false);
-    }
+    );
   };
 
   const handleViewAppointmentLogs = async (apt: Appointment) => {
@@ -714,6 +785,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       setAppointmentLogsModal(prev => ({ ...prev, logs, loading: false }));
     } catch (err) {
       console.warn('Could not load message logs for appointment:', err);
+      toast.error(getSafeErrorMessage(err, 'Failed to load WhatsApp message logs.'));
       setAppointmentLogsModal(prev => ({ ...prev, loading: false }));
     }
   };
@@ -729,7 +801,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   // POS Checkout Handler
   const handlePosCheckout = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isGeneratingBill) return; // Prevent double clicks / concurrent bill creation
+    if (posCheckoutAction.isLoading) return;
 
     if (!posBranchId) {
       posBranchRef.current?.focus();
@@ -752,7 +824,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       return;
     }
     if (posSelectedItems.length === 0) {
-      alert('Please add at least one service or product to the bill.');
+      toast.warning('Please add at least one service or product to the bill.');
       return;
     }
 
@@ -778,43 +850,47 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     const tax = Math.round(subtotal * 0.05);
     const grandTotal = Math.max(0, subtotal - posDiscount + tax + posTip);
 
-    // 1. Immediately disable button, show spinner, and show status toast
-    setIsGeneratingBill(true);
-    setPosBillingStatus('Creating bill. Please wait…');
-    setPosBillingError(null);
-    setPosFeedbackMessage(null);
-    setPosFeedbackStatus(null);
+    await posCheckoutAction.run(
+      async () => {
+        setPosBillingStatus('Creating bill. Please wait…');
+        setPosBillingError(null);
+        setPosFeedbackMessage(null);
+        setPosFeedbackStatus(null);
 
-    try {
-      const newOrder = await api.createOrder({
-        idempotency_key: posIdempotencyKey,
-        customer_name: posCustomerName,
-        customer_phone: posCustomerPhone,
-        branch_id: posBranchId,
-        items,
-        subtotal,
-        discount: posDiscount,
-        tax_amount: tax,
-        tip_amount: posTip,
-        grand_total: grandTotal,
-        paid_amount: grandTotal,
-        payment_status: 'Paid',
-        primary_payment_mode: posPaymentMode as Order['primary_payment_mode'],
-        cashier_name: currentUser?.name || 'Reception',
-        notes: posNotes
-      }, currentUser?.name);
+        const newOrder = await api.createOrder({
+          idempotency_key: posIdempotencyKey,
+          customer_name: posCustomerName,
+          customer_phone: posCustomerPhone,
+          branch_id: posBranchId,
+          items,
+          subtotal,
+          discount: posDiscount,
+          tax_amount: tax,
+          tip_amount: posTip,
+          grand_total: grandTotal,
+          paid_amount: grandTotal,
+          payment_status: 'Paid',
+          primary_payment_mode: posPaymentMode as Order['primary_payment_mode'],
+          cashier_name: currentUser?.name || 'Reception',
+          notes: posNotes
+        }, currentUser?.name);
 
-      setPosSuccessOrder(newOrder);
-      setPosBillingStatus(null);
-      // Generate new idempotency key for next bill attempt
-      setPosIdempotencyKey(`pos-idem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-      loadAllData();
-    } catch (err: any) {
-      setPosBillingStatus(null);
-      setPosBillingError(err.message || 'Error executing POS bill. Please check inputs and retry.');
-    } finally {
-      setIsGeneratingBill(false);
-    }
+        setPosSuccessOrder(newOrder);
+        setPosBillingStatus(null);
+        // Generate new idempotency key for next bill attempt
+        setPosIdempotencyKey(`pos-idem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+        loadAllData();
+        return newOrder;
+      },
+      {
+        successMessage: (ord) => `Bill ${ord.bill_number} generated successfully`,
+        errorFallback: 'Error creating POS bill. Please check inputs and try again.',
+        onError: (msg) => {
+          setPosBillingStatus(null);
+          setPosBillingError(msg);
+        }
+      }
+    );
   };
 
   const handleResetPosForm = () => {
@@ -877,118 +953,156 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
   const handleSendPosFeedback = async () => {
     if (!posSuccessOrder) {
-      setPosFeedbackMessage('Generate the bill first, then send customer feedback.');
+      const msg = 'Generate the bill first, then send customer feedback.';
+      setPosFeedbackMessage(msg);
+      toast.warning(msg);
       return;
     }
 
-    // Check if feedback is already sent/delivered to avoid duplicate messages
+    // Check if feedback is already submitted/delivered to avoid duplicate messages
     if (
       posSuccessOrder.feedback_whatsapp_status === 'sent' ||
       posSuccessOrder.feedback_whatsapp_status === 'delivered' ||
       posSuccessOrder.feedback_whatsapp_status === 'read'
     ) {
-      setPosFeedbackMessage('Customer feedback WhatsApp has already been sent to this customer.');
+      const msg = 'Customer feedback WhatsApp has already been submitted for this bill.';
+      setPosFeedbackMessage(msg);
       setPosFeedbackStatus('sent');
+      toast.info(msg);
       return;
     }
 
-    setPosFeedbackSending(true);
-    setPosFeedbackMessage(null);
-    setPosFeedbackStatus(null);
-    try {
-      const result = await api.sendOrderWhatsAppFeedback(posSuccessOrder.id);
-      if (result.success) {
-        if (result.status === 'sent') {
-          setPosFeedbackMessage('Feedback request sent');
-          setPosFeedbackStatus('sent');
-          setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'sent' } : prev);
+    await posFeedbackAction.run(
+      async () => {
+        setPosFeedbackMessage(null);
+        setPosFeedbackStatus(null);
+        const result = await api.sendOrderWhatsAppFeedback(posSuccessOrder.id);
+        if (result.success) {
+          if (result.status === 'sent') {
+            setPosFeedbackMessage('WhatsApp feedback template submitted successfully');
+            setPosFeedbackStatus('sent');
+            setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'sent' } : prev);
+            toast.success('WhatsApp feedback template submitted successfully');
+          } else {
+            const msg = result.message || 'Feedback request queued and will retry automatically';
+            setPosFeedbackMessage(msg);
+            setPosFeedbackStatus('queued');
+            setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'retrying' } : prev);
+            toast.info(msg);
+          }
         } else {
-          setPosFeedbackMessage(result.message || 'Feedback request queued and will retry automatically');
-          setPosFeedbackStatus('queued');
-          setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'retrying' } : prev);
+          const errMsg = result.error || 'Feedback request failed — Retry';
+          setPosFeedbackMessage(errMsg);
+          setPosFeedbackStatus('failed');
+          setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'failed' } : prev);
+          toast.error(errMsg);
         }
-      } else {
-        setPosFeedbackMessage(result.error || 'Feedback request failed — Retry');
-        setPosFeedbackStatus('failed');
-        setPosSuccessOrder(prev => prev ? { ...prev, feedback_whatsapp_status: 'failed' } : prev);
+        loadAllData();
+        return result;
+      },
+      {
+        errorFallback: 'Failed to submit WhatsApp feedback template.',
+        onError: (msg) => {
+          setPosFeedbackMessage(msg);
+          setPosFeedbackStatus('failed');
+        }
       }
-      loadAllData();
-    } catch (err: any) {
-      setPosFeedbackMessage(err.message || 'Feedback request failed — Retry');
-      setPosFeedbackStatus('failed');
-    } finally {
-      setPosFeedbackSending(false);
-    }
+    );
   };
 
   const handleRetryPosReceipt = async (orderId: string) => {
-    setPosRetryingReceipt(true);
-    try {
-      const res = await api.retryOrderWhatsApp(orderId, 'bill_receipt');
-      if (res.success) {
-        setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, receipt_whatsapp_status: 'sent', receipt_whatsapp_error: undefined } : prev);
-      } else {
-        setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, receipt_whatsapp_status: 'failed', receipt_whatsapp_error: res.error } : prev);
+    await posRetryReceiptAction.run(
+      async () => {
+        const res = await api.retryOrderWhatsApp(orderId, 'bill_receipt');
+        if (res.success) {
+          setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, receipt_whatsapp_status: 'sent', receipt_whatsapp_error: undefined } : prev);
+          toast.success('WhatsApp bill receipt template submitted successfully');
+        } else {
+          const errMsg = res.error || 'Failed to retry WhatsApp receipt.';
+          setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, receipt_whatsapp_status: 'failed', receipt_whatsapp_error: errMsg } : prev);
+          toast.error(errMsg);
+        }
+        loadAllData();
+        return res;
+      },
+      {
+        errorFallback: 'Failed to retry WhatsApp bill receipt.'
       }
-      loadAllData();
-    } catch (err: any) {
-      console.warn('Error retrying receipt WhatsApp:', err);
-    } finally {
-      setPosRetryingReceipt(false);
-    }
+    );
   };
 
   const handleRetryPosFeedback = async (orderId: string) => {
-    setPosRetryingFeedback(true);
-    try {
-      const res = await api.retryOrderWhatsApp(orderId, 'customer_feedback');
-      if (res.success) {
-        setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, feedback_whatsapp_status: 'sent', feedback_whatsapp_error: undefined } : prev);
-      } else {
-        setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, feedback_whatsapp_status: 'failed', feedback_whatsapp_error: res.error } : prev);
+    await posRetryFeedbackAction.run(
+      async () => {
+        const res = await api.retryOrderWhatsApp(orderId, 'customer_feedback');
+        if (res.success) {
+          setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, feedback_whatsapp_status: 'sent', feedback_whatsapp_error: undefined } : prev);
+          toast.success('WhatsApp feedback template submitted successfully');
+        } else {
+          const errMsg = res.error || 'Failed to retry WhatsApp feedback.';
+          setPosSuccessOrder(prev => prev && prev.id === orderId ? { ...prev, feedback_whatsapp_status: 'failed', feedback_whatsapp_error: errMsg } : prev);
+          toast.error(errMsg);
+        }
+        loadAllData();
+        return res;
+      },
+      {
+        errorFallback: 'Failed to retry WhatsApp feedback template.'
       }
-      loadAllData();
-    } catch (err: any) {
-      console.warn('Error retrying feedback WhatsApp:', err);
-    } finally {
-      setPosRetryingFeedback(false);
-    }
+    );
   };
 
   const handleRetryOrderWhatsApp = async (orderId: string) => {
-    try {
-      const res = await api.retryOrderWhatsApp(orderId);
-      loadAllData();
-    } catch (err: any) {
-      console.warn('Error retrying WhatsApp message:', err);
-    }
+    await rowAction.runForKey(
+      `retry-wa-${orderId}`,
+      async () => {
+        const res = await api.retryOrderWhatsApp(orderId);
+        if (res && (res as any).success === false) {
+          throw new Error((res as any).error || 'Failed to resubmit WhatsApp notification.');
+        }
+        loadAllData();
+        return res;
+      },
+      {
+        successMessage: 'WhatsApp notification resubmitted',
+        errorFallback: 'Failed to resubmit WhatsApp notification.'
+      }
+    );
   };
 
   // Stock Movement Submit
   const handleRecordStockMovement = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!stockMovementModal.product) return;
-    try {
-      await api.recordInventoryMovement({
-        product_id: stockMovementModal.product.id,
-        product_name: stockMovementModal.product.name,
-        movement_type: stockType,
-        quantity: stockQty,
-        notes: stockNotes,
-        performed_by: currentUser?.name || 'Inventory Staff'
-      }, currentUser?.name);
-      setStockMovementModal({ isOpen: false });
-      setStockNotes('');
-      setStockQty(1);
-      loadAllData();
-    } catch (e) {
-      console.error(e);
-    }
+    const product = stockMovementModal.product;
+    await stockMovementAction.run(
+      async () => {
+        await api.recordInventoryMovement({
+          product_id: product.id,
+          product_name: product.name,
+          movement_type: stockType,
+          quantity: stockQty,
+          notes: stockNotes,
+          performed_by: currentUser?.name || 'Inventory Staff'
+        }, currentUser?.name);
+        setStockMovementModal({ isOpen: false });
+        setStockNotes('');
+        setStockQty(1);
+        await loadAllData();
+      },
+      {
+        successMessage: `Stock movement recorded for ${product.name}`,
+        errorFallback: 'Failed to record stock movement.'
+      }
+    );
   };
 
   // CSV Export for Sales & Financial Reports
   const handleExportCSV = () => {
-    if (!detailedReports) return;
+    if (!detailedReports) {
+      toast.warning('No report data loaded yet to export.');
+      return;
+    }
     const rows = [
       ['The Glossy Looks - Sales & Revenue Audit Report'],
       ['Report Period', detailedReports.filter.period.toUpperCase()],
@@ -1054,9 +1168,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    toast.success('Sales report CSV exported');
   };
 
-  // Owner RBAC User Management Handlers
+  // Owner RBAC User Management Handlers (with SMAV sync feedback)
   const handleSaveAdminUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!currentUser || currentUser.role !== 'owner') return;
@@ -1070,39 +1185,46 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     const role = formData.get('role') as AdminRole;
     const password = (formData.get('password') as string)?.trim();
     const is_active = formData.get('is_active') === 'true';
+    const isEditing = Boolean(userModal.data?.id);
+    const editingId = userModal.data?.id;
 
-    try {
-      if (userModal.data?.id) {
-        // Edit existing staff user
-        await api.updateAdminUser(
-          userModal.data.id,
-          { user_id, name, email, phone, role, is_active },
-          currentUser.name
-        );
-      } else {
-        // Create new staff user
-        if (!password || password.length < 6) {
-          alert('Password must be at least 6 characters.');
-          return;
-        }
-        await api.createAdminUser(
-          { user_id, name, email, phone, role, password, is_active: true } as any,
-          currentUser.name
-        );
-      }
-      setUserModal({ isOpen: false });
-      await loadAllData();
-      if (currentUser && userModal.data?.id === currentUser.id) {
-        const usersData = await api.getAdminUsers();
-        const updatedMe = usersData.find(u => u.id === currentUser.id);
-        if (updatedMe) {
-          setCurrentUser(updatedMe);
-          sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ user: updatedMe }));
-        }
-      }
-    } catch (err: any) {
-      alert(err.message || 'Failed to save staff user.');
+    if (!isEditing && (!password || password.length < 6)) {
+      toast.warning('Password must be at least 6 characters.');
+      return;
     }
+
+    await adminUserSaveAction.run(
+      async () => {
+        if (isEditing && editingId) {
+          await api.updateAdminUser(
+            editingId,
+            { user_id, name, email, phone, role, is_active },
+            currentUser.name
+          );
+        } else {
+          await api.createAdminUser(
+            { user_id, name, email, phone, role, password, is_active: true } as any,
+            currentUser.name
+          );
+        }
+        setUserModal({ isOpen: false });
+        await loadAllData();
+        if (currentUser && editingId === currentUser.id) {
+          const usersData = await api.getAdminUsers();
+          const updatedMe = usersData.find(u => u.id === currentUser.id);
+          if (updatedMe) {
+            setCurrentUser(updatedMe);
+            sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ user: updatedMe }));
+          }
+        }
+      },
+      {
+        successMessage: isEditing
+          ? `Staff account for ${name} updated and synced`
+          : `Staff account for ${name} created and synced`,
+        errorFallback: 'Failed to save staff user.'
+      }
+    );
   };
 
   const handleResetAdminPassword = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -1112,45 +1234,59 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     const formData = new FormData(form);
     const newPassword = (formData.get('new_password') as string)?.trim();
     const confirmPassword = (formData.get('confirm_password') as string)?.trim();
+    const targetUser = resetPasswordModal.user;
 
     if (!newPassword || newPassword.length < 6) {
-      alert('Password must be at least 6 characters.');
+      toast.warning('Password must be at least 6 characters.');
       return;
     }
     if (newPassword !== confirmPassword) {
-      alert('Passwords do not match.');
+      toast.warning('Passwords do not match.');
       return;
     }
 
-    try {
-      await api.resetAdminUserPassword(resetPasswordModal.user.id, newPassword, currentUser.name);
-      setResetPasswordModal({ isOpen: false });
-      const logsData = await api.getAuditLogs();
-      setAuditLogs(logsData);
-      alert(`Password for ${resetPasswordModal.user.name} has been securely updated.`);
-    } catch (err: any) {
-      alert(err.message || 'Failed to reset password.');
-    }
+    await resetPasswordAction.run(
+      async () => {
+        await api.resetAdminUserPassword(targetUser.id, newPassword, currentUser.name);
+        setResetPasswordModal({ isOpen: false });
+        const logsData = await api.getAuditLogs();
+        setAuditLogs(logsData);
+      },
+      {
+        successMessage: `Password for ${targetUser.name} updated and synced`,
+        errorFallback: 'Failed to reset staff password.'
+      }
+    );
   };
 
   const handleConfirmUserStatusToggle = async () => {
     if (!currentUser || currentUser.role !== 'owner' || !deactivateConfirmModal.user) return;
-    try {
-      const user = deactivateConfirmModal.user;
-      if (deactivateConfirmModal.action === 'delete') {
-        await api.deleteAdminUser(user.id, currentUser.name);
-      } else {
-        await api.updateAdminUser(
-          user.id,
-          { is_active: !user.is_active },
-          currentUser.name
-        );
+    const user = deactivateConfirmModal.user;
+    const actionType = deactivateConfirmModal.action;
+
+    await userStatusToggleAction.run(
+      async () => {
+        if (actionType === 'delete') {
+          await api.deleteAdminUser(user.id, currentUser.name);
+        } else {
+          await api.updateAdminUser(
+            user.id,
+            { is_active: !user.is_active },
+            currentUser.name
+          );
+        }
+        setDeactivateConfirmModal({ isOpen: false });
+        await loadAllData();
+      },
+      {
+        successMessage: actionType === 'delete'
+          ? `Staff user ${user.name} removed`
+          : user.is_active
+          ? `${user.name} deactivated and synced`
+          : `${user.name} reactivated and synced`,
+        errorFallback: 'Failed to update staff user status.'
       }
-      setDeactivateConfirmModal({ isOpen: false });
-      await loadAllData();
-    } catch (err: any) {
-      alert(err.message || 'Failed to update user status.');
-    }
+    );
   };
 
   // =========================================================================
@@ -1243,23 +1379,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               </div>
             )}
 
-            <button
+            <ActionButton
               type="submit"
-              disabled={isLoggingIn}
+              loading={loginAction.isLoading}
+              loadingText="Signing in..."
+              icon={<Lock className="w-4 h-4" />}
+              spinnerClassName="w-4 h-4"
               className="w-full py-3 bg-gradient-to-r from-[#D4AF37] to-[#F3D7D7] text-[#120B0F] font-bold rounded-xl shadow-lg hover:opacity-95 transition-all flex items-center justify-center gap-2 mt-2"
             >
-              {isLoggingIn ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span>Verifying Authorization...</span>
-                </>
-              ) : (
-                <>
-                  <Lock className="w-4 h-4" />
-                  <span>Secure Sign In</span>
-                </>
-              )}
-            </button>
+              <span>Secure Sign In</span>
+            </ActionButton>
           </form>
 
           {/* Customer Redirection */}
@@ -1775,14 +1904,29 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             {apt.status}
                           </span>
                           <button
-                            onClick={async () => {
-                              await api.updateAppointment(apt.id, { status: 'Confirmed' }, currentUser.name);
-                              loadAllData();
+                            type="button"
+                            disabled={rowAction.isPending(`confirm-apt-${apt.id}`) || apt.status === 'Confirmed'}
+                            onClick={() => {
+                              rowAction.runForKey(
+                                `confirm-apt-${apt.id}`,
+                                async () => {
+                                  await api.updateAppointment(apt.id, { status: 'Confirmed' }, currentUser.name);
+                                  await loadAllData();
+                                },
+                                {
+                                  successMessage: `Appointment for ${apt.customer_name} confirmed`,
+                                  errorFallback: 'Failed to confirm appointment.'
+                                }
+                              );
                             }}
-                            className="p-1 text-emerald-700 hover:bg-emerald-50 rounded"
-                            title="Confirm"
+                            className="p-1 text-emerald-700 hover:bg-emerald-50 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                            title={apt.status === 'Confirmed' ? 'Confirmed' : 'Confirm'}
                           >
-                            <Check className="w-4 h-4" />
+                            {rowAction.isPending(`confirm-apt-${apt.id}`) ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Check className="w-4 h-4" />
+                            )}
                           </button>
                         </div>
                       </div>
@@ -1868,15 +2012,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         </button>
                       )}
                     </div>
-                    <button
+                    <ActionButton
                       type="button"
-                      onClick={() => loadAllData()}
+                      loading={refreshCrmAction.isLoading || loading}
+                      loadingText="Refreshing..."
+                      icon={<RefreshCw className="w-3.5 h-3.5" />}
+                      onClick={() => {
+                        refreshCrmAction.run(
+                          async () => {
+                            await loadAllData();
+                          },
+                          {
+                            successMessage: 'Customer directory refreshed',
+                            errorFallback: 'Failed to refresh customer directory.'
+                          }
+                        );
+                      }}
                       className="px-3 py-2.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer"
                       title="Refresh CRM customers from Supabase"
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#5B132B]' : ''}`} />
                       <span className="hidden sm:inline">Refresh</span>
-                    </button>
+                    </ActionButton>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -2042,13 +2198,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                   {isManager && (
                                     <button
                                       type="button"
-                                      onClick={async () => {
-                                        if (confirm(`Are you sure you want to delete customer ${c.name}?`)) {
-                                          await api.deleteCustomer(c.id, currentUser.name);
-                                          loadAllData();
-                                        }
+                                      disabled={rowAction.isPending(`del-cust-${c.id}`)}
+                                      onClick={() => {
+                                        setConfirmActionInput('');
+                                        setConfirmActionError('');
+                                        setConfirmActionModal({
+                                          isOpen: true,
+                                          title: 'Delete Customer?',
+                                          description: `Are you sure you want to delete customer ${c.name}? This action cannot be undone.`,
+                                          confirmLabel: 'Delete Customer',
+                                          loadingLabel: 'Deleting...',
+                                          onConfirm: async () => {
+                                            await api.deleteCustomer(c.id, currentUser.name);
+                                            await loadAllData();
+                                            toast.success(`Customer ${c.name} deleted`);
+                                          }
+                                        });
                                       }}
-                                      className="inline-flex p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg transition-colors"
+                                      className="inline-flex p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg transition-colors disabled:opacity-50"
                                       title="Delete Customer"
                                     >
                                       <Trash2 className="w-4 h-4" />
@@ -2170,46 +2337,78 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <div className="text-[10px] text-slate-400">Total: {apt.services.reduce((a, b) => a + b.duration, 0)}m</div>
                           </td>
                           <td className="p-3.5">
-                            <select
-                              value={apt.assigned_staff_id || ''}
-                              onChange={async (e) => {
-                                const stf = staffList.find(s => s.id === e.target.value);
-                                await api.updateAppointment(apt.id, {
-                                  assigned_staff_id: stf?.id,
-                                  assigned_staff_name: stf?.name
-                                }, currentUser.name);
-                                loadAllData();
-                              }}
-                              className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-1"
-                            >
-                              <option value="">-- Assign Stylist --</option>
-                              {staffList
-                                .filter(s => s.is_active || s.id === apt.assigned_staff_id)
-                                .map(s => (
-                                  <option key={s.id} value={s.id}>
-                                    {s.name} ({s.title || s.role})
-                                  </option>
-                                ))}
-                            </select>
+                            <div className="flex items-center gap-1.5">
+                              <select
+                                value={apt.assigned_staff_id || ''}
+                                disabled={rowAction.isPending(`apt-staff-${apt.id}`)}
+                                onChange={(e) => {
+                                  const staffIdVal = e.target.value;
+                                  const stf = staffList.find(s => s.id === staffIdVal);
+                                  rowAction.runForKey(
+                                    `apt-staff-${apt.id}`,
+                                    async () => {
+                                      await api.updateAppointment(apt.id, {
+                                        assigned_staff_id: stf?.id,
+                                        assigned_staff_name: stf?.name
+                                      }, currentUser.name);
+                                      await loadAllData();
+                                    },
+                                    {
+                                      successMessage: stf ? `Assigned ${stf.name} to ${apt.booking_reference}` : `Unassigned stylist for ${apt.booking_reference}`,
+                                      errorFallback: 'Failed to assign stylist.'
+                                    }
+                                  );
+                                }}
+                                className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-1 disabled:opacity-60"
+                              >
+                                <option value="">-- Assign Stylist --</option>
+                                {staffList
+                                  .filter(s => s.is_active || s.id === apt.assigned_staff_id)
+                                  .map(s => (
+                                    <option key={s.id} value={s.id}>
+                                      {s.name} ({s.title || s.role})
+                                    </option>
+                                  ))}
+                              </select>
+                              {rowAction.isPending(`apt-staff-${apt.id}`) && (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#5B132B] shrink-0" />
+                              )}
+                            </div>
                           </td>
                           <td className="p-3.5 font-bold text-slate-900">₹{apt.final_amount}</td>
                           <td className="p-3.5">
-                            <select
-                              value={apt.status}
-                              onChange={async (e) => {
-                                await api.updateAppointment(apt.id, { status: e.target.value as any }, currentUser.name);
-                                loadAllData();
-                              }}
-                              className="text-xs font-bold bg-white border border-slate-200 rounded-lg p-1"
-                            >
-                              <option value="Pending">Pending</option>
-                              <option value="Confirmed">Confirmed</option>
-                              <option value="Checked In">Checked In</option>
-                              <option value="Service In Progress">In Progress</option>
-                              <option value="Completed">Completed</option>
-                              <option value="Cancelled">Cancelled</option>
-                              <option value="No Show">No Show</option>
-                            </select>
+                            <div className="flex items-center gap-1.5">
+                              <select
+                                value={apt.status}
+                                disabled={rowAction.isPending(`apt-status-${apt.id}`)}
+                                onChange={(e) => {
+                                  const nextStatus = e.target.value as any;
+                                  rowAction.runForKey(
+                                    `apt-status-${apt.id}`,
+                                    async () => {
+                                      await api.updateAppointment(apt.id, { status: nextStatus }, currentUser.name);
+                                      await loadAllData();
+                                    },
+                                    {
+                                      successMessage: `Appointment ${apt.booking_reference} marked as ${nextStatus}`,
+                                      errorFallback: 'Failed to update appointment status.'
+                                    }
+                                  );
+                                }}
+                                className="text-xs font-bold bg-white border border-slate-200 rounded-lg p-1 disabled:opacity-60"
+                              >
+                                <option value="Pending">Pending</option>
+                                <option value="Confirmed">Confirmed</option>
+                                <option value="Checked In">Checked In</option>
+                                <option value="Service In Progress">In Progress</option>
+                                <option value="Completed">Completed</option>
+                                <option value="Cancelled">Cancelled</option>
+                                <option value="No Show">No Show</option>
+                              </select>
+                              {rowAction.isPending(`apt-status-${apt.id}`) && (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#5B132B] shrink-0" />
+                              )}
+                            </div>
                           </td>
                           <td className="p-3.5 text-right space-x-1.5">
                             <button
@@ -2997,16 +3196,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           )}
 
                           {/* 1. Fast & Clear Generate Bill Button */}
-                          {isGeneratingBill ? (
-                            <button
-                              type="button"
-                              disabled
-                              className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-[#5B132B]/85 flex items-center justify-center gap-2 shadow-sm cursor-not-allowed"
-                            >
-                              <Loader2 className="w-4 h-4 animate-spin text-[#D4AF37]" />
-                              <span>Generating Bill…</span>
-                            </button>
-                          ) : posSuccessOrder ? (
+                          {posSuccessOrder ? (
                             <button
                               type="button"
                               disabled
@@ -3016,54 +3206,46 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               <span>Bill Generated ({posSuccessOrder.bill_number})</span>
                             </button>
                           ) : (
-                            <button
+                            <ActionButton
                               type="submit"
+                              loading={posCheckoutAction.isLoading}
+                              loadingText="Generating..."
                               disabled={posSelectedItems.length === 0}
-                              className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] transition-colors flex items-center justify-center gap-2 shadow-md shadow-[#5B132B]/15 disabled:opacity-50 cursor-pointer"
+                              icon={<Receipt className="w-4 h-4 text-[#D4AF37]" />}
+                              spinnerClassName="w-4 h-4 text-[#D4AF37]"
+                              className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] transition-colors flex items-center justify-center gap-2 shadow-md shadow-[#5B132B]/15 cursor-pointer"
                             >
-                              <Receipt className="w-4 h-4 text-[#D4AF37]" />
                               <span>Generate Bill & Auto-Print Receipt</span>
-                            </button>
+                            </ActionButton>
                           )}
 
                           {/* 2. Manual Send Customer Feedback on WhatsApp */}
                           {(() => {
                             const isFeedbackSent = posSuccessOrder?.feedback_whatsapp_status === 'sent' || posSuccessOrder?.feedback_whatsapp_status === 'delivered' || posSuccessOrder?.feedback_whatsapp_status === 'read';
                             return (
-                              <button
+                              <ActionButton
                                 type="button"
                                 onClick={handleSendPosFeedback}
-                                disabled={!posSuccessOrder || posFeedbackSending || isFeedbackSent}
+                                loading={posFeedbackAction.isLoading}
+                                loadingText="Sending..."
+                                disabled={!posSuccessOrder || isFeedbackSent}
+                                icon={isFeedbackSent ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <MessageCircle className="w-4 h-4" />}
+                                spinnerClassName="w-4 h-4 text-emerald-600"
                                 className={`w-full py-2.5 px-4 rounded-xl text-xs font-bold transition-colors flex items-center justify-center gap-2 ${
                                   isFeedbackSent
                                     ? 'bg-emerald-100 text-emerald-800 border border-emerald-300 cursor-default'
-                                    : 'text-[#087443] bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer'
+                                    : 'text-[#087443] bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 cursor-pointer'
                                 }`}
                                 title={
                                   isFeedbackSent
-                                    ? 'Feedback template already delivered to customer'
+                                    ? 'Feedback template already submitted for this bill'
                                     : posSuccessOrder
-                                    ? 'Send approved feedback template immediately without waiting 2 minutes'
+                                    ? 'Submit approved feedback template immediately without waiting 2 minutes'
                                     : 'Generate the bill first'
                                 }
                               >
-                                {posFeedbackSending ? (
-                                  <>
-                                    <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
-                                    <span>Sending feedback…</span>
-                                  </>
-                                ) : isFeedbackSent ? (
-                                  <>
-                                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                                    <span>Feedback Sent on WhatsApp</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <MessageCircle className="w-4 h-4" />
-                                    <span>Send Customer Feedback on WhatsApp</span>
-                                  </>
-                                )}
-                              </button>
+                                <span>{isFeedbackSent ? 'Feedback Submitted on WhatsApp' : 'Send Customer Feedback on WhatsApp'}</span>
+                              </ActionButton>
                             );
                           })()}
 
@@ -3083,13 +3265,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                 <span className="font-semibold">{posFeedbackMessage}</span>
                               </div>
                               {posFeedbackStatus === 'failed' && posSuccessOrder && (
-                                <button
+                                <ActionButton
                                   type="button"
+                                  loading={posFeedbackAction.isLoading}
+                                  loadingText="Sending..."
+                                  spinnerClassName="w-3 h-3"
                                   onClick={handleSendPosFeedback}
-                                  className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-md text-[10px] font-bold cursor-pointer"
+                                  className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-md text-[10px] font-bold cursor-pointer inline-flex items-center gap-1"
                                 >
                                   Retry
-                                </button>
+                                </ActionButton>
                               )}
                             </div>
                           )}
@@ -3135,15 +3320,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                          receiptStatus === 'failed' ? 'Failed' : 'Queued'}
                                       </span>
                                       {receiptStatus === 'failed' && (
-                                        <button
+                                        <ActionButton
                                           type="button"
                                           onClick={() => handleRetryPosReceipt(posSuccessOrder.id)}
-                                          disabled={posRetryingReceipt}
-                                          className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer transition-colors"
+                                          loading={posRetryReceiptAction.isLoading}
+                                          loadingText="Sending..."
+                                          spinnerClassName="w-3 h-3"
+                                          className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer transition-colors inline-flex items-center gap-1"
                                           title="Retry sending bill receipt template"
                                         >
-                                          {posRetryingReceipt ? 'Retrying…' : 'Retry'}
-                                        </button>
+                                          Retry
+                                        </ActionButton>
                                       )}
                                     </div>
                                     {receiptStatus === 'failed' && posSuccessOrder.receipt_whatsapp_error && (
@@ -3184,15 +3371,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                          feedbackStatus === 'failed' ? 'Failed' : 'Scheduled for 2 minutes'}
                                       </span>
                                       {feedbackStatus === 'failed' && (
-                                        <button
+                                        <ActionButton
                                           type="button"
                                           onClick={() => handleRetryPosFeedback(posSuccessOrder.id)}
-                                          disabled={posRetryingFeedback}
-                                          className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer transition-colors"
+                                          loading={posRetryFeedbackAction.isLoading}
+                                          loadingText="Sending..."
+                                          spinnerClassName="w-3 h-3"
+                                          className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer transition-colors inline-flex items-center gap-1"
                                           title="Retry sending customer feedback template"
                                         >
-                                          {posRetryingFeedback ? 'Retrying…' : 'Retry'}
-                                        </button>
+                                          Retry
+                                        </ActionButton>
                                       )}
                                     </div>
                                   </div>
@@ -3654,12 +3843,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                   {p.status === 'Success' && isManager && (
                                     <button
                                       type="button"
-                                      onClick={async () => {
-                                        const reason = prompt('Please enter reason for refund:');
-                                        if (reason) {
-                                          await api.refundPayment(p.id, reason, currentUser.name);
-                                          loadAllData();
-                                        }
+                                      onClick={() => {
+                                        setConfirmActionInput('');
+                                        setConfirmActionError('');
+                                        setConfirmActionModal({
+                                          isOpen: true,
+                                          title: `Refund Payment (${p.bill_number})`,
+                                          description: `Issue a refund of ₹${Number(p.amount || 0).toFixed(2)} for ${p.customer_name || 'this customer'}. This action will be recorded in the audit ledger.`,
+                                          confirmLabel: 'Confirm Refund',
+                                          loadingLabel: 'Refunding...',
+                                          inputLabel: 'Reason for Refund *',
+                                          inputPlaceholder: 'e.g. Service cancelled / duplicate charge',
+                                          inputRequired: true,
+                                          onConfirm: async (reason) => {
+                                            await api.refundPayment(p.id, (reason || '').trim(), currentUser.name);
+                                            await loadAllData();
+                                            toast.success(`Payment ${p.bill_number} refunded successfully`);
+                                          }
+                                        });
                                       }}
                                       className="py-1 px-2.5 text-[11px] font-bold text-rose-600 hover:bg-rose-50 rounded-lg cursor-pointer"
                                     >
@@ -3740,13 +3941,25 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               <Edit3 className="w-4 h-4" />
                             </button>
                             <button
-                              onClick={async () => {
-                                if (confirm(`Delete service ${srv.name}?`)) {
-                                  await api.deleteService(srv.id, currentUser.name);
-                                  loadAllData();
-                                }
+                              type="button"
+                              onClick={() => {
+                                setConfirmActionInput('');
+                                setConfirmActionError('');
+                                setConfirmActionModal({
+                                  isOpen: true,
+                                  title: 'Delete Service?',
+                                  description: `Are you sure you want to delete "${srv.name}" from the salon service menu?`,
+                                  confirmLabel: 'Delete Service',
+                                  loadingLabel: 'Deleting...',
+                                  onConfirm: async () => {
+                                    await api.deleteService(srv.id, currentUser.name);
+                                    await loadAllData();
+                                    toast.success(`Service "${srv.name}" deleted`);
+                                  }
+                                });
                               }}
                               className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
+                              title="Delete Service"
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
@@ -4000,24 +4213,50 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     </div>
 
                     <div className="p-3 border-t border-slate-100 flex items-center justify-between text-xs">
-                      <button
-                        onClick={async () => {
-                          await api.updateGalleryItem(item.id, { is_approved: !item.is_approved }, currentUser.name);
-                          loadAllData();
+                      <ActionButton
+                        type="button"
+                        loading={rowAction.isPending(`gallery-toggle-${item.id}`)}
+                        loadingText="Updating..."
+                        spinnerClassName="w-3 h-3"
+                        onClick={() => {
+                          const nextApproved = !item.is_approved;
+                          rowAction.runForKey(
+                            `gallery-toggle-${item.id}`,
+                            async () => {
+                              await api.updateGalleryItem(item.id, { is_approved: nextApproved }, currentUser.name);
+                              await loadAllData();
+                            },
+                            {
+                              successMessage: nextApproved ? `"${item.title}" approved for gallery` : `"${item.title}" unpublished`,
+                              errorFallback: 'Failed to update gallery item.'
+                            }
+                          );
                         }}
-                        className="text-xs font-semibold text-[#5B132B]"
+                        className="text-xs font-semibold text-[#5B132B] inline-flex items-center gap-1"
                       >
                         {item.is_approved ? 'Unpublish' : 'Approve'}
-                      </button>
+                      </ActionButton>
 
                       <button
-                        onClick={async () => {
-                          if (confirm(`Delete ${item.title}?`)) {
-                            await api.deleteGalleryItem(item.id, currentUser.name);
-                            loadAllData();
-                          }
+                        type="button"
+                        onClick={() => {
+                          setConfirmActionInput('');
+                          setConfirmActionError('');
+                          setConfirmActionModal({
+                            isOpen: true,
+                            title: 'Delete Portfolio Item?',
+                            description: `Permanently delete "${item.title}" from the salon gallery?`,
+                            confirmLabel: 'Delete Item',
+                            loadingLabel: 'Deleting...',
+                            onConfirm: async () => {
+                              await api.deleteGalleryItem(item.id, currentUser.name);
+                              await loadAllData();
+                              toast.success(`Gallery item "${item.title}" deleted`);
+                            }
+                          });
                         }}
                         className="text-rose-500 hover:text-rose-700"
+                        title="Delete Item"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
@@ -4063,24 +4302,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
+                  <ActionButton
                     type="button"
                     onClick={() => handleTriggerDailyStylistReport(false)}
-                    disabled={sendingDailyStylistReports}
-                    className={`py-2 px-3.5 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors ${
-                      sendingDailyStylistReports
-                        ? 'bg-[#25D366]/80 cursor-wait'
-                        : 'bg-[#25D366] hover:bg-[#1EBE5D]'
-                    }`}
+                    loading={dailyReportAction.isLoading}
+                    loadingText="Sending..."
+                    icon={<MessageSquare className="w-4 h-4 text-white" />}
+                    spinnerClassName="w-4 h-4 text-white"
+                    className="py-2 px-3.5 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors bg-[#25D366] hover:bg-[#1EBE5D]"
                     title="Send today's stylist sales report via WhatsApp"
                   >
-                    {sendingDailyStylistReports ? (
-                      <RefreshCw className="w-4 h-4 animate-spin text-white" />
-                    ) : (
-                      <MessageSquare className="w-4 h-4 text-white" />
-                    )}
                     <span>Send Today’s Stylist Sales Report Now</span>
-                  </button>
+                  </ActionButton>
                   <button
                     onClick={handleExportCSV}
                     className="py-2 px-3.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors"
@@ -4090,7 +4323,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     <span>Export CSV</span>
                   </button>
                   <button
-                    onClick={() => window.print()}
+                    onClick={() => {
+                      toast.info('Opening print dialog...');
+                      window.print();
+                    }}
                     className="py-2 px-3.5 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors"
                     title="Print formatted sales report"
                   >
@@ -4158,23 +4394,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       <Clock className="w-3.5 h-3.5 text-slate-500" />
                       <span>{showDailySalesHistorySection ? 'Hide History' : `View History (${dailySalesHistory.length})`}</span>
                     </button>
-                    <button
+                    <ActionButton
                       type="button"
                       onClick={() => handleTriggerDailyStylistReport(false)}
-                      disabled={sendingDailyStylistReports}
-                      className={`px-3.5 py-1.5 rounded-xl text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors ${
-                        sendingDailyStylistReports
-                          ? 'bg-[#25D366]/80 cursor-wait'
-                          : 'bg-[#25D366] hover:bg-[#1EBE5D]'
-                      }`}
+                      loading={dailyReportAction.isLoading}
+                      loadingText="Sending..."
+                      icon={<MessageSquare className="w-3.5 h-3.5" />}
+                      className="px-3.5 py-1.5 rounded-xl text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors bg-[#25D366] hover:bg-[#1EBE5D]"
                     >
-                      {sendingDailyStylistReports ? (
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <MessageSquare className="w-3.5 h-3.5" />
-                      )}
                       <span>Send Today’s Stylist Sales Report Now</span>
-                    </button>
+                    </ActionButton>
                   </div>
                 </div>
 
@@ -4222,14 +4451,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         <Clock className="w-3.5 h-3.5 text-slate-500" />
                         <span>Daily WhatsApp Reports Log ({dailySalesHistory.length} entries)</span>
                       </h5>
-                      <button
+                      <ActionButton
                         type="button"
-                        onClick={loadDailySalesHistory}
+                        loading={refreshHistoryAction.isLoading}
+                        loadingText="Refreshing..."
+                        spinnerClassName="w-3 h-3"
+                        icon={<RefreshCw className="w-3 h-3" />}
+                        onClick={() => loadDailySalesHistory(true)}
                         className="text-[11px] text-slate-500 hover:text-slate-800 flex items-center gap-1"
                       >
-                        <RefreshCw className="w-3 h-3" />
                         <span>Refresh History</span>
-                      </button>
+                      </ActionButton>
                     </div>
 
                     {dailySalesHistory.length === 0 ? (
@@ -4341,19 +4573,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
                       <button
                         type="button"
+                        disabled={dailyReportAction.isLoading}
                         onClick={() => setResendConfirmModalOpen(false)}
-                        className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors"
+                        className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-50"
                       >
                         Cancel
                       </button>
-                      <button
+                      <ActionButton
                         type="button"
+                        loading={dailyReportAction.isLoading}
+                        loadingText="Sending..."
+                        icon={<MessageSquare className="w-3.5 h-3.5" />}
                         onClick={() => handleTriggerDailyStylistReport(true)}
                         className="px-4 py-2 bg-[#25D366] hover:bg-[#1EBE5D] text-white rounded-xl text-xs font-bold transition-colors shadow-xs flex items-center gap-1.5"
                       >
-                        <MessageSquare className="w-3.5 h-3.5" />
                         <span>Yes, Re-send WhatsApp Reports</span>
-                      </button>
+                      </ActionButton>
                     </div>
                   </div>
                 </div>
@@ -4370,11 +4605,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     <button
                       key={period}
                       type="button"
+                      disabled={loadingReports}
                       onClick={() => {
                         setReportFilterPeriod(period);
                         loadDetailedReports(period, customStartDate, customEndDate);
                       }}
-                      className={`py-1.5 px-3 rounded-lg text-xs font-semibold capitalize transition-all ${
+                      className={`py-1.5 px-3 rounded-lg text-xs font-semibold capitalize transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
                         reportFilterPeriod === period
                           ? 'bg-[#5B132B] text-white shadow-xs'
                           : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -4405,13 +4641,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         className="p-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-slate-50"
                       />
                     </div>
-                    <button
+                    <ActionButton
                       type="button"
-                      onClick={() => loadDetailedReports('custom', customStartDate, customEndDate)}
-                      className="py-1.5 px-3 bg-[#5B132B] text-white rounded-lg text-xs font-bold hover:bg-[#430D1F]"
+                      loading={loadingReports}
+                      loadingText="Generating..."
+                      onClick={() => loadDetailedReports('custom', customStartDate, customEndDate, true)}
+                      className="py-1.5 px-3 bg-[#5B132B] text-white rounded-lg text-xs font-bold hover:bg-[#430D1F] inline-flex items-center gap-1.5"
                     >
                       Apply
-                    </button>
+                    </ActionButton>
                   </div>
                 )}
               </div>
@@ -5040,16 +5278,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             </div>
 
             <div className="flex gap-2 pt-2">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl hover:bg-[#430D1F]"
+                loading={stockMovementAction.isLoading}
+                loadingText="Saving..."
+                className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl hover:bg-[#430D1F] flex items-center justify-center gap-1.5"
               >
                 Confirm Movement
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={stockMovementAction.isLoading}
                 onClick={() => setStockMovementModal({ isOpen: false })}
-                className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl"
+                className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5069,7 +5310,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               const rawMobile = form.mobile.value.trim();
               const cleanMobile = rawMobile.replace(/\D/g, '').slice(-10);
               if (cleanMobile.length !== 10) {
-                alert('Please enter a valid 10-digit mobile number.');
+                toast.warning('Please enter a valid 10-digit mobile number.');
                 return;
               }
               const email = form.email.value.trim() || undefined;
@@ -5078,39 +5319,44 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               const birthday = form.birthday.value || undefined;
               const allergies = form.allergies.value.trim() || undefined;
               const notes = form.notes.value.trim() || undefined;
+              const isEdit = Boolean(customerModal.data);
 
-              try {
-                if (customerModal.data) {
-                  await api.updateCustomer(customerModal.data.id, {
-                    name,
-                    mobile: cleanMobile,
-                    email,
-                    branch_id,
-                    status,
-                    birthday,
-                    allergies,
-                    notes
-                  }, currentUser.name);
-                } else {
-                  await api.createCustomer({
-                    name,
-                    mobile: cleanMobile,
-                    email,
-                    branch_id,
-                    status,
-                    birthday,
-                    allergies,
-                    notes,
-                    loyalty_points: 0,
-                    total_spend: 0,
-                    visit_count: 1
-                  }, currentUser.name);
+              await customerSaveAction.run(
+                async () => {
+                  if (customerModal.data) {
+                    await api.updateCustomer(customerModal.data.id, {
+                      name,
+                      mobile: cleanMobile,
+                      email,
+                      branch_id,
+                      status,
+                      birthday,
+                      allergies,
+                      notes
+                    }, currentUser.name);
+                  } else {
+                    await api.createCustomer({
+                      name,
+                      mobile: cleanMobile,
+                      email,
+                      branch_id,
+                      status,
+                      birthday,
+                      allergies,
+                      notes,
+                      loyalty_points: 0,
+                      total_spend: 0,
+                      visit_count: 1
+                    }, currentUser.name);
+                  }
+                  setCustomerModal({ isOpen: false });
+                  await loadAllData();
+                },
+                {
+                  successMessage: isEdit ? `Customer ${name} updated successfully` : `Customer ${name} added successfully`,
+                  errorFallback: 'Failed to save customer.'
                 }
-                setCustomerModal({ isOpen: false });
-                await loadAllData();
-              } catch (err: any) {
-                alert('Failed to save customer: ' + (err.message || 'Unknown error'));
-              }
+              );
             }}
             className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl relative space-y-3 text-xs"
           >
@@ -5229,16 +5475,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             </div>
 
             <div className="flex gap-2 pt-2">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl transition-colors cursor-pointer shadow-xs"
+                loading={customerSaveAction.isLoading}
+                loadingText="Saving..."
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
               >
                 Save Customer to Supabase
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={customerSaveAction.isLoading}
                 onClick={() => setCustomerModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5254,21 +5503,30 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             onSubmit={async (e) => {
               e.preventDefault();
               const form = e.target as any;
-              const name = form.name.value;
+              const name = form.name.value.trim();
               const category_id = form.category_id.value;
               const duration_minutes = Number(form.duration.value);
               const price = Number(form.price.value);
               const discount_price = form.discount_price.value ? Number(form.discount_price.value) : undefined;
               const description = form.description.value;
               const benefits = form.benefits.value;
+              const isEdit = Boolean(serviceModal.data);
 
-              if (serviceModal.data) {
-                await api.updateService(serviceModal.data.id, { name, category_id, duration_minutes, price, discount_price, description, benefits }, currentUser.name);
-              } else {
-                await api.createService({ name, slug: name.toLowerCase().replace(/\s+/g, '-'), category_id, duration_minutes, price, discount_price, description, benefits, is_active: true, image_url: '/services/default.jpg' }, currentUser.name);
-              }
-              setServiceModal({ isOpen: false });
-              loadAllData();
+              await serviceSaveAction.run(
+                async () => {
+                  if (serviceModal.data) {
+                    await api.updateService(serviceModal.data.id, { name, category_id, duration_minutes, price, discount_price, description, benefits }, currentUser.name);
+                  } else {
+                    await api.createService({ name, slug: name.toLowerCase().replace(/\s+/g, '-'), category_id, duration_minutes, price, discount_price, description, benefits, is_active: true, image_url: '/services/default.jpg' }, currentUser.name);
+                  }
+                  setServiceModal({ isOpen: false });
+                  await loadAllData();
+                },
+                {
+                  successMessage: isEdit ? `Service "${name}" updated` : `Service "${name}" created`,
+                  errorFallback: 'Failed to save service.'
+                }
+              );
             }}
             className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl relative space-y-3 text-xs"
           >
@@ -5347,16 +5605,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               />
             </div>
             <div className="flex gap-2 pt-2">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl"
+                loading={serviceSaveAction.isLoading}
+                loadingText="Saving..."
+                className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl flex items-center justify-center gap-1.5"
               >
                 Save Service
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={serviceSaveAction.isLoading}
                 onClick={() => setServiceModal({ isOpen: false })}
-                className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl"
+                className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5372,23 +5633,31 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             onSubmit={async (e) => {
               e.preventDefault();
               const form = e.target as any;
-              const title = form.title.value;
+              const title = form.title.value.trim();
               const category = form.category.value;
               const artist_name = form.artist_name.value;
               const description = form.description.value;
 
-              await api.createGalleryItem({
-                title,
-                category,
-                artist_name,
-                description,
-                image_url: '/gallery/new-upload.jpg',
-                is_approved: isManager,
-                display_order: gallery.length + 1
-              }, currentUser.name);
+              await galleryUploadAction.run(
+                async () => {
+                  await api.createGalleryItem({
+                    title,
+                    category,
+                    artist_name,
+                    description,
+                    image_url: '/gallery/new-upload.jpg',
+                    is_approved: isManager,
+                    display_order: gallery.length + 1
+                  }, currentUser.name);
 
-              setGalleryModal({ isOpen: false });
-              loadAllData();
+                  setGalleryModal({ isOpen: false });
+                  await loadAllData();
+                },
+                {
+                  successMessage: `Portfolio item "${title}" uploaded`,
+                  errorFallback: 'Failed to upload portfolio artwork.'
+                }
+              );
             }}
             className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl relative space-y-3 text-xs"
           >
@@ -5416,10 +5685,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               <textarea name="description" rows={2} className="w-full p-2 bg-slate-50 border rounded-lg" />
             </div>
             <div className="flex gap-2 pt-2">
-              <button type="submit" className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl">
+              <ActionButton
+                type="submit"
+                loading={galleryUploadAction.isLoading}
+                loadingText="Saving..."
+                className="flex-1 py-2 text-xs font-bold text-white bg-[#5B132B] rounded-xl flex items-center justify-center gap-1.5"
+              >
                 Upload Artwork
-              </button>
-              <button type="button" onClick={() => setGalleryModal({ isOpen: false })} className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl">
+              </ActionButton>
+              <button
+                type="button"
+                disabled={galleryUploadAction.isLoading}
+                onClick={() => setGalleryModal({ isOpen: false })}
+                className="py-2 px-4 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl disabled:opacity-50"
+              >
                 Cancel
               </button>
             </div>
@@ -5444,37 +5723,42 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               const skillsStr = (formData.get('skills') as string) || '';
               const skills = skillsStr.split(',').map(s => s.trim()).filter(Boolean);
               const is_active = formData.get('is_active') === 'true';
+              const isEdit = Boolean(staffModal.data?.id);
 
-              try {
-                if (staffModal.data?.id) {
-                  await api.updateStaff(staffModal.data.id, {
-                    name,
-                    phone,
-                    email,
-                    role,
-                    commission_rate,
-                    working_hours,
-                    skills,
-                    is_active
-                  }, currentUser.name);
-                } else {
-                  await api.createStaff({
-                    name,
-                    phone,
-                    email,
-                    role,
-                    salary_type: 'commission',
-                    commission_rate,
-                    working_hours,
-                    skills,
-                    is_active: true
-                  } as any, currentUser.name);
+              await staffSaveAction.run(
+                async () => {
+                  if (staffModal.data?.id) {
+                    await api.updateStaff(staffModal.data.id, {
+                      name,
+                      phone,
+                      email,
+                      role,
+                      commission_rate,
+                      working_hours,
+                      skills,
+                      is_active
+                    }, currentUser.name);
+                  } else {
+                    await api.createStaff({
+                      name,
+                      phone,
+                      email,
+                      role,
+                      salary_type: 'commission',
+                      commission_rate,
+                      working_hours,
+                      skills,
+                      is_active: true
+                    } as any, currentUser.name);
+                  }
+                  setStaffModal({ isOpen: false });
+                  await loadAllData();
+                },
+                {
+                  successMessage: isEdit ? `Stylist profile for ${name} updated` : `Stylist profile for ${name} created`,
+                  errorFallback: 'Failed to save staff profile.'
                 }
-                setStaffModal({ isOpen: false });
-                await loadAllData();
-              } catch (err: any) {
-                alert(err.message || 'Failed to save staff profile.');
-              }
+              );
             }}
             className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl relative space-y-3.5 text-xs max-h-[90vh] overflow-y-auto"
           >
@@ -5591,16 +5875,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             )}
 
             <div className="flex gap-2 pt-3 border-t">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl shadow-xs transition-colors"
+                loading={staffSaveAction.isLoading}
+                loadingText="Saving..."
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5"
               >
                 {staffModal.data ? 'Save Profile Changes' : 'Create Stylist'}
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={staffSaveAction.isLoading}
                 onClick={() => setStaffModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5732,16 +6019,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             )}
 
             <div className="flex gap-2 pt-3 border-t">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl shadow-xs transition-colors"
+                loading={adminUserSaveAction.isLoading}
+                loadingText="Syncing..."
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5"
               >
                 {userModal.data ? 'Update Staff User' : 'Create Staff User'}
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={adminUserSaveAction.isLoading}
                 onClick={() => setUserModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5808,16 +6098,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             </div>
 
             <div className="flex gap-2 pt-3 border-t">
-              <button
+              <ActionButton
                 type="submit"
-                className="flex-1 py-2.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-xl shadow-xs transition-colors"
+                loading={resetPasswordAction.isLoading}
+                loadingText="Syncing..."
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5"
               >
                 Set New Password
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={resetPasswordAction.isLoading}
                 onClick={() => setResetPasswordModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5854,21 +6147,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             </div>
 
             <div className="flex gap-2 pt-2">
-              <button
+              <ActionButton
                 type="button"
+                loading={userStatusToggleAction.isLoading}
+                loadingText="Syncing..."
                 onClick={handleConfirmUserStatusToggle}
-                className={`flex-1 py-2.5 text-xs font-bold text-white rounded-xl shadow-xs transition-colors ${
+                className={`flex-1 py-2.5 text-xs font-bold text-white rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 ${
                   deactivateConfirmModal.user.is_active
                     ? 'bg-rose-600 hover:bg-rose-700'
                     : 'bg-emerald-600 hover:bg-emerald-700'
                 }`}
               >
                 {deactivateConfirmModal.user.is_active ? 'Yes, Deactivate' : 'Yes, Reactivate'}
-              </button>
+              </ActionButton>
               <button
                 type="button"
+                disabled={userStatusToggleAction.isLoading}
                 onClick={() => setDeactivateConfirmModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -5962,10 +6258,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   )}
                   <span>
                     {whatsAppSendResult.success
-                      ? 'WhatsApp Template Dispatched Successfully!'
+                      ? 'WhatsApp Template Submitted Successfully'
                       : whatsAppSendResult.status === 'pending_approval'
                       ? 'Status: Pending Meta Approval'
-                      : 'Delivery Failed'}
+                      : 'Template Submission Failed'}
                   </span>
                 </div>
                 {whatsAppSendResult.message_id && (
@@ -5987,12 +6283,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             <div className="flex items-center justify-between pt-3 border-t border-slate-100 gap-2">
               <button
                 type="button"
+                disabled={whatsAppConfirmAction.isLoading}
                 onClick={() => {
                   const apt = whatsAppConfirmModal.appointment;
                   setWhatsAppConfirmModal({ isOpen: false, appointment: null });
                   if (apt) handleViewAppointmentLogs(apt);
                 }}
-                className="py-2.5 px-3 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                className="py-2.5 px-3 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 View History Logs
               </button>
@@ -6000,34 +6297,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               <div className="flex items-center gap-2">
                 <button
                   type="button"
+                  disabled={whatsAppConfirmAction.isLoading}
                   onClick={() => setWhatsAppConfirmModal({ isOpen: false, appointment: null })}
-                  className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl"
+                  className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
                 >
                   Close
                 </button>
 
-                <button
+                <ActionButton
                   type="button"
-                  disabled={whatsAppSending}
+                  loading={whatsAppConfirmAction.isLoading}
+                  loadingText="Sending..."
+                  icon={<MessageCircle className="w-3.5 h-3.5" />}
                   onClick={() => handleSendWhatsAppConfirm(Boolean(whatsAppConfirmModal.appointment?.last_whatsapp_sent_at || whatsAppSendResult?.duplicate_prevented))}
-                  className="py-2.5 px-4 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl shadow-xs transition-colors flex items-center gap-1.5 disabled:opacity-60"
+                  className="py-2.5 px-4 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl shadow-xs transition-colors flex items-center gap-1.5"
                 >
-                  {whatsAppSending ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      <span>Sending via Meta...</span>
-                    </>
-                  ) : (
-                    <>
-                      <MessageCircle className="w-3.5 h-3.5" />
-                      <span>
-                        {whatsAppConfirmModal.appointment?.last_whatsapp_sent_at || whatsAppSendResult?.duplicate_prevented
-                          ? 'Send Again (Force)'
-                          : 'Send WhatsApp Confirmation'}
-                      </span>
-                    </>
-                  )}
-                </button>
+                  <span>
+                    {whatsAppConfirmModal.appointment?.last_whatsapp_sent_at || whatsAppSendResult?.duplicate_prevented
+                      ? 'Send Again (Force)'
+                      : 'Send WhatsApp Confirmation'}
+                  </span>
+                </ActionButton>
               </div>
             </div>
           </div>
@@ -6233,17 +6523,29 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       </span>
 
                       {!item.is_read ? (
-                        <button
+                        <ActionButton
                           type="button"
-                          onClick={async () => {
-                            await api.markFeedbackRead(item.id);
-                            const updated = await api.getAppointmentFeedback();
-                            setFeedbackList(updated);
+                          loading={rowAction.isPending(`fb-read-${item.id}`)}
+                          loadingText="Updating..."
+                          spinnerClassName="w-3 h-3"
+                          onClick={() => {
+                            rowAction.runForKey(
+                              `fb-read-${item.id}`,
+                              async () => {
+                                await api.markFeedbackRead(item.id);
+                                const updated = await api.getAppointmentFeedback();
+                                setFeedbackList(updated);
+                              },
+                              {
+                                successMessage: 'Feedback marked as resolved',
+                                errorFallback: 'Failed to mark feedback as resolved.'
+                              }
+                            );
                           }}
-                          className="px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-800 font-bold rounded-lg border text-[10px] shadow-xs"
+                          className="px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-800 font-bold rounded-lg border text-[10px] shadow-xs inline-flex items-center gap-1"
                         >
                           Mark as Resolved
-                        </button>
+                        </ActionButton>
                       ) : (
                         <span className="text-[10px] text-emerald-700 font-semibold flex items-center gap-1">
                           <Check className="w-3 h-3" /> Resolved
@@ -6441,28 +6743,32 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               e.preventDefault();
               const orderId = orderEditModal.order?.id || orderEditModal.payment?.order_id;
               if (!orderId) {
-                setOrderEditError('Order reference ID not found.');
+                const msg = 'Order reference ID not found.';
+                setOrderEditError(msg);
+                toast.error(msg);
                 return;
               }
-              setOrderEditSaving(true);
               setOrderEditError(null);
-              try {
-                await api.updateOrder(orderId, {
-                  customer_name: editOrderCustomerName.trim(),
-                  customer_phone: editOrderCustomerPhone.trim(),
-                  primary_payment_mode: editOrderPaymentMode,
-                  discount: Number(editOrderDiscount || 0),
-                  payment_status: editOrderPaymentStatus,
-                  notes: editOrderNotes.trim()
-                }, currentUser.name);
+              await orderEditAction.run(
+                async () => {
+                  await api.updateOrder(orderId, {
+                    customer_name: editOrderCustomerName.trim(),
+                    customer_phone: editOrderCustomerPhone.trim(),
+                    primary_payment_mode: editOrderPaymentMode,
+                    discount: Number(editOrderDiscount || 0),
+                    payment_status: editOrderPaymentStatus,
+                    notes: editOrderNotes.trim()
+                  }, currentUser.name);
 
-                setOrderEditModal({ isOpen: false });
-                await loadAllData();
-              } catch (err: any) {
-                setOrderEditError(err.message || 'Failed to update order');
-              } finally {
-                setOrderEditSaving(false);
-              }
+                  setOrderEditModal({ isOpen: false });
+                  await loadAllData();
+                },
+                {
+                  successMessage: 'Order and settlement details updated successfully',
+                  errorFallback: 'Failed to update order details.',
+                  onError: (msg) => setOrderEditError(msg)
+                }
+              );
             }}
             className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl relative space-y-4 text-xs max-h-[90vh] overflow-y-auto"
           >
@@ -6636,24 +6942,112 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
             {/* Buttons */}
             <div className="flex gap-2 pt-2 border-t border-slate-100">
-              <button
+              <ActionButton
                 type="submit"
-                disabled={orderEditSaving}
-                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl transition-colors cursor-pointer shadow-xs disabled:opacity-50 flex items-center justify-center gap-1.5"
+                loading={orderEditAction.isLoading}
+                loadingText="Saving..."
+                spinnerClassName="w-3.5 h-3.5 text-[#D4AF37]"
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5"
               >
-                {orderEditSaving ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-[#D4AF37]" />
-                    <span>Saving Changes…</span>
-                  </>
-                ) : (
-                  <span>Save Order & Ledger Updates</span>
-                )}
-              </button>
+                <span>Save Order & Ledger Updates</span>
+              </ActionButton>
               <button
                 type="button"
+                disabled={orderEditAction.isLoading}
                 onClick={() => setOrderEditModal({ isOpen: false })}
-                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer"
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* MODAL: REUSABLE IN-PORTAL CONFIRMATION / REFUND REASON DIALOG */}
+      {confirmActionModal?.isOpen && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (confirmActionModal.inputRequired && !confirmActionInput.trim()) {
+                setConfirmActionError('Please enter a reason to continue.');
+                return;
+              }
+              setConfirmActionError('');
+              await confirmDialogAction.run(
+                async () => {
+                  await confirmActionModal.onConfirm(confirmActionInput);
+                  setConfirmActionModal(null);
+                  setConfirmActionInput('');
+                },
+                {
+                  errorFallback: 'Action failed. Please try again.',
+                  onError: (msg) => setConfirmActionError(msg)
+                }
+              );
+            }}
+            className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl relative space-y-4 text-xs"
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="font-serif font-bold text-base text-slate-900">
+                  {confirmActionModal.title}
+                </h3>
+                <p className="text-slate-600 mt-1 leading-relaxed">
+                  {confirmActionModal.description}
+                </p>
+              </div>
+            </div>
+
+            {confirmActionModal.inputLabel && (
+              <div>
+                <label className="block font-semibold mb-1 text-slate-700">
+                  {confirmActionModal.inputLabel}
+                </label>
+                <input
+                  type="text"
+                  autoFocus
+                  disabled={confirmDialogAction.isLoading}
+                  value={confirmActionInput}
+                  onChange={e => {
+                    setConfirmActionInput(e.target.value);
+                    if (confirmActionError) setConfirmActionError('');
+                  }}
+                  placeholder={confirmActionModal.inputPlaceholder || ''}
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white outline-none focus:border-[#5B132B]"
+                />
+              </div>
+            )}
+
+            {confirmActionError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span>{confirmActionError}</span>
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2 border-t border-slate-100">
+              <ActionButton
+                type="submit"
+                loading={confirmDialogAction.isLoading}
+                loadingText={confirmActionModal.loadingLabel}
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5"
+              >
+                {confirmActionModal.confirmLabel}
+              </ActionButton>
+              <button
+                type="button"
+                disabled={confirmDialogAction.isLoading}
+                onClick={() => {
+                  setConfirmActionModal(null);
+                  setConfirmActionInput('');
+                  setConfirmActionError('');
+                }}
+                className="py-2.5 px-4 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl disabled:opacity-50"
               >
                 Cancel
               </button>

@@ -28,6 +28,7 @@ import { EnquiryModal } from './components/customer/EnquiryModal';
 import { MobileBottomNav } from './components/customer/MobileBottomNav';
 import { AdminPortal } from './components/admin/AdminPortal';
 import { ThermalReceipt } from './components/common/ThermalReceipt';
+import { ToastProvider } from './components/common/ToastProvider';
 import { ScrollToTopOnRouteChange, resetScrollPosition } from './components/common/ScrollToTopOnRouteChange';
 import { ArrowRight, Sparkles, Crown } from 'lucide-react';
 
@@ -177,7 +178,7 @@ export default function App() {
   // If in admin view, render Admin Portal
   if (currentView === 'admin') {
     return (
-      <>
+      <ToastProvider>
         <AdminPortal
           onBackToWebsite={navigateToCustomer}
           onViewReceipt={handleOpenReceipt}
@@ -190,7 +191,7 @@ export default function App() {
             onClose={() => setReceiptModal({ isOpen: false })}
           />
         )}
-      </>
+      </ToastProvider>
     );
   }
 

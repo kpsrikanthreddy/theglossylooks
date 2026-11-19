@@ -45,6 +45,8 @@ import {
 
 const API_BASE = '/api';
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+
 async function fetchJson<T>(url: string, options?: RequestInit, adminName?: string): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -79,15 +81,35 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
     headers['x-admin-name'] = adminName;
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers
-  });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error || `HTTP error ${res.status}`);
+  const controller = !options?.signal ? new AbortController() : null;
+  const timeoutId = controller
+    ? window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS)
+    : null;
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      headers,
+      signal: options?.signal ?? controller?.signal
+    });
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}));
+      throw new Error(errorData.error || errorData.message || `Request failed (HTTP ${res.status})`);
+    }
+    return await res.json();
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Request timed out. Please check your connection and try again.');
+    }
+    if (err instanceof TypeError) {
+      throw new Error('Network error. Please check your internet connection and try again.');
+    }
+    throw err;
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
   }
-  return res.json();
 }
 
 export const api = {
