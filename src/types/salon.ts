@@ -6,7 +6,15 @@
  * Matches PostgreSQL / Supabase Relational Schema
  */
 
-export type AdminRole = 'owner' | 'manager' | 'receptionist' | 'stylist' | 'inventory_staff';
+export type AdminRole =
+  | 'superadmin'
+  | 'admin'
+  | 'owner'
+  | 'manager'
+  | 'receptionist'
+  | 'stylist'
+  | 'pos_billing'
+  | 'inventory_staff';
 
 export type SmavSyncStatus = 'SYNCED' | 'PENDING' | 'FAILED';
 
@@ -324,6 +332,12 @@ export interface Appointment {
   feedback_whatsapp_sent_at?: string;
   feedback_whatsapp_message_id?: string;
   feedback_whatsapp_source?: 'AUTO_FEEDBACK' | 'MANUAL_FEEDBACK';
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  deleted_by_user_id?: string | null;
+  deletion_reason?: string | null;
+  restored_at?: string | null;
+  restored_by?: string | null;
 }
 
 export interface OrderItem {
@@ -337,6 +351,9 @@ export interface OrderItem {
   staff_id?: string;
   staff_name?: string;
   commission_amount?: number;
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  deletion_reason?: string | null;
 }
 
 export interface Order {
@@ -377,6 +394,12 @@ export interface Order {
   feedback_whatsapp_sent_at?: string;
   feedback_whatsapp_source?: 'AUTO_FEEDBACK' | 'MANUAL_FEEDBACK';
   feedback_rating?: FeedbackRating;
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  deleted_by_user_id?: string | null;
+  deletion_reason?: string | null;
+  restored_at?: string | null;
+  restored_by?: string | null;
   created_at: string;
 }
 
@@ -402,6 +425,12 @@ export interface PaymentRecord {
   receipt_whatsapp_error?: string;
   feedback_whatsapp_status?: WhatsAppMessageStatus;
   items?: OrderItem[];
+  deleted_at?: string | null;
+  deleted_by?: string | null;
+  deleted_by_user_id?: string | null;
+  deletion_reason?: string | null;
+  restored_at?: string | null;
+  restored_by?: string | null;
   created_at: string;
 }
 
@@ -675,16 +704,22 @@ export interface WhatsAppMessageLog {
   id: string;
   appointment_id?: string;
   order_id?: string;
+  bill_number?: string;
+  payment_id?: string;
   branch_id?: string;
   template_name: string;
   recipient_number: string;
   customer_name?: string;
-  job_type?: 'appointment_confirmation' | 'customer_feedback' | 'bill_receipt' | 'pos_bill' | 'custom' | string;
+  job_type?: 'appointment_confirmation' | 'appointment_reminder' | 'customer_feedback' | 'bill_receipt' | 'payment_reminder' | 'pos_bill' | 'custom' | string;
   sender_phone_number_id?: string;
   meta_message_id?: string;
   status: WhatsAppMessageStatus;
   error_message?: string;
   diagnostics?: string;
+  sent_by_user_id?: string;
+  sent_by_user_name?: string;
+  conversation_id?: string;
+  whatsapp_message_id?: string;
   retry_count?: number;
   next_retry_at?: string;
   scheduled_at?: string;
@@ -843,6 +878,10 @@ export interface WhatsAppMessage {
   salon_id?: string;
   branch_id?: string;
   conversation_id: string;
+  appointment_id?: string;
+  order_id?: string;
+  bill_number?: string;
+  payment_id?: string;
   meta_message_id?: string; // wamid
   direction: WhatsAppMessageDirection;
   message_type?: WhatsAppMessageType;

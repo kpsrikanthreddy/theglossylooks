@@ -242,10 +242,13 @@ function generateLocalUserCode(role: AdminRole, preferredUsername?: string): str
     return cleanPreferred.slice(0, 50);
   }
   const rolePrefix: Record<AdminRole, string> = {
+    superadmin: 'SUP',
+    admin: 'ADM',
     owner: 'OWN',
     manager: 'MGR',
     receptionist: 'REC',
     stylist: 'STY',
+    pos_billing: 'POS',
     inventory_staff: 'INV',
   };
   const prefix = rolePrefix[role] || 'STF';

@@ -119,21 +119,56 @@ export interface ISalonRepository {
   deletePackage(id: string, performedBy: string): Promise<boolean>;
 
   // Appointments
-  getAppointments(filters?: { status?: string; staffId?: string; customerMobile?: string }): Promise<Appointment[]>;
+  getAppointments(filters?: {
+    status?: string;
+    staffId?: string;
+    customerMobile?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+  }): Promise<Appointment[]>;
   getAppointmentById(id: string): Promise<Appointment | null>;
   createAppointment(apt: Omit<Appointment, 'id' | 'booking_reference' | 'created_at' | 'updated_at'>, performedBy?: string): Promise<Appointment>;
   updateAppointment(id: string, data: Partial<Appointment>, performedBy: string): Promise<Appointment | null>;
   cancelAppointment(id: string, reason: string, performedBy: string): Promise<Appointment | null>;
+  softDeleteAppointment(
+    id: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<Appointment | null>;
+  restoreAppointment(
+    id: string,
+    actor: { userId?: string; name: string }
+  ): Promise<Appointment | null>;
 
   // Orders & POS Invoicing
-  getOrders(filters?: { customerMobile?: string; paymentStatus?: string }): Promise<Order[]>;
+  getOrders(filters?: {
+    customerMobile?: string;
+    paymentStatus?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<Order[]>;
   getOrderById(id: string): Promise<Order | null>;
   createOrder(orderData: Omit<Order, 'id' | 'bill_number' | 'created_at'>, performedBy: string): Promise<Order>;
   updateOrder(id: string, data: Partial<Order>): Promise<Order | null>;
   updateOrderStatus(id: string, status: Order['payment_status'], performedBy: string): Promise<Order | null>;
+  softDeleteOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<{ order: Order; affectedPayments: number } | null>;
+  restoreOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string }
+  ): Promise<{ order: Order; restoredPayments: number } | null>;
 
   // Payments & Refunds
-  getPayments(): Promise<PaymentRecord[]>;
+  getPayments(filters?: {
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<PaymentRecord[]>;
   recordPayment(payment: Omit<PaymentRecord, 'id' | 'created_at'>, performedBy: string): Promise<PaymentRecord>;
   refundPayment(id: string, reason: string, performedBy: string): Promise<PaymentRecord | null>;
 
@@ -179,7 +214,7 @@ export interface ISalonRepository {
   getDetailedReports(filter?: SalesReportFilter): Promise<DetailedSalesReport>;
 
   // WhatsApp Message Logs
-  getWhatsAppMessageLogs(appointmentId?: string, branchId?: string): Promise<WhatsAppMessageLog[]>;
+  getWhatsAppMessageLogs(appointmentId?: string, branchId?: string, orderId?: string): Promise<WhatsAppMessageLog[]>;
   createWhatsAppMessageLog(log: Omit<WhatsAppMessageLog, 'id' | 'created_at' | 'updated_at'>): Promise<WhatsAppMessageLog>;
   updateWhatsAppMessageLog(id: string, data: Partial<WhatsAppMessageLog>): Promise<WhatsAppMessageLog | null>;
   updateWhatsAppMessageLogByMetaId(metaMessageId: string, data: Partial<WhatsAppMessageLog>): Promise<WhatsAppMessageLog | null>;

@@ -102,6 +102,53 @@ export interface SmavReconciliationReport {
   users: SmavReconciliationUserAudit[];
 }
 
+export interface ApprovedWhatsAppTemplateInfo {
+  name: string;
+  status: string;
+  language: string;
+  category?: string;
+  components?: any[];
+}
+
+export interface WhatsAppRecordContextResponse {
+  record_type: 'appointment' | 'order';
+  record_id: string;
+  branch_id: string;
+  branch_name: string;
+  customer_name: string;
+  customer_phone: string;
+  phone_validation: {
+    isValid: boolean;
+    digits: string;
+    e164: string;
+    metaRecipient: string;
+    error?: string;
+  };
+  customer_service_window: {
+    window_open: boolean;
+    last_inbound_at: string | null;
+    window_expires_at: string | null;
+    conversation_id: string | null;
+    policy_note: string;
+  };
+  templates_source: 'meta_api' | 'unavailable';
+  templates_error: string | null;
+  approved_templates: ApprovedWhatsAppTemplateInfo[];
+  missing_recommended_templates: string[];
+  default_variables: Record<string, string>;
+  logs: WhatsAppMessageLog[];
+}
+
+export interface SendRecordWhatsAppTemplateResponse {
+  success: boolean;
+  status: 'queued' | 'sent' | 'delivered' | 'read' | 'failed';
+  message_id?: string;
+  error?: string;
+  diagnostics?: string;
+  log?: WhatsAppMessageLog;
+  inbox_message?: WhatsAppMessage | null;
+}
+
 const API_BASE = '/api';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -251,11 +298,12 @@ export const api = {
     fetchJson<{ success: boolean }>(`${API_BASE}/packages/${id}`, { method: 'DELETE' }, adminName),
 
   // Appointments
-  getAppointments: (filters?: { status?: string; staffId?: string; mobile?: string }) => {
+  getAppointments: (filters?: { status?: string; staffId?: string; mobile?: string; deleted?: 'active' | 'deleted' | 'all' }) => {
     const params = new URLSearchParams();
     if (filters?.status) params.append('status', filters.status);
     if (filters?.staffId) params.append('staff_id', filters.staffId);
     if (filters?.mobile) params.append('mobile', filters.mobile);
+    if (filters?.deleted && filters.deleted !== 'active') params.append('deleted', filters.deleted);
     const qs = params.toString() ? `?${params.toString()}` : '';
     return fetchJson<Appointment[]>(`${API_BASE}/appointments${qs}`);
   },
@@ -266,6 +314,18 @@ export const api = {
     fetchJson<Appointment>(`${API_BASE}/appointments/${id}`, { method: 'PATCH', body: JSON.stringify(data) }, adminName),
   cancelAppointment: (id: string, reason: string, adminName?: string) =>
     fetchJson<Appointment>(`${API_BASE}/appointments/${id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) }, adminName),
+  softDeleteAppointment: (id: string, reason?: string, adminName?: string) =>
+    fetchJson<{ success: boolean; appointment: Appointment }>(
+      `${API_BASE}/appointments/${id}`,
+      { method: 'DELETE', body: JSON.stringify({ reason }) },
+      adminName
+    ),
+  restoreAppointment: (id: string, adminName?: string) =>
+    fetchJson<{ success: boolean; appointment: Appointment }>(
+      `${API_BASE}/appointments/${id}/restore`,
+      { method: 'POST' },
+      adminName
+    ),
 
   // Customers
   getCustomers: (search?: string) => {
@@ -280,12 +340,32 @@ export const api = {
     fetchJson<{ success: boolean }>(`${API_BASE}/customers/${id}`, { method: 'DELETE' }, adminName),
 
   // Orders & POS
-  getOrders: () => fetchJson<Order[]>(`${API_BASE}/orders`),
+  getOrders: (filters?: { deleted?: 'active' | 'deleted' | 'all'; branchId?: string; startIso?: string; endIso?: string }) => {
+    const params = new URLSearchParams();
+    if (filters?.deleted && filters.deleted !== 'active') params.append('deleted', filters.deleted);
+    if (filters?.branchId && filters.branchId !== 'all') params.append('branch_id', filters.branchId);
+    if (filters?.startIso) params.append('start_iso', filters.startIso);
+    if (filters?.endIso) params.append('end_iso', filters.endIso);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return fetchJson<Order[]>(`${API_BASE}/orders${qs}`);
+  },
   getOrderById: (orderId: string) => fetchJson<Order>(`${API_BASE}/orders/${orderId}`),
   createOrder: (data: any, adminName?: string) =>
     fetchJson<Order>(`${API_BASE}/orders`, { method: 'POST', body: JSON.stringify(data) }, adminName),
   updateOrder: (id: string, data: Partial<Order>, adminName?: string) =>
     fetchJson<Order>(`${API_BASE}/orders/${id}`, { method: 'PATCH', body: JSON.stringify(data) }, adminName),
+  softDeleteOrder: (orderId: string, reason?: string, adminName?: string) =>
+    fetchJson<{ success: boolean; order: Order; affected_payments: number; affected_order_items: number }>(
+      `${API_BASE}/orders/${orderId}`,
+      { method: 'DELETE', body: JSON.stringify({ reason }) },
+      adminName
+    ),
+  restoreOrder: (orderId: string, adminName?: string) =>
+    fetchJson<{ success: boolean; order: Order; restored_payments: number; restored_order_items: number }>(
+      `${API_BASE}/orders/${orderId}/restore`,
+      { method: 'POST' },
+      adminName
+    ),
   getOrderWhatsAppStatus: (orderId: string) =>
     fetchJson<{
       order_id: string;
@@ -311,9 +391,51 @@ export const api = {
     ),
 
   // Payments & Refunds
-  getPayments: () => fetchJson<PaymentRecord[]>(`${API_BASE}/payments`),
+  getPayments: (filters?: { deleted?: 'active' | 'deleted' | 'all'; branchId?: string; startIso?: string; endIso?: string }) => {
+    const params = new URLSearchParams();
+    if (filters?.deleted && filters.deleted !== 'active') params.append('deleted', filters.deleted);
+    if (filters?.branchId && filters.branchId !== 'all') params.append('branch_id', filters.branchId);
+    if (filters?.startIso) params.append('start_iso', filters.startIso);
+    if (filters?.endIso) params.append('end_iso', filters.endIso);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return fetchJson<PaymentRecord[]>(`${API_BASE}/payments${qs}`);
+  },
+  exportPaymentsCsv: async (filters?: { branchId?: string; startIso?: string; endIso?: string; mode?: string }): Promise<string> => {
+    const params = new URLSearchParams();
+    if (filters?.branchId && filters.branchId !== 'all') params.append('branch_id', filters.branchId);
+    if (filters?.startIso) params.append('start_iso', filters.startIso);
+    if (filters?.endIso) params.append('end_iso', filters.endIso);
+    if (filters?.mode && filters.mode !== 'all') params.append('mode', filters.mode);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const headers: Record<string, string> = {};
+    try {
+      const savedSession = sessionStorage.getItem('the_glossy_looks_admin_session') || localStorage.getItem('the_glossy_looks_admin_session');
+      if (savedSession) {
+        const parsed = JSON.parse(savedSession);
+        if (parsed.token) headers['Authorization'] = `Bearer ${parsed.token}`;
+      }
+    } catch {}
+    const res = await fetch(`${API_BASE}/payments/export${qs}`, { headers });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to export Payment Ledger CSV (HTTP ${res.status})`);
+    }
+    return await res.text();
+  },
   refundPayment: (id: string, reason: string, adminName?: string) =>
     fetchJson<PaymentRecord>(`${API_BASE}/payments/${id}/refund`, { method: 'POST', body: JSON.stringify({ reason }) }, adminName),
+  softDeletePaymentBill: (paymentId: string, reason?: string, adminName?: string) =>
+    fetchJson<{ success: boolean; order: Order; affected_payments: number; affected_order_items: number }>(
+      `${API_BASE}/payments/${paymentId}`,
+      { method: 'DELETE', body: JSON.stringify({ reason }) },
+      adminName
+    ),
+  restorePaymentBill: (paymentId: string, adminName?: string) =>
+    fetchJson<{ success: boolean; order: Order; restored_payments: number; restored_order_items: number }>(
+      `${API_BASE}/payments/${paymentId}/restore`,
+      { method: 'POST' },
+      adminName
+    ),
 
   // Products & Inventory
   getProducts: () => fetchJson<Product[]>(`${API_BASE}/products`),
@@ -434,13 +556,30 @@ export const api = {
     fetchJson<{ success: boolean; message: string; integration: BranchWhatsAppIntegration }>(`${API_BASE}/admin/branches/${branchId}/whatsapp/disconnect`, { method: 'POST' }, adminName),
 
   // Real WhatsApp Automated Messaging & Feedback
-  getWhatsAppMessageLogs: (appointmentId?: string, branchId?: string) => {
+  getWhatsAppMessageLogs: (appointmentId?: string, branchId?: string, orderId?: string) => {
     const params = new URLSearchParams();
     if (appointmentId) params.append('appointment_id', appointmentId);
     if (branchId) params.append('branch_id', branchId);
+    if (orderId) params.append('order_id', orderId);
     const qs = params.toString() ? `?${params.toString()}` : '';
     return fetchJson<WhatsAppMessageLog[]>(`${API_BASE}/admin/whatsapp/message-logs${qs}`);
   },
+  getWhatsAppRecordContext: (recordType: 'appointment' | 'order', recordId: string) =>
+    fetchJson<WhatsAppRecordContextResponse>(
+      `${API_BASE}/admin/whatsapp/record-context?record_type=${encodeURIComponent(recordType)}&record_id=${encodeURIComponent(recordId)}`
+    ),
+  sendRecordWhatsAppTemplate: (payload: {
+    record_type: 'appointment' | 'order';
+    record_id: string;
+    template_name: string;
+    template_language?: string;
+    variables?: Record<string, string>;
+    retry_log_id?: string;
+  }) =>
+    fetchJson<SendRecordWhatsAppTemplateResponse>(`${API_BASE}/admin/whatsapp/send-record-template`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
   getAppointmentFeedback: (branchId?: string) => {
     const qs = branchId ? `?branch_id=${encodeURIComponent(branchId)}` : '';
     return fetchJson<AppointmentFeedback[]>(`${API_BASE}/admin/whatsapp/feedback${qs}`);

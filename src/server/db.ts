@@ -1124,7 +1124,7 @@ function getInitialData(): DatabaseData {
   };
 }
 
-class SalonDatabase implements ISalonRepository {
+export class SalonDatabase implements ISalonRepository {
   private data: DatabaseData;
 
   constructor() {
@@ -2552,7 +2552,13 @@ class SalonDatabase implements ISalonRepository {
   }
 
   // --- Appointments ---
-  public async getAppointments(filters?: { status?: string; staffId?: string; customerMobile?: string }): Promise<Appointment[]> {
+  public async getAppointments(filters?: {
+    status?: string;
+    staffId?: string;
+    customerMobile?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+  }): Promise<Appointment[]> {
+    const deletedMode = filters?.deleted || 'active';
     let list = this.data.appointments.map(apt => {
       const resolvedStaff = this.resolveStaff(apt.assigned_staff_id || apt.assigned_staff_name);
       const resolvedServices = (apt.services || []).map(srv => {
@@ -2565,11 +2571,14 @@ class SalonDatabase implements ISalonRepository {
       });
       return {
         ...apt,
+        branch_id: apt.branch_id || 'tgl-gachibowli-main',
         assigned_staff_id: resolvedStaff ? resolvedStaff.id : apt.assigned_staff_id,
         assigned_staff_name: resolvedStaff ? resolvedStaff.name : apt.assigned_staff_name,
         services: resolvedServices
       };
     });
+    if (deletedMode === 'active') list = list.filter(a => !a.deleted_at);
+    else if (deletedMode === 'deleted') list = list.filter(a => Boolean(a.deleted_at));
     if (filters?.status) list = list.filter(a => a.status === filters.status);
     if (filters?.staffId) list = list.filter(a => a.assigned_staff_id === filters.staffId);
     if (filters?.customerMobile) list = list.filter(a => a.customer_phone.includes(filters.customerMobile!));
@@ -2705,8 +2714,90 @@ class SalonDatabase implements ISalonRepository {
     return apt;
   }
 
+  public async softDeleteAppointment(
+    id: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<Appointment | null> {
+    const idx = this.data.appointments.findIndex(a => a.id === id);
+    if (idx === -1) return null;
+    const now = new Date().toISOString();
+    const cleanReason = (reason || '').trim() || 'Removed by authorized admin';
+    const existing = this.data.appointments[idx];
+    this.data.appointments[idx] = {
+      ...existing,
+      deleted_at: now,
+      deleted_by: actor.name,
+      deleted_by_user_id: actor.userId || null,
+      deletion_reason: cleanReason,
+      updated_at: now,
+    };
+    await this.cancelScheduledFeedbackJobByAppointment(id).catch(() => false);
+    await this.logAudit(
+      'SOFT_DELETE',
+      'Appointment',
+      id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'Appointment',
+        appointment_id: id,
+        booking_reference: existing.booking_reference,
+        customer_name: existing.customer_name,
+        customer_phone: existing.customer_phone,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        reason: cleanReason,
+        deleted_at: now,
+      })
+    );
+    this.save();
+    return this.data.appointments[idx];
+  }
+
+  public async restoreAppointment(
+    id: string,
+    actor: { userId?: string; name: string }
+  ): Promise<Appointment | null> {
+    const idx = this.data.appointments.findIndex(a => a.id === id);
+    if (idx === -1) return null;
+    const now = new Date().toISOString();
+    const existing = this.data.appointments[idx];
+    this.data.appointments[idx] = {
+      ...existing,
+      deleted_at: null,
+      restored_at: now,
+      restored_by: actor.name,
+      updated_at: now,
+    };
+    await this.logAudit(
+      'RESTORE',
+      'Appointment',
+      id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'Appointment',
+        appointment_id: id,
+        booking_reference: existing.booking_reference,
+        customer_name: existing.customer_name,
+        restored_by: actor.name,
+        restored_by_user_id: actor.userId || null,
+        restored_at: now,
+      })
+    );
+    this.save();
+    return this.data.appointments[idx];
+  }
+
   // --- Orders & POS Invoicing ---
-  public async getOrders(filters?: { customerMobile?: string; paymentStatus?: string }): Promise<Order[]> {
+  public async getOrders(filters?: {
+    customerMobile?: string;
+    paymentStatus?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<Order[]> {
+    const deletedMode = filters?.deleted || 'active';
     let list = this.data.orders.map(o => {
       const cashier = this.resolveStaff(o.cashier_id || o.cashier_name);
       const resolvedItems = (o.items || []).map(item => {
@@ -2719,12 +2810,24 @@ class SalonDatabase implements ISalonRepository {
       });
       return {
         ...o,
+        branch_id: o.branch_id || 'tgl-gachibowli-main',
         cashier_id: cashier ? cashier.id : o.cashier_id,
         cashier_name: cashier ? cashier.name : o.cashier_name,
         items: resolvedItems
       };
     });
 
+    if (deletedMode === 'active') list = list.filter(o => !o.deleted_at);
+    else if (deletedMode === 'deleted') list = list.filter(o => Boolean(o.deleted_at));
+    if (filters?.branchId) list = list.filter(o => (o.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    if (filters?.startIso) {
+      const startMs = new Date(filters.startIso).getTime();
+      list = list.filter(o => new Date(o.created_at).getTime() >= startMs);
+    }
+    if (filters?.endIso) {
+      const endMs = new Date(filters.endIso).getTime();
+      list = list.filter(o => new Date(o.created_at).getTime() <= endMs);
+    }
     if (filters?.customerMobile) list = list.filter(o => o.customer_phone.includes(filters.customerMobile!));
     if (filters?.paymentStatus) list = list.filter(o => o.payment_status === filters.paymentStatus);
     return list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -2888,9 +2991,181 @@ class SalonDatabase implements ISalonRepository {
     return this.data.orders[idx];
   }
 
+  public async softDeleteOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<{ order: Order; affectedPayments: number } | null> {
+    let orderIdx = this.data.orders.findIndex(o => o.id === orderOrPaymentId || o.bill_number === orderOrPaymentId);
+    if (orderIdx === -1) {
+      const payment = this.data.payments.find(p => p.id === orderOrPaymentId);
+      if (payment) {
+        orderIdx = this.data.orders.findIndex(o => o.id === payment.order_id || o.bill_number === payment.bill_number);
+      }
+    }
+    if (orderIdx === -1) return null;
+
+    const now = new Date().toISOString();
+    const cleanReason = (reason || '').trim() || 'Removed from ledger by authorized admin';
+    const order = this.data.orders[orderIdx];
+    this.data.orders[orderIdx] = {
+      ...order,
+      deleted_at: now,
+      deleted_by: actor.name,
+      deleted_by_user_id: actor.userId || null,
+      deletion_reason: cleanReason,
+      items: (order.items || []).map(it => ({
+        ...it,
+        deleted_at: now,
+        deleted_by: actor.name,
+        deletion_reason: cleanReason,
+      })),
+    };
+
+    let affectedPayments = 0;
+    this.data.payments = this.data.payments.map(p => {
+      if (p.order_id === order.id || p.bill_number === order.bill_number) {
+        affectedPayments++;
+        return {
+          ...p,
+          deleted_at: now,
+          deleted_by: actor.name,
+          deleted_by_user_id: actor.userId || null,
+          deletion_reason: cleanReason,
+        };
+      }
+      return p;
+    });
+
+    await this.cancelScheduledFeedbackJobByOrder(order.id).catch(() => false);
+    await this.logAudit(
+      'SOFT_DELETE',
+      'PaymentLedgerBill',
+      order.id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'OrderAndPayments',
+        order_id: order.id,
+        bill_number: order.bill_number,
+        customer_name: order.customer_name,
+        customer_phone: order.customer_phone,
+        amount: order.grand_total,
+        affected_payments: affectedPayments,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        reason: cleanReason,
+        deleted_at: now,
+      })
+    );
+    this.save();
+    return { order: this.data.orders[orderIdx], affectedPayments };
+  }
+
+  public async restoreOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string }
+  ): Promise<{ order: Order; restoredPayments: number } | null> {
+    let orderIdx = this.data.orders.findIndex(o => o.id === orderOrPaymentId || o.bill_number === orderOrPaymentId);
+    if (orderIdx === -1) {
+      const payment = this.data.payments.find(p => p.id === orderOrPaymentId);
+      if (payment) {
+        orderIdx = this.data.orders.findIndex(o => o.id === payment.order_id || o.bill_number === payment.bill_number);
+      }
+    }
+    if (orderIdx === -1) return null;
+
+    const now = new Date().toISOString();
+    const order = this.data.orders[orderIdx];
+    this.data.orders[orderIdx] = {
+      ...order,
+      deleted_at: null,
+      restored_at: now,
+      restored_by: actor.name,
+      items: (order.items || []).map(it => ({
+        ...it,
+        deleted_at: null,
+      })),
+    };
+
+    let restoredPayments = 0;
+    this.data.payments = this.data.payments.map(p => {
+      if (p.order_id === order.id || p.bill_number === order.bill_number) {
+        restoredPayments++;
+        return {
+          ...p,
+          deleted_at: null,
+          restored_at: now,
+          restored_by: actor.name,
+        };
+      }
+      return p;
+    });
+
+    await this.logAudit(
+      'RESTORE',
+      'PaymentLedgerBill',
+      order.id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'OrderAndPayments',
+        order_id: order.id,
+        bill_number: order.bill_number,
+        customer_name: order.customer_name,
+        amount: order.grand_total,
+        restored_payments: restoredPayments,
+        restored_by: actor.name,
+        restored_by_user_id: actor.userId || null,
+        restored_at: now,
+      })
+    );
+    this.save();
+    return { order: this.data.orders[orderIdx], restoredPayments };
+  }
+
   // --- Payments & Refunds ---
-  public async getPayments(): Promise<PaymentRecord[]> {
-    return this.data.payments;
+  public async getPayments(filters?: {
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<PaymentRecord[]> {
+    const deletedMode = filters?.deleted || 'active';
+    const ordersById = new Map(this.data.orders.map(o => [o.id, o]));
+    const ordersByBill = new Map(this.data.orders.map(o => [o.bill_number, o]));
+
+    let list = this.data.payments.map(p => {
+      const ord = ordersById.get(p.order_id) || ordersByBill.get(p.bill_number);
+      return {
+        ...p,
+        branch_id: p.branch_id || ord?.branch_id || 'tgl-gachibowli-main',
+        subtotal: ord?.subtotal ?? p.subtotal ?? p.amount,
+        discount: ord?.discount ?? p.discount ?? 0,
+        tax_amount: ord?.tax_amount ?? p.tax_amount ?? 0,
+        receipt_whatsapp_status: ord?.receipt_whatsapp_status || ord?.whatsapp_status || p.receipt_whatsapp_status,
+        receipt_whatsapp_error: ord?.receipt_whatsapp_error || p.receipt_whatsapp_error,
+        feedback_whatsapp_status: ord?.feedback_whatsapp_status || p.feedback_whatsapp_status,
+        items: ord?.items || p.items || [],
+        deleted_at: p.deleted_at || ord?.deleted_at || null,
+        deleted_by: p.deleted_by || ord?.deleted_by || null,
+        deleted_by_user_id: p.deleted_by_user_id || ord?.deleted_by_user_id || null,
+        deletion_reason: p.deletion_reason || ord?.deletion_reason || null,
+        restored_at: p.restored_at || ord?.restored_at || null,
+        restored_by: p.restored_by || ord?.restored_by || null,
+      };
+    });
+
+    if (deletedMode === 'active') list = list.filter(p => !p.deleted_at);
+    else if (deletedMode === 'deleted') list = list.filter(p => Boolean(p.deleted_at));
+    if (filters?.branchId) list = list.filter(p => (p.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    if (filters?.startIso) {
+      const startMs = new Date(filters.startIso).getTime();
+      list = list.filter(p => new Date(p.created_at).getTime() >= startMs);
+    }
+    if (filters?.endIso) {
+      const endMs = new Date(filters.endIso).getTime();
+      list = list.filter(p => new Date(p.created_at).getTime() <= endMs);
+    }
+    return list;
   }
 
   public async recordPayment(payment: Omit<PaymentRecord, 'id' | 'created_at'>, performedBy: string): Promise<PaymentRecord> {
@@ -3163,7 +3438,7 @@ class SalonDatabase implements ISalonRepository {
 
   // --- Reports ---
   public async getReports(): Promise<any> {
-    const orders = this.data.orders;
+    const orders = this.data.orders.filter(o => !o.deleted_at);
     const totalSales = orders.reduce((sum, o) => sum + o.grand_total, 0);
     const totalPaid = orders.reduce((sum, o) => sum + o.paid_amount, 0);
     const totalDue = orders.reduce((sum, o) => sum + o.due_amount, 0);
@@ -3208,8 +3483,8 @@ class SalonDatabase implements ISalonRepository {
       totalPaid,
       totalDue,
       totalOrders: orders.length,
-      totalAppointments: this.data.appointments.length,
-      pendingAppointments: this.data.appointments.filter(a => a.status === 'Pending').length,
+      totalAppointments: this.data.appointments.filter(a => !a.deleted_at).length,
+      pendingAppointments: this.data.appointments.filter(a => !a.deleted_at && a.status === 'Pending').length,
       activeStaffCount: this.data.staff.filter(s => s.is_active).length,
       lowStockCount: lowStockItems.length,
       lowStockItems,
@@ -3259,11 +3534,13 @@ class SalonDatabase implements ISalonRepository {
     }
 
     const filteredOrders = this.data.orders.filter(o => {
+      if (o.deleted_at) return false;
       const d = new Date(o.created_at);
       return d >= start && d <= end;
     });
 
     const filteredPayments = this.data.payments.filter(p => {
+      if (p.deleted_at) return false;
       const d = new Date(p.created_at);
       return d >= start && d <= end;
     });
@@ -3421,13 +3698,16 @@ class SalonDatabase implements ISalonRepository {
   // WhatsApp Message Logs
   // ==========================================================================
 
-  public async getWhatsAppMessageLogs(appointmentId?: string, branchId?: string): Promise<WhatsAppMessageLog[]> {
+  public async getWhatsAppMessageLogs(appointmentId?: string, branchId?: string, orderId?: string): Promise<WhatsAppMessageLog[]> {
     let logs = this.data.whatsapp_message_logs || [];
     if (appointmentId) {
       logs = logs.filter(l => l.appointment_id === appointmentId);
     }
     if (branchId) {
       logs = logs.filter(l => l.branch_id === branchId);
+    }
+    if (orderId) {
+      logs = logs.filter(l => l.order_id === orderId);
     }
     return logs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   }

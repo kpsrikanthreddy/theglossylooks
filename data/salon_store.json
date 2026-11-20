@@ -132,6 +132,66 @@
       "last_visit_at": "2026-10-30",
       "created_at": "2026-10-30T18:31:19.058Z",
       "updated_at": "2026-10-30T18:31:19.058Z"
+    },
+    {
+      "id": "cust-1795166339800",
+      "name": "Kavya Reddy",
+      "mobile": "9848011223",
+      "loyalty_points": 20,
+      "total_spend": 0,
+      "visit_count": 3,
+      "saved_addresses": [],
+      "last_visit_at": "2026-11-20",
+      "created_at": "2026-11-20T09:18:59.800Z",
+      "updated_at": "2026-11-20T09:18:59.800Z"
+    },
+    {
+      "id": "cust-1795166339817",
+      "name": "Ananya Rao",
+      "mobile": "+919848099887",
+      "loyalty_points": 630,
+      "total_spend": 12600,
+      "visit_count": 1,
+      "saved_addresses": [],
+      "last_visit_at": "2026-11-20T10:03:12.629Z",
+      "created_at": "2026-11-20T09:18:59.817Z",
+      "updated_at": "2026-11-20T09:18:59.817Z"
+    },
+    {
+      "id": "cust-1795166339828",
+      "name": "Today Gachibowli",
+      "mobile": "+919848000001",
+      "loyalty_points": 78,
+      "total_spend": 1575,
+      "visit_count": 1,
+      "saved_addresses": [],
+      "last_visit_at": "2026-11-20T10:03:12.701Z",
+      "created_at": "2026-11-20T09:18:59.828Z",
+      "updated_at": "2026-11-20T09:18:59.828Z"
+    },
+    {
+      "id": "cust-1795166339833",
+      "name": "Today Kondapur",
+      "mobile": "+919848000002",
+      "loyalty_points": 93,
+      "total_spend": 1890,
+      "visit_count": 1,
+      "saved_addresses": [],
+      "last_visit_at": "2026-11-20T10:03:12.706Z",
+      "created_at": "2026-11-20T09:18:59.833Z",
+      "updated_at": "2026-11-20T09:18:59.833Z"
+    },
+    {
+      "id": "cust-1795166339839",
+      "name": "Yesterday Gachibowli",
+      "mobile": "+919848000003",
+      "loyalty_points": 156,
+      "total_spend": 3150,
+      "visit_count": 1,
+      "saved_addresses": [],
+      "last_visit_at": "2026-11-20T10:03:12.714Z",
+      "created_at": "2026-11-20T09:18:59.839Z",
+      "updated_at": "2026-11-20T09:18:59.839Z"
     }
   ],
   "otp_sessions": [],
@@ -3179,9 +3239,695 @@
       "is_active": true
     }
   ],
-  "appointments": [],
-  "orders": [],
-  "payments": [],
+  "appointments": [
+    {
+      "customer_name": "Kavya Reddy",
+      "customer_phone": "9848011223",
+      "branch_id": "tgl-gachibowli-main",
+      "appointment_date": "2026-11-20",
+      "time_slot": "03:00 PM",
+      "status": "Confirmed",
+      "services": [
+        {
+          "id": "srv-1",
+          "name": "Hair Spa",
+          "price": 1500,
+          "duration": 45
+        }
+      ],
+      "total_amount": 1500,
+      "discount_amount": 0,
+      "final_amount": 1500,
+      "payment_preference": "pay_at_salon",
+      "booking_source": "walkin",
+      "id": "apt-1795168992615",
+      "assigned_staff_name": "Station Stylist",
+      "booking_reference": "TGL-BK-2026-103",
+      "created_at": "2026-11-20T10:03:12.615Z",
+      "updated_at": "2026-11-20T10:03:12.625Z",
+      "customer_id": "cust-1795166339800",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Duplicate booking",
+      "restored_at": "2026-11-20T10:03:12.625Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "customer_name": "Kavya Reddy",
+      "customer_phone": "9848011223",
+      "branch_id": "tgl-gachibowli-main",
+      "appointment_date": "2026-11-20",
+      "time_slot": "03:00 PM",
+      "status": "Confirmed",
+      "services": [
+        {
+          "id": "srv-1",
+          "name": "Hair Spa",
+          "price": 1500,
+          "duration": 45
+        }
+      ],
+      "total_amount": 1500,
+      "discount_amount": 0,
+      "final_amount": 1500,
+      "payment_preference": "pay_at_salon",
+      "booking_source": "admin_walkin",
+      "id": "apt-1795168933798",
+      "assigned_staff_name": "Station Stylist",
+      "booking_reference": "TGL-BK-2026-102",
+      "created_at": "2026-11-20T10:02:13.798Z",
+      "updated_at": "2026-11-20T10:02:13.807Z",
+      "customer_id": "cust-1795166339800",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Duplicate booking",
+      "restored_at": "2026-11-20T10:02:13.807Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "customer_name": "Kavya Reddy",
+      "customer_phone": "9848011223",
+      "branch_id": "tgl-gachibowli-main",
+      "appointment_date": "2026-11-20",
+      "time_slot": "03:00 PM",
+      "status": "Confirmed",
+      "services": [
+        {
+          "id": "srv-1",
+          "name": "Hair Spa",
+          "price": 1500,
+          "duration": 45
+        }
+      ],
+      "total_amount": 1500,
+      "discount_amount": 0,
+      "final_amount": 1500,
+      "payment_preference": "pay_at_salon",
+      "booking_source": "admin_walkin",
+      "id": "apt-1795166339799",
+      "assigned_staff_name": "Station Stylist",
+      "booking_reference": "TGL-BK-2026-101",
+      "created_at": "2026-11-20T09:18:59.799Z",
+      "updated_at": "2026-11-20T09:18:59.809Z",
+      "customer_id": "cust-1795166339800",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Duplicate booking",
+      "restored_at": "2026-11-20T09:18:59.809Z",
+      "restored_by": "Madu Mounika"
+    }
+  ],
+  "orders": [
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "items": [
+        {
+          "item_name": "Facial",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 1000,
+          "total_price": 1000,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 1000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 50,
+      "tip_amount": 0,
+      "grand_total": 1050,
+      "paid_amount": 1050,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795168992714",
+      "bill_number": "TGL-2026-1012",
+      "invoice_number": "INV-2026-0012",
+      "created_at": "2026-11-20T10:03:12.714Z",
+      "customer_id": "cust-1795166339839"
+    },
+    {
+      "branch_id": "brn-1793346038689",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 600,
+          "total_price": 600,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 600,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 30,
+      "tip_amount": 0,
+      "grand_total": 630,
+      "paid_amount": 630,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795168992706",
+      "bill_number": "TGL-2026-1011",
+      "invoice_number": "INV-2026-0011",
+      "created_at": "2026-11-20T10:03:12.706Z",
+      "customer_id": "cust-1795166339833"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 500,
+          "total_price": 500,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 500,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 25,
+      "tip_amount": 0,
+      "grand_total": 525,
+      "paid_amount": 525,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "Cash",
+      "cashier_name": "Staff",
+      "id": "ord-1795168992701",
+      "bill_number": "TGL-2026-1010",
+      "invoice_number": "INV-2026-0010",
+      "created_at": "2026-11-20T10:03:12.701Z",
+      "customer_id": "cust-1795166339828"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "items": [
+        {
+          "item_name": "Keratin Treatment",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 4000,
+          "total_price": 4000,
+          "staff_name": "Station Stylist",
+          "deleted_at": null,
+          "deleted_by": "Madu Mounika",
+          "deletion_reason": "Wrong amount entered"
+        }
+      ],
+      "subtotal": 4000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 200,
+      "tip_amount": 0,
+      "grand_total": 4200,
+      "paid_amount": 4200,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Madu Mounika",
+      "id": "ord-1795168992629",
+      "bill_number": "TGL-2026-1009",
+      "invoice_number": "INV-2026-0009",
+      "cashier_id": "stf-1",
+      "created_at": "2026-11-20T10:03:12.629Z",
+      "customer_id": "cust-1795166339817",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered",
+      "restored_at": "2026-11-20T10:03:12.696Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "items": [
+        {
+          "item_name": "Facial",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 1000,
+          "total_price": 1000,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 1000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 50,
+      "tip_amount": 0,
+      "grand_total": 1050,
+      "paid_amount": 1050,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795168933846",
+      "bill_number": "TGL-2026-1008",
+      "invoice_number": "INV-2026-0008",
+      "created_at": "2026-11-20T10:02:13.846Z",
+      "customer_id": "cust-1795166339839"
+    },
+    {
+      "branch_id": "brn-1793346038689",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 600,
+          "total_price": 600,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 600,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 30,
+      "tip_amount": 0,
+      "grand_total": 630,
+      "paid_amount": 630,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795168933841",
+      "bill_number": "TGL-2026-1007",
+      "invoice_number": "INV-2026-0007",
+      "created_at": "2026-11-20T10:02:13.841Z",
+      "customer_id": "cust-1795166339833"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 500,
+          "total_price": 500,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 500,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 25,
+      "tip_amount": 0,
+      "grand_total": 525,
+      "paid_amount": 525,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "Cash",
+      "cashier_name": "Staff",
+      "id": "ord-1795168933832",
+      "bill_number": "TGL-2026-1006",
+      "invoice_number": "INV-2026-0006",
+      "created_at": "2026-11-20T10:02:13.833Z",
+      "customer_id": "cust-1795166339828"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "items": [
+        {
+          "item_name": "Keratin Treatment",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 4000,
+          "total_price": 4000,
+          "staff_name": "Station Stylist",
+          "deleted_at": null,
+          "deleted_by": "Madu Mounika",
+          "deletion_reason": "Wrong amount entered"
+        }
+      ],
+      "subtotal": 4000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 200,
+      "tip_amount": 0,
+      "grand_total": 4200,
+      "paid_amount": 4200,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Madu Mounika",
+      "id": "ord-1795168933811",
+      "bill_number": "TGL-2026-1005",
+      "invoice_number": "INV-2026-0005",
+      "cashier_id": "stf-1",
+      "created_at": "2026-11-20T10:02:13.811Z",
+      "customer_id": "cust-1795166339817",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered",
+      "restored_at": "2026-11-20T10:02:13.828Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "items": [
+        {
+          "item_name": "Facial",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 1000,
+          "total_price": 1000,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 1000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 50,
+      "tip_amount": 0,
+      "grand_total": 1050,
+      "paid_amount": 1050,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795166339839",
+      "bill_number": "TGL-2026-1004",
+      "invoice_number": "INV-2026-0004",
+      "created_at": "2026-11-20T09:18:59.839Z",
+      "customer_id": "cust-1795166339839"
+    },
+    {
+      "branch_id": "brn-1793346038689",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 600,
+          "total_price": 600,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 600,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 30,
+      "tip_amount": 0,
+      "grand_total": 630,
+      "paid_amount": 630,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Staff",
+      "id": "ord-1795166339833",
+      "bill_number": "TGL-2026-1003",
+      "invoice_number": "INV-2026-0003",
+      "created_at": "2026-11-20T09:18:59.833Z",
+      "customer_id": "cust-1795166339833"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "items": [
+        {
+          "item_name": "Haircut",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 500,
+          "total_price": 500,
+          "staff_name": "Station Stylist"
+        }
+      ],
+      "subtotal": 500,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 25,
+      "tip_amount": 0,
+      "grand_total": 525,
+      "paid_amount": 525,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "Cash",
+      "cashier_name": "Staff",
+      "id": "ord-1795166339828",
+      "bill_number": "TGL-2026-1002",
+      "invoice_number": "INV-2026-0002",
+      "created_at": "2026-11-20T09:18:59.828Z",
+      "customer_id": "cust-1795166339828"
+    },
+    {
+      "branch_id": "tgl-gachibowli-main",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "items": [
+        {
+          "item_name": "Keratin Treatment",
+          "item_type": "service",
+          "quantity": 1,
+          "unit_price": 4000,
+          "total_price": 4000,
+          "staff_name": "Station Stylist",
+          "deleted_at": "2026-11-20T09:18:59.824Z",
+          "deleted_by": "Madu Mounika",
+          "deletion_reason": "Wrong amount entered"
+        }
+      ],
+      "subtotal": 4000,
+      "discount": 0,
+      "tax_percent": 5,
+      "tax_amount": 200,
+      "tip_amount": 0,
+      "grand_total": 4200,
+      "paid_amount": 4200,
+      "due_amount": 0,
+      "payment_status": "Paid",
+      "primary_payment_mode": "UPI",
+      "cashier_name": "Madu Mounika",
+      "id": "ord-1795166339816",
+      "bill_number": "TGL-2026-1001",
+      "invoice_number": "INV-2026-0001",
+      "cashier_id": "stf-1",
+      "created_at": "2026-11-20T09:18:59.816Z",
+      "customer_id": "cust-1795166339817",
+      "deleted_at": "2026-11-20T09:18:59.824Z",
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered"
+    }
+  ],
+  "payments": [
+    {
+      "id": "pay-1795168992714",
+      "order_id": "ord-1795168992714",
+      "bill_number": "TGL-2026-1012",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "amount": 1050,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-755647",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:03:12.714Z"
+    },
+    {
+      "id": "pay-1795168992706",
+      "order_id": "ord-1795168992706",
+      "bill_number": "TGL-2026-1011",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "amount": 630,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-357652",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:03:12.706Z"
+    },
+    {
+      "id": "pay-1795168992701",
+      "order_id": "ord-1795168992701",
+      "bill_number": "TGL-2026-1010",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "amount": 525,
+      "payment_mode": "Cash",
+      "transaction_ref": "POS-207063",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:03:12.701Z"
+    },
+    {
+      "id": "pay-1795168992630",
+      "order_id": "ord-1795168992629",
+      "bill_number": "TGL-2026-1009",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "amount": 4200,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-162094",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Madu Mounika",
+      "created_at": "2026-11-20T10:03:12.630Z",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered",
+      "restored_at": "2026-11-20T10:03:12.696Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "id": "pay-1795168933847",
+      "order_id": "ord-1795168933846",
+      "bill_number": "TGL-2026-1008",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "amount": 1050,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-602894",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:02:13.847Z"
+    },
+    {
+      "id": "pay-1795168933841",
+      "order_id": "ord-1795168933841",
+      "bill_number": "TGL-2026-1007",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "amount": 630,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-300948",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:02:13.841Z"
+    },
+    {
+      "id": "pay-1795168933833",
+      "order_id": "ord-1795168933832",
+      "bill_number": "TGL-2026-1006",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "amount": 525,
+      "payment_mode": "Cash",
+      "transaction_ref": "POS-208819",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T10:02:13.833Z"
+    },
+    {
+      "id": "pay-1795168933811",
+      "order_id": "ord-1795168933811",
+      "bill_number": "TGL-2026-1005",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "amount": 4200,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-906119",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Madu Mounika",
+      "created_at": "2026-11-20T10:02:13.811Z",
+      "deleted_at": null,
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered",
+      "restored_at": "2026-11-20T10:02:13.828Z",
+      "restored_by": "Madu Mounika"
+    },
+    {
+      "id": "pay-1795166339839",
+      "order_id": "ord-1795166339839",
+      "bill_number": "TGL-2026-1004",
+      "customer_name": "Yesterday Gachibowli",
+      "customer_phone": "+919848000003",
+      "amount": 1050,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-483039",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T09:18:59.839Z"
+    },
+    {
+      "id": "pay-1795166339833",
+      "order_id": "ord-1795166339833",
+      "bill_number": "TGL-2026-1003",
+      "customer_name": "Today Kondapur",
+      "customer_phone": "+919848000002",
+      "amount": 630,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-800664",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T09:18:59.833Z"
+    },
+    {
+      "id": "pay-1795166339828",
+      "order_id": "ord-1795166339828",
+      "bill_number": "TGL-2026-1002",
+      "customer_name": "Today Gachibowli",
+      "customer_phone": "+919848000001",
+      "amount": 525,
+      "payment_mode": "Cash",
+      "transaction_ref": "POS-436665",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Staff",
+      "created_at": "2026-11-20T09:18:59.828Z"
+    },
+    {
+      "id": "pay-1795166339817",
+      "order_id": "ord-1795166339816",
+      "bill_number": "TGL-2026-1001",
+      "customer_name": "Ananya Rao",
+      "customer_phone": "+919848099887",
+      "amount": 4200,
+      "payment_mode": "UPI",
+      "transaction_ref": "POS-717817",
+      "status": "Success",
+      "notes": "POS Order Payment",
+      "recorded_by": "Madu Mounika",
+      "created_at": "2026-11-20T09:18:59.817Z",
+      "deleted_at": "2026-11-20T09:18:59.824Z",
+      "deleted_by": "Madu Mounika",
+      "deleted_by_user_id": "usr-1",
+      "deletion_reason": "Wrong amount entered"
+    }
+  ],
   "products": [
     {
       "id": "prod-1",
@@ -3190,7 +3936,7 @@
       "brand": "O3+ Professional",
       "category": "Facial Kits",
       "unit": "kits",
-      "current_stock": 4,
+      "current_stock": 1,
       "min_stock_alert": 3,
       "purchase_cost": 4800,
       "sale_price": 6500,
@@ -3353,6 +4099,39 @@
     }
   ],
   "inventory_movements": [
+    {
+      "id": "im-1795168992714-293",
+      "product_id": "prod-1",
+      "product_name": "O3+ Bridal Radiance Professional Facial Kit (10 Treatments)",
+      "movement_type": "pos_sale",
+      "quantity": -1,
+      "balance_after": 1,
+      "notes": "Billed in order TGL-2026-1012",
+      "performed_by": "Staff",
+      "created_at": "2026-11-20T10:03:12.714Z"
+    },
+    {
+      "id": "im-1795168933847-808",
+      "product_id": "prod-1",
+      "product_name": "O3+ Bridal Radiance Professional Facial Kit (10 Treatments)",
+      "movement_type": "pos_sale",
+      "quantity": -1,
+      "balance_after": 2,
+      "notes": "Billed in order TGL-2026-1008",
+      "performed_by": "Staff",
+      "created_at": "2026-11-20T10:02:13.847Z"
+    },
+    {
+      "id": "im-1795166339839-609",
+      "product_id": "prod-1",
+      "product_name": "O3+ Bridal Radiance Professional Facial Kit (10 Treatments)",
+      "movement_type": "pos_sale",
+      "quantity": -1,
+      "balance_after": 3,
+      "notes": "Billed in order TGL-2026-1004",
+      "performed_by": "Staff",
+      "created_at": "2026-11-20T09:18:59.839Z"
+    },
     {
       "id": "im-1",
       "product_id": "prod-1",
@@ -3540,8 +4319,687 @@
       "last_heartbeat": "2026-10-27T15:43:41.548Z"
     }
   ],
-  "print_jobs": [],
+  "print_jobs": [
+    {
+      "id": "pj-1795168992714-411",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168992714",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1012",
+        "invoice_number": "INV-2026-0012",
+        "customer_name": "Yesterday Gachibowli",
+        "customer_phone": "+919848000003",
+        "items": [
+          {
+            "name": "Facial",
+            "quantity": 1,
+            "price": 1000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 1000,
+        "discount": 0,
+        "tax": 50,
+        "tip": 0,
+        "total": 1050,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:33:12 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:03:12.714Z"
+    },
+    {
+      "id": "pj-1795168992706-587",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168992706",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1011",
+        "invoice_number": "INV-2026-0011",
+        "customer_name": "Today Kondapur",
+        "customer_phone": "+919848000002",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 600,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 600,
+        "discount": 0,
+        "tax": 30,
+        "tip": 0,
+        "total": 630,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:33:12 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:03:12.706Z"
+    },
+    {
+      "id": "pj-1795168992701-295",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168992701",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1010",
+        "invoice_number": "INV-2026-0010",
+        "customer_name": "Today Gachibowli",
+        "customer_phone": "+919848000001",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 500,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 500,
+        "discount": 0,
+        "tax": 25,
+        "tip": 0,
+        "total": 525,
+        "payment_method": "Cash",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:33:12 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:03:12.701Z"
+    },
+    {
+      "id": "pj-1795168992631-202",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168992629",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1009",
+        "invoice_number": "INV-2026-0009",
+        "customer_name": "Ananya Rao",
+        "customer_phone": "+919848099887",
+        "items": [
+          {
+            "name": "Keratin Treatment",
+            "quantity": 1,
+            "price": 4000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 4000,
+        "discount": 0,
+        "tax": 200,
+        "tip": 0,
+        "total": 4200,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:33:12 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:03:12.631Z"
+    },
+    {
+      "id": "pj-1795168992616-509",
+      "device_id": "dev-1",
+      "job_type": "service_ticket",
+      "appointment_id": "apt-1795168992615",
+      "status": "Pending",
+      "payload": {
+        "booking_reference": "TGL-BK-2026-103",
+        "customer_name": "Kavya Reddy",
+        "customer_phone": "9848011223",
+        "date": "2026-11-20",
+        "time_slot": "03:00 PM",
+        "assigned_staff": "Station Stylist",
+        "services": [
+          {
+            "name": "Hair Spa",
+            "duration": 45,
+            "price": 1500
+          }
+        ]
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:03:12.616Z"
+    },
+    {
+      "id": "pj-1795168933847-687",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168933846",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1008",
+        "invoice_number": "INV-2026-0008",
+        "customer_name": "Yesterday Gachibowli",
+        "customer_phone": "+919848000003",
+        "items": [
+          {
+            "name": "Facial",
+            "quantity": 1,
+            "price": 1000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 1000,
+        "discount": 0,
+        "tax": 50,
+        "tip": 0,
+        "total": 1050,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:32:13 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:02:13.847Z"
+    },
+    {
+      "id": "pj-1795168933842-134",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168933841",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1007",
+        "invoice_number": "INV-2026-0007",
+        "customer_name": "Today Kondapur",
+        "customer_phone": "+919848000002",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 600,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 600,
+        "discount": 0,
+        "tax": 30,
+        "tip": 0,
+        "total": 630,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:32:13 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:02:13.842Z"
+    },
+    {
+      "id": "pj-1795168933833-702",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168933832",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1006",
+        "invoice_number": "INV-2026-0006",
+        "customer_name": "Today Gachibowli",
+        "customer_phone": "+919848000001",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 500,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 500,
+        "discount": 0,
+        "tax": 25,
+        "tip": 0,
+        "total": 525,
+        "payment_method": "Cash",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:32:13 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:02:13.833Z"
+    },
+    {
+      "id": "pj-1795168933812-597",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795168933811",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1005",
+        "invoice_number": "INV-2026-0005",
+        "customer_name": "Ananya Rao",
+        "customer_phone": "+919848099887",
+        "items": [
+          {
+            "name": "Keratin Treatment",
+            "quantity": 1,
+            "price": 4000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 4000,
+        "discount": 0,
+        "tax": 200,
+        "tip": 0,
+        "total": 4200,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 3:32:13 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:02:13.812Z"
+    },
+    {
+      "id": "pj-1795168933798-659",
+      "device_id": "dev-1",
+      "job_type": "service_ticket",
+      "appointment_id": "apt-1795168933798",
+      "status": "Pending",
+      "payload": {
+        "booking_reference": "TGL-BK-2026-102",
+        "customer_name": "Kavya Reddy",
+        "customer_phone": "9848011223",
+        "date": "2026-11-20",
+        "time_slot": "03:00 PM",
+        "assigned_staff": "Station Stylist",
+        "services": [
+          {
+            "name": "Hair Spa",
+            "duration": 45,
+            "price": 1500
+          }
+        ]
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T10:02:13.798Z"
+    },
+    {
+      "id": "pj-1795166339839-361",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795166339839",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1004",
+        "invoice_number": "INV-2026-0004",
+        "customer_name": "Yesterday Gachibowli",
+        "customer_phone": "+919848000003",
+        "items": [
+          {
+            "name": "Facial",
+            "quantity": 1,
+            "price": 1000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 1000,
+        "discount": 0,
+        "tax": 50,
+        "tip": 0,
+        "total": 1050,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 2:48:59 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T09:18:59.839Z"
+    },
+    {
+      "id": "pj-1795166339834-609",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795166339833",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1003",
+        "invoice_number": "INV-2026-0003",
+        "customer_name": "Today Kondapur",
+        "customer_phone": "+919848000002",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 600,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 600,
+        "discount": 0,
+        "tax": 30,
+        "tip": 0,
+        "total": 630,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 2:48:59 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T09:18:59.834Z"
+    },
+    {
+      "id": "pj-1795166339829-218",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795166339828",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1002",
+        "invoice_number": "INV-2026-0002",
+        "customer_name": "Today Gachibowli",
+        "customer_phone": "+919848000001",
+        "items": [
+          {
+            "name": "Haircut",
+            "quantity": 1,
+            "price": 500,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 500,
+        "discount": 0,
+        "tax": 25,
+        "tip": 0,
+        "total": 525,
+        "payment_method": "Cash",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 2:48:59 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T09:18:59.829Z"
+    },
+    {
+      "id": "pj-1795166339818-190",
+      "device_id": "dev-1",
+      "job_type": "bill",
+      "order_id": "ord-1795166339816",
+      "status": "Pending",
+      "payload": {
+        "bill_number": "TGL-2026-1001",
+        "invoice_number": "INV-2026-0001",
+        "customer_name": "Ananya Rao",
+        "customer_phone": "+919848099887",
+        "items": [
+          {
+            "name": "Keratin Treatment",
+            "quantity": 1,
+            "price": 4000,
+            "staff": "Station Stylist"
+          }
+        ],
+        "subtotal": 4000,
+        "discount": 0,
+        "tax": 200,
+        "tip": 0,
+        "total": 4200,
+        "payment_method": "UPI",
+        "payment_status": "Paid",
+        "date": "20/11/2026, 2:48:59 pm"
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T09:18:59.818Z"
+    },
+    {
+      "id": "pj-1795166339800-624",
+      "device_id": "dev-1",
+      "job_type": "service_ticket",
+      "appointment_id": "apt-1795166339799",
+      "status": "Pending",
+      "payload": {
+        "booking_reference": "TGL-BK-2026-101",
+        "customer_name": "Kavya Reddy",
+        "customer_phone": "9848011223",
+        "date": "2026-11-20",
+        "time_slot": "03:00 PM",
+        "assigned_staff": "Station Stylist",
+        "services": [
+          {
+            "name": "Hair Spa",
+            "duration": 45,
+            "price": 1500
+          }
+        ]
+      },
+      "retry_count": 0,
+      "created_at": "2026-11-20T09:18:59.800Z"
+    }
+  ],
   "audit_logs": [
+    {
+      "id": "aud-1795168992716-782",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168992714",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1012 for ₹1050",
+      "timestamp": "2026-11-20T10:03:12.717Z"
+    },
+    {
+      "id": "aud-1795168992709-915",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168992706",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1011 for ₹630",
+      "timestamp": "2026-11-20T10:03:12.709Z"
+    },
+    {
+      "id": "aud-1795168992703-775",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168992701",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1010 for ₹525",
+      "timestamp": "2026-11-20T10:03:12.703Z"
+    },
+    {
+      "id": "aud-1795168992696-870",
+      "action": "RESTORE",
+      "entity": "PaymentLedgerBill",
+      "entity_id": "ord-1795168992629",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"OrderAndPayments\",\"order_id\":\"ord-1795168992629\",\"bill_number\":\"TGL-2026-1009\",\"customer_name\":\"Ananya Rao\",\"amount\":4200,\"restored_payments\":1,\"restored_by\":\"Madu Mounika\",\"restored_by_user_id\":\"usr-1\",\"restored_at\":\"2026-11-20T10:03:12.696Z\"}",
+      "timestamp": "2026-11-20T10:03:12.697Z"
+    },
+    {
+      "id": "aud-1795168992688-664",
+      "action": "SOFT_DELETE",
+      "entity": "PaymentLedgerBill",
+      "entity_id": "ord-1795168992629",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"OrderAndPayments\",\"order_id\":\"ord-1795168992629\",\"bill_number\":\"TGL-2026-1009\",\"customer_name\":\"Ananya Rao\",\"customer_phone\":\"+919848099887\",\"amount\":4200,\"affected_payments\":1,\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Wrong amount entered\",\"deleted_at\":\"2026-11-20T10:03:12.688Z\"}",
+      "timestamp": "2026-11-20T10:03:12.688Z"
+    },
+    {
+      "id": "aud-1795168992632-972",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168992629",
+      "performed_by": "Madu Mounika",
+      "details": "Generated Bill: TGL-2026-1009 for ₹4200",
+      "timestamp": "2026-11-20T10:03:12.632Z"
+    },
+    {
+      "id": "aud-1795168992625-48",
+      "action": "RESTORE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168992615",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795168992615\",\"booking_reference\":\"TGL-BK-2026-103\",\"customer_name\":\"Kavya Reddy\",\"restored_by\":\"Madu Mounika\",\"restored_by_user_id\":\"usr-1\",\"restored_at\":\"2026-11-20T10:03:12.625Z\"}",
+      "timestamp": "2026-11-20T10:03:12.625Z"
+    },
+    {
+      "id": "aud-1795168992622-282",
+      "action": "SOFT_DELETE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168992615",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795168992615\",\"booking_reference\":\"TGL-BK-2026-103\",\"customer_name\":\"Kavya Reddy\",\"customer_phone\":\"9848011223\",\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Duplicate booking\",\"deleted_at\":\"2026-11-20T10:03:12.622Z\"}",
+      "timestamp": "2026-11-20T10:03:12.622Z"
+    },
+    {
+      "id": "aud-1795168992618-882",
+      "action": "CREATE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168992615",
+      "performed_by": "Madu Mounika",
+      "details": "Scheduled booking: TGL-BK-2026-103 for Kavya Reddy",
+      "timestamp": "2026-11-20T10:03:12.618Z"
+    },
+    {
+      "id": "aud-1795168933848-412",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168933846",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1008 for ₹1050",
+      "timestamp": "2026-11-20T10:02:13.848Z"
+    },
+    {
+      "id": "aud-1795168933843-114",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168933841",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1007 for ₹630",
+      "timestamp": "2026-11-20T10:02:13.843Z"
+    },
+    {
+      "id": "aud-1795168933834-262",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168933832",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1006 for ₹525",
+      "timestamp": "2026-11-20T10:02:13.834Z"
+    },
+    {
+      "id": "aud-1795168933829-476",
+      "action": "RESTORE",
+      "entity": "PaymentLedgerBill",
+      "entity_id": "ord-1795168933811",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"OrderAndPayments\",\"order_id\":\"ord-1795168933811\",\"bill_number\":\"TGL-2026-1005\",\"customer_name\":\"Ananya Rao\",\"amount\":4200,\"restored_payments\":1,\"restored_by\":\"Madu Mounika\",\"restored_by_user_id\":\"usr-1\",\"restored_at\":\"2026-11-20T10:02:13.828Z\"}",
+      "timestamp": "2026-11-20T10:02:13.829Z"
+    },
+    {
+      "id": "aud-1795168933823-833",
+      "action": "SOFT_DELETE",
+      "entity": "PaymentLedgerBill",
+      "entity_id": "ord-1795168933811",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"OrderAndPayments\",\"order_id\":\"ord-1795168933811\",\"bill_number\":\"TGL-2026-1005\",\"customer_name\":\"Ananya Rao\",\"customer_phone\":\"+919848099887\",\"amount\":4200,\"affected_payments\":1,\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Wrong amount entered\",\"deleted_at\":\"2026-11-20T10:02:13.823Z\"}",
+      "timestamp": "2026-11-20T10:02:13.823Z"
+    },
+    {
+      "id": "aud-1795168933813-314",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795168933811",
+      "performed_by": "Madu Mounika",
+      "details": "Generated Bill: TGL-2026-1005 for ₹4200",
+      "timestamp": "2026-11-20T10:02:13.813Z"
+    },
+    {
+      "id": "aud-1795168933807-560",
+      "action": "RESTORE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168933798",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795168933798\",\"booking_reference\":\"TGL-BK-2026-102\",\"customer_name\":\"Kavya Reddy\",\"restored_by\":\"Madu Mounika\",\"restored_by_user_id\":\"usr-1\",\"restored_at\":\"2026-11-20T10:02:13.807Z\"}",
+      "timestamp": "2026-11-20T10:02:13.807Z"
+    },
+    {
+      "id": "aud-1795168933803-63",
+      "action": "SOFT_DELETE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168933798",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795168933798\",\"booking_reference\":\"TGL-BK-2026-102\",\"customer_name\":\"Kavya Reddy\",\"customer_phone\":\"9848011223\",\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Duplicate booking\",\"deleted_at\":\"2026-11-20T10:02:13.803Z\"}",
+      "timestamp": "2026-11-20T10:02:13.803Z"
+    },
+    {
+      "id": "aud-1795168933800-789",
+      "action": "CREATE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795168933798",
+      "performed_by": "Madu Mounika",
+      "details": "Scheduled booking: TGL-BK-2026-102 for Kavya Reddy",
+      "timestamp": "2026-11-20T10:02:13.800Z"
+    },
+    {
+      "id": "aud-1795166339841-84",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795166339839",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1004 for ₹1050",
+      "timestamp": "2026-11-20T09:18:59.841Z"
+    },
+    {
+      "id": "aud-1795166339835-531",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795166339833",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1003 for ₹630",
+      "timestamp": "2026-11-20T09:18:59.835Z"
+    },
+    {
+      "id": "aud-1795166339831-911",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795166339828",
+      "performed_by": "Staff",
+      "details": "Generated Bill: TGL-2026-1002 for ₹525",
+      "timestamp": "2026-11-20T09:18:59.831Z"
+    },
+    {
+      "id": "aud-1795166339824-324",
+      "action": "SOFT_DELETE",
+      "entity": "PaymentLedgerBill",
+      "entity_id": "ord-1795166339816",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"OrderAndPayments\",\"order_id\":\"ord-1795166339816\",\"bill_number\":\"TGL-2026-1001\",\"customer_name\":\"Ananya Rao\",\"customer_phone\":\"+919848099887\",\"amount\":4200,\"affected_payments\":1,\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Wrong amount entered\",\"deleted_at\":\"2026-11-20T09:18:59.824Z\"}",
+      "timestamp": "2026-11-20T09:18:59.824Z"
+    },
+    {
+      "id": "aud-1795166339820-285",
+      "action": "CREATE",
+      "entity": "Order",
+      "entity_id": "ord-1795166339816",
+      "performed_by": "Madu Mounika",
+      "details": "Generated Bill: TGL-2026-1001 for ₹4200",
+      "timestamp": "2026-11-20T09:18:59.820Z"
+    },
+    {
+      "id": "aud-1795166339809-576",
+      "action": "RESTORE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795166339799",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795166339799\",\"booking_reference\":\"TGL-BK-2026-101\",\"customer_name\":\"Kavya Reddy\",\"restored_by\":\"Madu Mounika\",\"restored_by_user_id\":\"usr-1\",\"restored_at\":\"2026-11-20T09:18:59.809Z\"}",
+      "timestamp": "2026-11-20T09:18:59.809Z"
+    },
+    {
+      "id": "aud-1795166339806-958",
+      "action": "SOFT_DELETE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795166339799",
+      "performed_by": "Madu Mounika",
+      "details": "{\"record_type\":\"Appointment\",\"appointment_id\":\"apt-1795166339799\",\"booking_reference\":\"TGL-BK-2026-101\",\"customer_name\":\"Kavya Reddy\",\"customer_phone\":\"9848011223\",\"deleted_by\":\"Madu Mounika\",\"deleted_by_user_id\":\"usr-1\",\"reason\":\"Duplicate booking\",\"deleted_at\":\"2026-11-20T09:18:59.806Z\"}",
+      "timestamp": "2026-11-20T09:18:59.806Z"
+    },
+    {
+      "id": "aud-1795166339802-281",
+      "action": "CREATE",
+      "entity": "Appointment",
+      "entity_id": "apt-1795166339799",
+      "performed_by": "Madu Mounika",
+      "details": "Scheduled booking: TGL-BK-2026-101 for Kavya Reddy",
+      "timestamp": "2026-11-20T09:18:59.802Z"
+    },
     {
       "id": "aud-1793385143969-930",
       "action": "CUSTOMER_FEEDBACK_ALERT",

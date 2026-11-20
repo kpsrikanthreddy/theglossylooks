@@ -40,6 +40,16 @@ import type {
   WhatsAppMessage,
   WhatsAppDeliveryStatus
 } from './src/types/salon.ts';
+import {
+  canDeleteOrRestoreRecords,
+  hasFullPaymentLedgerAccess,
+  isRestrictedPaymentLedgerStaff,
+  canSendWhatsAppTemplates,
+  getKolkataTodayBounds,
+  isWithinKolkataToday,
+  validateWhatsAppPhone,
+  normalizeRole,
+} from './src/lib/rbac.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -446,7 +456,16 @@ function clearAdminFailedAttempts(key: string) {
   adminLoginAttempts.delete(key);
 }
 
-const AUTHORIZED_STAFF_ROLES = ['owner', 'manager', 'receptionist', 'stylist', 'inventory_staff'];
+const AUTHORIZED_STAFF_ROLES = [
+  'superadmin',
+  'admin',
+  'owner',
+  'manager',
+  'receptionist',
+  'stylist',
+  'pos_billing',
+  'inventory_staff',
+];
 
 app.post(['/api/auth/admin/login', '/auth/admin/login'], async (req, res) => {
   try {
@@ -1939,7 +1958,20 @@ interface SendWhatsAppTemplateOptions {
   components?: any[];
   appointmentId?: string;
   orderId?: string;
-  jobType?: 'appointment_confirmation' | 'customer_feedback' | 'bill_receipt' | string;
+  billNumber?: string;
+  paymentId?: string;
+  sentByUserId?: string;
+  sentByUserName?: string;
+  renderedPreview?: string;
+  templateParams?: Record<string, any>;
+  recordFailureInInbox?: boolean;
+  jobType?:
+    | 'appointment_confirmation'
+    | 'appointment_reminder'
+    | 'customer_feedback'
+    | 'bill_receipt'
+    | 'payment_reminder'
+    | string;
   customData?: {
     customerName?: string;
     branchName?: string;
@@ -1953,6 +1985,7 @@ interface SendWhatsAppTemplateOptions {
     itemsSummary?: string;
     grandTotal?: string | number;
     paymentMode?: string;
+    dueAmount?: string | number;
     stylistName?: string;
     ownerName?: string;
     reportDate?: string;
@@ -1978,8 +2011,23 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
   error?: string;
   diagnostics?: string;
   log?: any;
+  inboxMessage?: WhatsAppMessage | null;
 }> {
-  const { branchId, recipientPhone, templateName, appointmentId, orderId, customData } = options;
+  const {
+    branchId,
+    recipientPhone,
+    templateName,
+    appointmentId,
+    orderId,
+    billNumber,
+    paymentId,
+    sentByUserId,
+    sentByUserName,
+    renderedPreview,
+    templateParams,
+    recordFailureInInbox,
+    customData,
+  } = options;
   let integration = await salonRepository.getBranchWhatsAppIntegration(branchId);
   if (!integration || integration.status !== 'connected' || !integration.phone_number_id) {
     const fallback = await salonRepository.getBranchWhatsAppIntegration('tgl-gachibowli-main');
@@ -2149,9 +2197,46 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
         }
       ];
     }
+  } else if (templateName === 'gl_appointment_reminder') {
+    resolvedTemplateName = 'gl_appointment_reminder';
+    resolvedLang = resolvedLang || 'en';
+    if (!components) {
+      components = [
+        {
+          type: 'body',
+          parameters: [
+            { type: 'text', text: customData?.customerName || 'Valued Customer' },
+            { type: 'text', text: customData?.serviceNames || 'Salon Services' },
+            { type: 'text', text: customData?.appointmentDate || new Date().toISOString().split('T')[0] },
+            { type: 'text', text: customData?.appointmentTime || 'Scheduled Slot' },
+            { type: 'text', text: customData?.branchName || 'The Glossy Looks' }
+          ]
+        }
+      ];
+    }
+  } else if (templateName === 'gl_payment_reminder') {
+    resolvedTemplateName = 'gl_payment_reminder';
+    resolvedLang = resolvedLang || 'en';
+    if (!components) {
+      const rawTotal = String(customData?.dueAmount || customData?.grandTotal || '0').replace(/[^0-9.]/g, '') || '0';
+      components = [
+        {
+          type: 'body',
+          parameters: [
+            { type: 'text', text: customData?.customerName || 'Valued Customer' },
+            { type: 'text', text: customData?.billNumber || billNumber || 'TGL-BILL' },
+            { type: 'text', text: rawTotal },
+            { type: 'text', text: customData?.branchName || 'The Glossy Looks' },
+            { type: 'text', text: customData?.billDate || getKolkataDateString() }
+          ]
+        }
+      ];
+    }
   } else if (templateName === 'hello_world') {
     resolvedLang = resolvedLang || 'en_US';
     components = [];
+  } else {
+    resolvedLang = resolvedLang || 'en';
   }
 
   try {
@@ -2211,6 +2296,8 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       const log = await salonRepository.createWhatsAppMessageLog({
         appointment_id: appointmentId,
         order_id: orderId,
+        bill_number: billNumber || customData?.billNumber,
+        payment_id: paymentId,
         branch_id: branchId,
         customer_name: customData?.customerName,
         template_name: resolvedTemplateName,
@@ -2219,8 +2306,10 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
         sender_phone_number_id: integration.phone_number_id,
         meta_message_id: messageId,
         status: 'sent',
+        sent_by_user_id: sentByUserId,
+        sent_by_user_name: sentByUserName,
         sent_at: sentTime,
-        diagnostics: `Graph API message queued (Message ID: ${messageId})`
+        diagnostics: `Graph API message accepted (Message ID: ${messageId})`
       });
 
       if (orderId) {
@@ -2230,7 +2319,9 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
             receipt_whatsapp_message_id: messageId,
             receipt_whatsapp_sent_at: sentTime,
             receipt_whatsapp_error: undefined,
-            whatsapp_status: 'sent'
+            whatsapp_status: 'sent',
+            whatsapp_message_id: messageId,
+            whatsapp_error: undefined
           });
         } else if (resolvedJobType === 'customer_feedback') {
           await salonRepository.updateOrder(orderId, {
@@ -2240,10 +2331,17 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
             feedback_whatsapp_error: undefined
           });
           await salonRepository.cancelScheduledFeedbackJobByOrder(orderId);
+        } else {
+          await salonRepository.updateOrder(orderId, {
+            whatsapp_status: 'sent',
+            whatsapp_message_id: messageId,
+            whatsapp_error: undefined
+          });
         }
       }
 
-      // Record outbound template message into WhatsApp Inbox
+      // Record outbound template message ONCE into permanent WhatsApp Inbox history
+      let inboxMsg: WhatsAppMessage | null = null;
       try {
         const inboxConv = await salonRepository.getOrCreateWhatsAppConversation({
           branch_id: branchId,
@@ -2251,11 +2349,15 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
           customer_name: customData?.customerName,
           wa_phone_number_id: integration.phone_number_id
         });
-        const templateBody = `Template: ${resolvedTemplateName}`;
-        const inboxMsg = await salonRepository.createWhatsAppMessage({
+        const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
+        inboxMsg = await salonRepository.createWhatsAppMessage({
           salon_id: 'tgl-gachibowli-main',
           branch_id: branchId || 'tgl-gachibowli-main',
           conversation_id: inboxConv.id,
+          appointment_id: appointmentId,
+          order_id: orderId,
+          bill_number: billNumber || customData?.billNumber,
+          payment_id: paymentId,
           direction: 'OUTBOUND',
           message_type: 'template',
           type: 'template',
@@ -2263,10 +2365,13 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
           message_body: templateBody,
           body: templateBody,
           template_name: resolvedTemplateName,
+          template_params: templateParams || customData || null,
           meta_message_id: messageId,
           status: 'sent',
           delivery_status: 'sent',
           source_badge: 'TEMPLATE',
+          sent_by_user_id: sentByUserId,
+          sent_by_user_name: sentByUserName,
           sent_at: sentTime
         });
         await salonRepository.updateWhatsAppConversation(inboxConv.id, {
@@ -2284,7 +2389,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
         console.warn('[WhatsApp Inbox] Failed to record outbound template in inbox:', inboxErr);
       }
 
-      return { sent: true, status: 'sent', messageId, log };
+      return { sent: true, status: 'sent', messageId, log, inboxMessage: inboxMsg };
     }
 
     // Handle Meta Graph API rejection
@@ -2330,6 +2435,8 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
     const log = await salonRepository.createWhatsAppMessageLog({
       appointment_id: appointmentId,
       order_id: orderId,
+      bill_number: billNumber || customData?.billNumber,
+      payment_id: paymentId,
       branch_id: branchId,
       customer_name: customData?.customerName,
       template_name: resolvedTemplateName,
@@ -2339,9 +2446,51 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       status: status,
       error_message: friendlyError,
       diagnostics: diagnostic,
+      sent_by_user_id: sentByUserId,
+      sent_by_user_name: sentByUserName,
       retry_count: isRetryable ? 1 : 0,
       next_retry_at: nextRetryAt
     });
+
+    let failedInboxMsg: WhatsAppMessage | null = null;
+    if (recordFailureInInbox) {
+      try {
+        const failedAt = new Date().toISOString();
+        const inboxConv = await salonRepository.getOrCreateWhatsAppConversation({
+          branch_id: branchId,
+          customer_phone: recipientE164,
+          customer_name: customData?.customerName,
+          wa_phone_number_id: integration.phone_number_id
+        });
+        const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
+        failedInboxMsg = await salonRepository.createWhatsAppMessage({
+          salon_id: 'tgl-gachibowli-main',
+          branch_id: branchId || 'tgl-gachibowli-main',
+          conversation_id: inboxConv.id,
+          appointment_id: appointmentId,
+          order_id: orderId,
+          bill_number: billNumber || customData?.billNumber,
+          payment_id: paymentId,
+          direction: 'OUTBOUND',
+          message_type: 'template',
+          type: 'template',
+          text_body: templateBody,
+          message_body: templateBody,
+          body: templateBody,
+          template_name: resolvedTemplateName,
+          template_params: templateParams || customData || null,
+          status: 'failed',
+          delivery_status: 'failed',
+          error_message: friendlyError,
+          source_badge: 'TEMPLATE',
+          sent_by_user_id: sentByUserId,
+          sent_by_user_name: sentByUserName,
+          failed_at: failedAt
+        });
+      } catch (inboxErr) {
+        console.warn('[WhatsApp Inbox] Failed to record failed template attempt:', inboxErr);
+      }
+    }
 
     if (orderId) {
       if (resolvedJobType === 'bill_receipt') {
@@ -2356,6 +2505,11 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
           feedback_whatsapp_status: status,
           feedback_whatsapp_error: friendlyError
         });
+      } else {
+        await salonRepository.updateOrder(orderId, {
+          whatsapp_status: status,
+          whatsapp_error: friendlyError
+        });
       }
     }
 
@@ -2364,7 +2518,8 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       status: status,
       error: friendlyError,
       diagnostics: diagnostic,
-      log
+      log,
+      inboxMessage: failedInboxMsg
     };
   } catch (err: any) {
     const errorMsg = `Network error communicating with Meta Cloud API: ${err.message}`;
@@ -3263,6 +3418,12 @@ async function handleMetaWebhookEvent(req: express.Request, res: express.Respons
                 status: 'delivered',
                 delivered_at: timestamp
               });
+              if (updatedLog?.appointment_id) {
+                await salonRepository.updateAppointment(updatedLog.appointment_id, {
+                  whatsapp_status: 'delivered',
+                  last_whatsapp_error: undefined
+                }, 'WhatsApp Webhook').catch(() => null);
+              }
               if (updatedLog?.order_id) {
                 const isReceipt = updatedLog.job_type === 'bill_receipt' || updatedLog.template_name === 'gl_bill_receipt';
                 await salonRepository.updateOrder(updatedLog.order_id, {
@@ -3275,6 +3436,12 @@ async function handleMetaWebhookEvent(req: express.Request, res: express.Respons
                 status: 'read',
                 read_at: timestamp
               });
+              if (updatedLog?.appointment_id) {
+                await salonRepository.updateAppointment(updatedLog.appointment_id, {
+                  whatsapp_status: 'read',
+                  last_whatsapp_error: undefined
+                }, 'WhatsApp Webhook').catch(() => null);
+              }
               if (updatedLog?.order_id) {
                 const isReceipt = updatedLog.job_type === 'bill_receipt' || updatedLog.template_name === 'gl_bill_receipt';
                 await salonRepository.updateOrder(updatedLog.order_id, {
@@ -3288,6 +3455,12 @@ async function handleMetaWebhookEvent(req: express.Request, res: express.Respons
                 status: 'failed',
                 error_message: errDetail
               });
+              if (updatedLog?.appointment_id) {
+                await salonRepository.updateAppointment(updatedLog.appointment_id, {
+                  whatsapp_status: 'failed',
+                  last_whatsapp_error: errDetail
+                }, 'WhatsApp Webhook').catch(() => null);
+              }
               if (updatedLog?.order_id) {
                 const isReceipt = updatedLog.job_type === 'bill_receipt' || updatedLog.template_name === 'gl_bill_receipt';
                 await salonRepository.updateOrder(updatedLog.order_id, {
@@ -3788,35 +3961,253 @@ app.post(META_WEBHOOK_PATHS, handleMetaWebhookEvent);
 // WhatsApp Admin Activity, Feedback & Test Endpoints
 // ----------------------------------------------------------------------------
 
-// 1. Get WhatsApp Message Logs (Owner & Manager)
+async function resolveStaffAssignedBranchId(admin: { id: string; user_id?: string; email?: string; branch_id?: string | null }): Promise<string> {
+  if (admin.branch_id && String(admin.branch_id).trim()) {
+    return String(admin.branch_id).trim();
+  }
+  try {
+    const staffList = await salonRepository.getStaff();
+    const match = staffList.find(
+      s =>
+        (s.user_id && String(s.user_id) === String(admin.id)) ||
+        (s.admin_user_id && admin.user_id && s.admin_user_id === admin.user_id) ||
+        (s.email && admin.email && s.email.trim().toLowerCase() === admin.email.trim().toLowerCase())
+    );
+    if (match?.branch_id && String(match.branch_id).trim()) {
+      return String(match.branch_id).trim();
+    }
+  } catch {
+    // Fallback to flagship branch
+  }
+  return 'tgl-gachibowli-main';
+}
+
+async function fetchApprovedWabaTemplates(branchId?: string): Promise<{
+  templates: Array<{
+    name: string;
+    status: string;
+    language: string;
+    category?: string;
+    components?: any[];
+  }>;
+  source: 'meta_api' | 'unavailable';
+  error?: string;
+}> {
+  try {
+    const integration = await salonRepository.getWhatsAppIntegration();
+    const effectiveBranchId = branchId || 'tgl-gachibowli-main';
+    const branchIntegration = await salonRepository.getBranchWhatsAppIntegration(effectiveBranchId);
+    const fallbackBranchIntegration = effectiveBranchId !== 'tgl-gachibowli-main'
+      ? await salonRepository.getBranchWhatsAppIntegration('tgl-gachibowli-main')
+      : null;
+    const wabaId =
+      branchIntegration?.waba_id ||
+      fallbackBranchIntegration?.waba_id ||
+      integration?.waba_id ||
+      META_BUSINESS_ID;
+
+    if (!wabaId || !META_SYSTEM_USER_ACCESS_TOKEN) {
+      return {
+        templates: [],
+        source: 'unavailable',
+        error: !wabaId ? 'No WABA ID configured.' : 'META_SYSTEM_USER_ACCESS_TOKEN is not configured on server.'
+      };
+    }
+
+    const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${wabaId}/message_templates?fields=name,status,language,components,category&limit=100`;
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${META_SYSTEM_USER_ACCESS_TOKEN}`
+      }
+    });
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok || !Array.isArray(data?.data)) {
+      return {
+        templates: [],
+        source: 'unavailable',
+        error: data?.error?.message || `Meta template API returned HTTP ${response.status}`
+      };
+    }
+
+    const approved = data.data
+      .filter((t: any) => String(t.status || '').toUpperCase() === 'APPROVED')
+      .map((t: any) => ({
+        name: String(t.name),
+        status: String(t.status),
+        language: String(t.language || 'en'),
+        category: t.category ? String(t.category) : undefined,
+        components: Array.isArray(t.components) ? t.components : []
+      }));
+
+    return { templates: approved, source: 'meta_api' };
+  } catch (err: any) {
+    return { templates: [], source: 'unavailable', error: err?.message || 'Failed to fetch Meta templates.' };
+  }
+}
+
+function buildRecordTemplateVariables(
+  recordType: 'appointment' | 'order',
+  record: any,
+  branch: any
+): Record<string, string> {
+  const branchName = branch?.name || 'The Glossy Looks Salon';
+  const branchAddress = branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad';
+
+  if (recordType === 'appointment') {
+    const serviceNames = Array.isArray(record.services) && record.services.length > 0
+      ? record.services.map((s: any) => s.name || s.item_name).filter(Boolean).join(', ')
+      : 'Salon Service';
+    return {
+      customer_name: String(record.customer_name || 'Guest'),
+      branch_name: branchName,
+      branch_address: branchAddress,
+      service_name: serviceNames,
+      appointment_date: String(record.appointment_date || ''),
+      appointment_time: String(record.time_slot || ''),
+      booking_id: String(record.booking_reference || record.id || ''),
+      amount: String(record.final_amount ?? record.total_amount ?? 0),
+    };
+  }
+
+  const billDate = new Date(record.created_at || Date.now()).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+  const itemsSummary = Array.isArray(record.items) && record.items.length > 0
+    ? record.items.map((i: any) => `${i.item_name} (x${i.quantity || 1})`).join(', ')
+    : 'Salon Services';
+
+  return {
+    customer_name: String(record.customer_name || 'Guest'),
+    bill_number: String(record.bill_number || record.id || ''),
+    bill_date: billDate,
+    items_summary: itemsSummary,
+    grand_total: String(record.grand_total ?? 0),
+    due_amount: String(record.due_amount ?? 0),
+    payment_mode: String(record.primary_payment_mode || 'UPI'),
+    branch_name: branchName,
+    branch_address: branchAddress,
+  };
+}
+
+function buildTemplateComponentsFromMetaSchema(
+  templateSchema: { name: string; components?: any[] } | undefined,
+  variables: Record<string, string>,
+  fallbackCustomData?: SendWhatsAppTemplateOptions['customData']
+): { components?: any[]; renderedPreview: string } {
+  const bodyComp = templateSchema?.components?.find((c: any) => String(c.type || '').toUpperCase() === 'BODY');
+  const rawBodyText = typeof bodyComp?.text === 'string' ? bodyComp.text : '';
+
+  if (!rawBodyText) {
+    // Let sendBranchWhatsAppTemplate build components for known templates from customData
+    const summaryParts = Object.entries(variables)
+      .filter(([, v]) => Boolean(String(v || '').trim()))
+      .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`);
+    return {
+      components: undefined,
+      renderedPreview: summaryParts.length > 0
+        ? `[Template: ${templateSchema?.name || 'approved_template'}] ${summaryParts.join(' | ')}`
+        : `[Template: ${templateSchema?.name || 'approved_template'}]`
+    };
+  }
+
+  // Extract ordered placeholders from BODY text: {{1}}, {{2}} OR {{customer_name}}, {{bill_number}}
+  const matches = [...rawBodyText.matchAll(/\{\{\s*([^}\s]+)\s*\}\}/g)];
+  if (matches.length === 0) {
+    return {
+      components: undefined,
+      renderedPreview: rawBodyText
+    };
+  }
+
+  const orderedPositionalDefaults = [
+    variables.customer_name || fallbackCustomData?.customerName || 'Guest',
+    variables.bill_number || variables.branch_name || fallbackCustomData?.billNumber || fallbackCustomData?.branchName || '',
+    variables.bill_date || variables.service_name || fallbackCustomData?.billDate || fallbackCustomData?.serviceNames || '',
+    variables.items_summary || variables.appointment_date || fallbackCustomData?.itemsSummary || fallbackCustomData?.appointmentDate || '',
+    variables.grand_total || variables.appointment_time || String(fallbackCustomData?.grandTotal ?? fallbackCustomData?.appointmentTime ?? ''),
+    variables.payment_mode || variables.booking_id || fallbackCustomData?.paymentMode || fallbackCustomData?.bookingId || '',
+    variables.branch_name || variables.branch_address || fallbackCustomData?.branchName || fallbackCustomData?.branchAddress || ''
+  ];
+
+  const isNamed = matches.some(m => !/^\d+$/.test(m[1]));
+  const parameters: any[] = [];
+  let preview = rawBodyText;
+
+  matches.forEach((m, idx) => {
+    const token = m[1];
+    let val = '';
+    if (/^\d+$/.test(token)) {
+      const posIndex = Number(token) - 1;
+      val = variables[token] ?? variables[`var_${token}`] ?? orderedPositionalDefaults[posIndex] ?? '';
+    } else {
+      val = variables[token] ?? '';
+    }
+    const cleanVal = String(val || '').trim() || '-';
+    if (isNamed && !/^\d+$/.test(token)) {
+      parameters.push({ type: 'text', parameter_name: token, text: cleanVal });
+    } else {
+      parameters.push({ type: 'text', text: cleanVal });
+    }
+    preview = preview.replace(m[0], cleanVal);
+  });
+
+  return {
+    components: [{ type: 'body', parameters }],
+    renderedPreview: preview
+  };
+}
+
+// 1. Get WhatsApp Message Logs (Authorized staff & admins)
 app.get('/api/admin/whatsapp/message-logs', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
-      return res.status(403).json({ error: 'Access denied: Restricted to Salon Owner and Manager.' });
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: Insufficient permissions to view WhatsApp delivery logs.' });
     }
 
     const appointmentId = req.query.appointment_id as string | undefined;
-    const branchId = admin.role === 'manager' && admin.branch_id
-      ? admin.branch_id
+    const orderId = req.query.order_id as string | undefined;
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+
+    if (orderId && !fullAccess) {
+      const order = await salonRepository.getOrderById(orderId);
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      if (
+        !order ||
+        order.deleted_at ||
+        !isWithinKolkataToday(order.created_at) ||
+        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+      ) {
+        return res.status(403).json({ error: 'Access denied: Staff may only view WhatsApp logs for today\'s bills in their assigned branch.' });
+      }
+    }
+
+    const branchId = !fullAccess
+      ? await resolveStaffAssignedBranchId(admin)
       : (req.query.branch_id as string | undefined);
 
-    const logs = await salonRepository.getWhatsAppMessageLogs(appointmentId, branchId);
+    const logs = await salonRepository.getWhatsAppMessageLogs(appointmentId, branchId, orderId);
     res.json(logs);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 2. Get Customer Feedback (Owner & Manager)
+// 2. Get Customer Feedback (Owner, Admin, Superadmin & Manager)
 app.get('/api/admin/whatsapp/feedback', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
-      return res.status(403).json({ error: 'Access denied: Restricted to Salon Owner and Manager.' });
+    if (!admin || (!hasFullPaymentLedgerAccess(admin.role) && admin.role !== 'manager')) {
+      return res.status(403).json({ error: 'Access denied: Restricted to Salon Owner, Admin, and Manager.' });
     }
 
-    const branchId = admin.role === 'manager' && admin.branch_id
+    const branchId = !hasFullPaymentLedgerAccess(admin.role) && admin.branch_id
       ? admin.branch_id
       : (req.query.branch_id as string | undefined);
 
@@ -3831,7 +4222,7 @@ app.get('/api/admin/whatsapp/feedback', async (req, res) => {
 app.post('/api/admin/whatsapp/feedback/:id/read', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
+    if (!admin || (!hasFullPaymentLedgerAccess(admin.role) && admin.role !== 'manager')) {
       return res.status(403).json({ error: 'Access denied.' });
     }
     await salonRepository.markFeedbackAsRead(req.params.id);
@@ -3845,7 +4236,7 @@ app.post('/api/admin/whatsapp/feedback/:id/read', async (req, res) => {
 app.get('/api/admin/whatsapp/scheduled-jobs', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
+    if (!admin || (!hasFullPaymentLedgerAccess(admin.role) && admin.role !== 'manager')) {
       return res.status(403).json({ error: 'Access denied.' });
     }
     const jobs = await salonRepository.getScheduledFeedbackJobs(req.query.status as string);
@@ -3855,31 +4246,423 @@ app.get('/api/admin/whatsapp/scheduled-jobs', async (req, res) => {
   }
 });
 
-// 4b. Get Meta WhatsApp Templates directly from WABA
+// 4b. Get Meta WhatsApp Templates directly from WABA (never exposes tokens)
 app.get('/api/admin/whatsapp/templates', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
       return res.status(403).json({ error: 'Access denied.' });
     }
-    const integration = await salonRepository.getWhatsAppIntegration();
-    const branch = await salonRepository.getBranchById('tgl-gachibowli-main');
-    const branchIntegration = branch ? await salonRepository.getBranchWhatsAppIntegration(branch.id) : null;
-    const wabaId = branchIntegration?.waba_id || integration?.waba_id || META_BUSINESS_ID;
-
-    if (!wabaId) {
-      return res.status(400).json({ error: 'No WABA ID configured.' });
-    }
-    const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${wabaId}/message_templates?fields=name,status,language,components,category&limit=100`;
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${META_SYSTEM_USER_ACCESS_TOKEN}`
-      }
-    });
-    const data = await response.json();
-    res.json(data);
+    const branchId = !hasFullPaymentLedgerAccess(admin.role)
+      ? await resolveStaffAssignedBranchId(admin)
+      : (req.query.branch_id as string | undefined);
+    const result = await fetchApprovedWabaTemplates(branchId);
+    res.json({ data: result.templates, source: result.source, ...(result.error ? { error: result.error } : {}) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// 4c. Get WhatsApp Template Context for an Appointment or Payment Ledger Bill/Order
+app.get('/api/admin/whatsapp/record-context', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: Insufficient permissions for WhatsApp templates.' });
+    }
+
+    const recordType = String(req.query.record_type || '').toLowerCase() as 'appointment' | 'order';
+    const recordId = String(req.query.record_id || '').trim();
+    if (!['appointment', 'order'].includes(recordType) || !recordId) {
+      return res.status(400).json({ error: 'record_type (appointment|order) and record_id are required.' });
+    }
+
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+    const staffBranch = await resolveStaffAssignedBranchId(admin);
+
+    let record: any = null;
+    let branchId = 'tgl-gachibowli-main';
+    let customerName = '';
+    let customerPhone = '';
+    let appointmentId: string | undefined;
+    let orderId: string | undefined;
+
+    if (recordType === 'appointment') {
+      record = await salonRepository.getAppointmentById(recordId);
+      if (!record) return res.status(404).json({ error: 'Appointment not found.' });
+      if (record.deleted_at && !canDeleteOrRestoreRecords(admin.role)) {
+        return res.status(403).json({ error: 'Access denied: Cannot access soft-deleted appointment.' });
+      }
+      branchId = record.branch_id || 'tgl-gachibowli-main';
+      if (!fullAccess && admin.branch_id && branchId !== staffBranch) {
+        return res.status(403).json({ error: 'Access denied: Appointment belongs to another branch.' });
+      }
+      customerName = record.customer_name || '';
+      customerPhone = record.customer_phone || '';
+      appointmentId = record.id;
+    } else {
+      record = await salonRepository.getOrderById(recordId);
+      if (!record) {
+        // Allow lookup by payment_id if caller passed payment ID
+        const payments = await salonRepository.getPayments({ deleted: fullAccess ? 'all' : 'active' });
+        const pay = payments.find(p => p.id === recordId);
+        if (pay?.order_id) {
+          record = await salonRepository.getOrderById(pay.order_id);
+        }
+      }
+      if (!record) return res.status(404).json({ error: 'Bill / order not found.' });
+      branchId = record.branch_id || 'tgl-gachibowli-main';
+
+      if (!fullAccess) {
+        if (record.deleted_at) {
+          return res.status(403).json({ error: 'Access denied: Deleted payment records are restricted to Owner/Admin/Superadmin.' });
+        }
+        if (!isWithinKolkataToday(record.created_at)) {
+          return res.status(403).json({ error: 'Access denied: Staff may only send WhatsApp templates for today\'s Payment Ledger records (Asia/Kolkata).' });
+        }
+        if (branchId !== staffBranch) {
+          return res.status(403).json({ error: 'Access denied: Staff may only access Payment Ledger records for their assigned branch.' });
+        }
+      }
+      customerName = record.customer_name || '';
+      customerPhone = record.customer_phone || '';
+      orderId = record.id;
+    }
+
+    const branch = await salonRepository.getBranchById(branchId);
+    const phoneValidation = validateWhatsAppPhone(customerPhone);
+
+    // Check 24-hour customer service window from permanent WhatsApp Inbox conversation
+    let conversation: WhatsAppConversation | null = null;
+    if (phoneValidation.isValid) {
+      const convs = await salonRepository.getWhatsAppConversations({
+        salonId: 'tgl-gachibowli-main',
+        search: phoneValidation.digits
+      });
+      conversation = convs.find(c => {
+        const cDigits = String(c.customer_phone || '').replace(/\D/g, '').slice(-10);
+        return cDigits && cDigits === phoneValidation.digits.slice(-10);
+      }) || null;
+    }
+    const lastInboundMs = conversation?.last_inbound_at ? new Date(conversation.last_inbound_at).getTime() : 0;
+    const windowExpiresMs = lastInboundMs ? lastInboundMs + 24 * 60 * 60 * 1000 : 0;
+    const windowOpen = Boolean(lastInboundMs && Date.now() < windowExpiresMs);
+
+    const wabaResult = await fetchApprovedWabaTemplates(branchId);
+    const recommendedOrder = recordType === 'appointment'
+      ? ['gl_appointment_confirmation', 'gl_appointment_reminder', 'glossylooks_customer_feedback', 'the_glossylooks_customer_feedback']
+      : ['gl_bill_receipt', 'gl_payment_reminder', 'glossylooks_customer_feedback', 'the_glossylooks_customer_feedback'];
+
+    const approvedMap = new Map(wabaResult.templates.map(t => [t.name, t]));
+    const prioritizedTemplates: typeof wabaResult.templates = [];
+    for (const name of recommendedOrder) {
+      const found = approvedMap.get(name);
+      if (found) {
+        prioritizedTemplates.push(found);
+        approvedMap.delete(name);
+      }
+    }
+    for (const remaining of approvedMap.values()) {
+      prioritizedTemplates.push(remaining);
+    }
+
+    const expectedRequiredNames = recordType === 'appointment'
+      ? ['gl_appointment_confirmation', 'gl_appointment_reminder', 'glossylooks_customer_feedback']
+      : ['gl_bill_receipt', 'gl_payment_reminder', 'glossylooks_customer_feedback'];
+    const approvedNamesSet = new Set(wabaResult.templates.map(t => t.name));
+    const missingRecommendedTemplates = wabaResult.source === 'meta_api'
+      ? expectedRequiredNames.filter(n => !approvedNamesSet.has(n) && !(n === 'glossylooks_customer_feedback' && approvedNamesSet.has('the_glossylooks_customer_feedback')))
+      : [];
+
+    const variables = buildRecordTemplateVariables(recordType, record, branch);
+    const logs = await salonRepository.getWhatsAppMessageLogs(appointmentId, undefined, orderId);
+
+    res.json({
+      record_type: recordType,
+      record_id: record.id,
+      branch_id: branchId,
+      branch_name: branch?.name || 'The Glossy Looks Salon',
+      customer_name: customerName,
+      customer_phone: customerPhone,
+      phone_validation: phoneValidation,
+      customer_service_window: {
+        window_open: windowOpen,
+        last_inbound_at: conversation?.last_inbound_at || null,
+        window_expires_at: windowExpiresMs ? new Date(windowExpiresMs).toISOString() : null,
+        conversation_id: conversation?.id || null,
+        policy_note: 'Approved Meta WhatsApp templates only. Free-text messaging is disabled here to strictly comply with Meta 24-hour customer-service window rules.'
+      },
+      templates_source: wabaResult.source,
+      templates_error: wabaResult.error || null,
+      approved_templates: prioritizedTemplates,
+      missing_recommended_templates: missingRecommendedTemplates,
+      default_variables: variables,
+      logs
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4d. Send Approved Meta WhatsApp Template for Appointment or Payment Ledger Bill/Order
+app.post('/api/admin/whatsapp/send-record-template', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: Insufficient permissions to send WhatsApp templates.' });
+    }
+
+    const {
+      record_type,
+      record_id,
+      template_name,
+      template_language,
+      variables: clientVariables,
+      retry_log_id
+    } = req.body || {};
+
+    const recordType = String(record_type || '').toLowerCase() as 'appointment' | 'order';
+    const recordId = String(record_id || '').trim();
+    const cleanTemplateName = String(template_name || '').trim();
+
+    if (!['appointment', 'order'].includes(recordType) || !recordId) {
+      return res.status(400).json({ error: 'record_type (appointment|order) and record_id are required.' });
+    }
+
+    if (!cleanTemplateName) {
+      return res.status(400).json({
+        error: 'An approved Meta WhatsApp template must be selected. Free-text messages are not permitted from this action.'
+      });
+    }
+
+    if (!/^[a-z0-9_]+$/i.test(cleanTemplateName)) {
+      return res.status(400).json({ error: 'Invalid Meta template name format.' });
+    }
+
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+    const staffBranch = await resolveStaffAssignedBranchId(admin);
+
+    let record: any = null;
+    let branchId = 'tgl-gachibowli-main';
+    let appointmentId: string | undefined;
+    let orderId: string | undefined;
+    let billNumber: string | undefined;
+    let paymentId: string | undefined;
+
+    if (recordType === 'appointment') {
+      record = await salonRepository.getAppointmentById(recordId);
+      if (!record) return res.status(404).json({ error: 'Appointment not found.' });
+      if (record.deleted_at) {
+        return res.status(400).json({ error: 'Cannot send WhatsApp template for a deleted appointment. Restore it first.' });
+      }
+      branchId = record.branch_id || 'tgl-gachibowli-main';
+      if (!fullAccess && admin.branch_id && branchId !== staffBranch) {
+        return res.status(403).json({ error: 'Access denied: Appointment belongs to another branch.' });
+      }
+      appointmentId = record.id;
+    } else {
+      record = await salonRepository.getOrderById(recordId);
+      if (!record) {
+        const payments = await salonRepository.getPayments({ deleted: fullAccess ? 'all' : 'active' });
+        const pay = payments.find(p => p.id === recordId);
+        if (pay?.order_id) {
+          paymentId = pay.id;
+          record = await salonRepository.getOrderById(pay.order_id);
+        }
+      }
+      if (!record) return res.status(404).json({ error: 'Bill / order not found.' });
+      if (record.deleted_at) {
+        return res.status(400).json({ error: 'Cannot send WhatsApp template for a deleted bill. Restore it first.' });
+      }
+      branchId = record.branch_id || 'tgl-gachibowli-main';
+
+      if (!fullAccess) {
+        if (!isWithinKolkataToday(record.created_at)) {
+          return res.status(403).json({
+            error: 'Access denied: Staff may only send WhatsApp templates for today\'s Payment Ledger records (Asia/Kolkata).'
+          });
+        }
+        if (branchId !== staffBranch) {
+          return res.status(403).json({
+            error: 'Access denied: Staff may only send WhatsApp templates for their assigned branch.'
+          });
+        }
+      }
+
+      orderId = record.id;
+      billNumber = record.bill_number;
+      if (!paymentId) {
+        const payments = await salonRepository.getPayments({ deleted: 'active' });
+        paymentId = payments.find(p => p.order_id === record.id || p.bill_number === record.bill_number)?.id;
+      }
+    }
+
+    // Validate customer WhatsApp number
+    const phoneValidation = validateWhatsAppPhone(record.customer_phone);
+    if (!phoneValidation.isValid) {
+      return res.status(400).json({
+        error: phoneValidation.error || 'Customer WhatsApp number is invalid or missing.'
+      });
+    }
+
+    // If retrying, verify target log exists and is strictly in 'failed' state
+    if (retry_log_id) {
+      const existingLogs = await salonRepository.getWhatsAppMessageLogs(appointmentId, undefined, orderId);
+      const targetLog = existingLogs.find(l => l.id === retry_log_id);
+      if (!targetLog) {
+        return res.status(404).json({ error: 'Original failed WhatsApp send log was not found.' });
+      }
+      if (targetLog.status !== 'failed') {
+        return res.status(409).json({
+          error: `Retry is only allowed for failed sends. Current delivery status is '${targetLog.status}'.`
+        });
+      }
+    }
+
+    // Enforce approved Meta templates only
+    const wabaResult = await fetchApprovedWabaTemplates(branchId);
+    const matchedTemplate = wabaResult.templates.find(t => t.name === cleanTemplateName);
+    if (wabaResult.source === 'meta_api' && !matchedTemplate) {
+      return res.status(400).json({
+        error: `Template '${cleanTemplateName}' is not APPROVED in Meta WhatsApp Business Manager. Only approved templates may be sent.`
+      });
+    }
+
+    const branch = await salonRepository.getBranchById(branchId);
+    const defaultVars = buildRecordTemplateVariables(recordType, record, branch);
+    const mergedVars: Record<string, string> = {
+      ...defaultVars,
+      ...(clientVariables && typeof clientVariables === 'object'
+        ? Object.fromEntries(
+            Object.entries(clientVariables).map(([k, v]) => [String(k), String(v ?? '').trim()])
+          )
+        : {})
+    };
+
+    const customData: SendWhatsAppTemplateOptions['customData'] = {
+      customerName: mergedVars.customer_name || record.customer_name,
+      branchName: mergedVars.branch_name || branch?.name || 'The Glossy Looks Salon',
+      branchAddress: mergedVars.branch_address || branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad',
+      serviceNames: mergedVars.service_name,
+      appointmentDate: mergedVars.appointment_date,
+      appointmentTime: mergedVars.appointment_time,
+      bookingId: mergedVars.booking_id,
+      billNumber: mergedVars.bill_number || record.bill_number,
+      billDate: mergedVars.bill_date,
+      itemsSummary: mergedVars.items_summary,
+      grandTotal: mergedVars.grand_total || (record.grand_total != null ? String(record.grand_total) : undefined),
+      dueAmount: mergedVars.due_amount || (record.due_amount != null ? String(record.due_amount) : undefined),
+      paymentMode: mergedVars.payment_mode || record.primary_payment_mode,
+    };
+
+    const knownBuiltInTemplates = new Set([
+      'gl_appointment_confirmation',
+      'gl_appointment_reminder',
+      'gl_bill_receipt',
+      'gl_payment_reminder',
+      'glossylooks_customer_feedback',
+      'the_glossylooks_customer_feedback'
+    ]);
+
+    const schemaComponents = buildTemplateComponentsFromMetaSchema(matchedTemplate, mergedVars, customData);
+    const useExplicitComponents = !knownBuiltInTemplates.has(cleanTemplateName)
+      ? schemaComponents.components
+      : (matchedTemplate ? schemaComponents.components : undefined);
+
+    const jobType =
+      cleanTemplateName === 'gl_bill_receipt' ? 'bill_receipt' :
+      cleanTemplateName.includes('payment') ? 'payment_reminder' :
+      cleanTemplateName.includes('feedback') ? 'customer_feedback' :
+      cleanTemplateName.includes('reminder') ? 'appointment_reminder' :
+      'appointment_confirmation';
+
+    const result = await sendBranchWhatsAppTemplate({
+      branchId,
+      recipientPhone: phoneValidation.e164,
+      templateName: cleanTemplateName,
+      templateLanguage: template_language || matchedTemplate?.language || undefined,
+      components: useExplicitComponents,
+      appointmentId,
+      orderId,
+      billNumber,
+      paymentId,
+      sentByUserId: admin.id,
+      sentByUserName: admin.name,
+      renderedPreview: schemaComponents.renderedPreview,
+      templateParams: mergedVars,
+      recordFailureInInbox: true,
+      jobType,
+      customData
+    });
+
+    const normalizedUiStatus =
+      result.sent ? 'sent' :
+      result.status === 'retrying' ? 'queued' :
+      result.status === 'pending_approval' ? 'failed' : 'failed';
+
+    // Update linked record status fields without breaking existing workflows
+    if (recordType === 'appointment' && appointmentId) {
+      await salonRepository.updateAppointment(appointmentId, {
+        whatsapp_status: result.sent ? 'sent' : (result.status === 'retrying' ? 'retrying' : 'failed'),
+        last_whatsapp_sent_at: result.sent ? new Date().toISOString() : record.last_whatsapp_sent_at,
+        last_whatsapp_error: result.sent ? undefined : result.error
+      }, admin.name).catch(() => null);
+    } else if (recordType === 'order' && orderId) {
+      if (cleanTemplateName === 'gl_bill_receipt') {
+        await salonRepository.updateOrder(orderId, {
+          receipt_whatsapp_status: result.sent ? 'sent' : (result.status === 'retrying' ? 'retrying' : 'failed'),
+          receipt_whatsapp_message_id: result.messageId || record.receipt_whatsapp_message_id,
+          receipt_whatsapp_sent_at: result.sent ? new Date().toISOString() : record.receipt_whatsapp_sent_at,
+          receipt_whatsapp_error: result.sent ? undefined : result.error,
+          whatsapp_status: result.sent ? 'sent' : (result.status === 'retrying' ? 'retrying' : 'failed')
+        }).catch(() => null);
+      } else if (cleanTemplateName.includes('feedback')) {
+        if (result.sent) {
+          await salonRepository.cancelScheduledFeedbackJobByOrder(orderId).catch(() => null);
+        }
+        await salonRepository.updateOrder(orderId, {
+          feedback_whatsapp_status: result.sent ? 'sent' : (result.status === 'retrying' ? 'retrying' : 'failed'),
+          feedback_whatsapp_message_id: result.messageId || record.feedback_whatsapp_message_id,
+          feedback_whatsapp_sent_at: result.sent ? new Date().toISOString() : record.feedback_whatsapp_sent_at,
+          feedback_whatsapp_source: 'MANUAL_FEEDBACK',
+          feedback_whatsapp_error: result.sent ? undefined : result.error
+        }).catch(() => null);
+      }
+    }
+
+    await salonRepository.logAudit(
+      result.sent ? 'WHATSAPP_TEMPLATE_SENT' : 'WHATSAPP_TEMPLATE_FAILED',
+      recordType === 'appointment' ? 'Appointment' : 'PaymentLedgerBill',
+      record.id,
+      admin.name,
+      JSON.stringify({
+        record_type: recordType,
+        record_id: record.id,
+        reference: recordType === 'appointment' ? record.booking_reference : record.bill_number,
+        customer_name: record.customer_name,
+        recipient: phoneValidation.e164,
+        template_name: cleanTemplateName,
+        meta_message_id: result.messageId || null,
+        status: normalizedUiStatus,
+        retry_log_id: retry_log_id || null,
+        sent_by_user_id: admin.id,
+        sent_by_role: admin.role,
+        error: result.error || null
+      })
+    ).catch(() => {});
+
+    const statusCode = result.sent || result.status === 'retrying' ? 200 : 502;
+    return res.status(statusCode).json({
+      success: result.sent || result.status === 'retrying',
+      status: normalizedUiStatus,
+      message_id: result.messageId,
+      error: result.error,
+      diagnostics: result.diagnostics,
+      log: result.log,
+      inbox_message: result.inboxMessage || null
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to send WhatsApp template.' });
   }
 });
 
@@ -4962,17 +5745,47 @@ app.delete('/api/packages/:id', async (req, res) => {
 // Appointments & Bookings CRUD
 // ----------------------------------------------------------------------------
 app.get('/api/appointments', async (req, res) => {
-  const status = req.query.status as string | undefined;
-  const staffId = req.query.staff_id as string | undefined;
-  const mobile = req.query.mobile as string | undefined;
-  const list = await salonRepository.getAppointments({ status, staffId, customerMobile: mobile });
-  res.json(list);
+  try {
+    const status = req.query.status as string | undefined;
+    const staffId = req.query.staff_id as string | undefined;
+    const mobile = req.query.mobile as string | undefined;
+    const deletedParam = String(req.query.deleted || 'active').toLowerCase() as 'active' | 'deleted' | 'all';
+
+    if (deletedParam === 'deleted' || deletedParam === 'all') {
+      const admin = await getAuthAdmin(req);
+      if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+        return res.status(403).json({
+          error: 'Access denied: Only SUPERADMIN, ADMIN, or OWNER may view deleted appointments.'
+        });
+      }
+    }
+
+    const list = await salonRepository.getAppointments({
+      status,
+      staffId,
+      customerMobile: mobile,
+      deleted: ['active', 'deleted', 'all'].includes(deletedParam) ? deletedParam : 'active'
+    });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/appointments/:id', async (req, res) => {
-  const apt = await salonRepository.getAppointmentById(req.params.id);
-  if (!apt) return res.status(404).json({ error: 'Appointment not found' });
-  res.json(apt);
+  try {
+    const apt = await salonRepository.getAppointmentById(req.params.id);
+    if (!apt) return res.status(404).json({ error: 'Appointment not found' });
+    if (apt.deleted_at) {
+      const admin = await getAuthAdmin(req);
+      if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+    }
+    res.json(apt);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Branch-Specific WhatsApp Notification Dispatcher (Never sends from the wrong branch)
@@ -5259,6 +6072,57 @@ app.post('/api/appointments/:id/cancel', async (req, res) => {
   }
 });
 
+// Soft-delete appointment (STRICTLY SUPERADMIN, ADMIN, OWNER only)
+app.delete('/api/appointments/:id', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to delete appointments.'
+      });
+    }
+
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : 'Removed from active appointments';
+
+    const deleted = await salonRepository.softDeleteAppointment(
+      req.params.id,
+      { userId: admin.id, name: admin.name },
+      reason
+    );
+    if (!deleted) {
+      return res.status(404).json({ error: 'Appointment not found.' });
+    }
+    res.json({ success: true, appointment: deleted });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete appointment.' });
+  }
+});
+
+// Restore soft-deleted appointment (STRICTLY SUPERADMIN, ADMIN, OWNER only)
+app.post('/api/appointments/:id/restore', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to restore deleted appointments.'
+      });
+    }
+
+    const restored = await salonRepository.restoreAppointment(req.params.id, {
+      userId: admin.id,
+      name: admin.name
+    });
+    if (!restored) {
+      return res.status(404).json({ error: 'Appointment not found.' });
+    }
+    res.json({ success: true, appointment: restored });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to restore appointment.' });
+  }
+});
+
 // ----------------------------------------------------------------------------
 // Customers Management / CRM
 // ----------------------------------------------------------------------------
@@ -5290,8 +6154,44 @@ app.delete('/api/customers/:id', async (req, res) => {
 // Orders & POS Billing
 // ----------------------------------------------------------------------------
 app.get('/api/orders', async (req, res) => {
-  const list = await salonRepository.getOrders();
-  res.json(list);
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to view orders.' });
+    }
+
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+    if (!fullAccess) {
+      // Staff roles are strictly restricted to today's (Asia/Kolkata) active orders for their assigned branch.
+      // Ignore any client-supplied deleted, branch_id, start_date, or end_date parameters.
+      const todayBounds = getKolkataTodayBounds();
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      const list = await salonRepository.getOrders({
+        deleted: 'active',
+        branchId: staffBranch,
+        startIso: todayBounds.startIso,
+        endIso: todayBounds.endIso
+      });
+      return res.json(list);
+    }
+
+    const deletedParam = String(req.query.deleted || 'active').toLowerCase() as 'active' | 'deleted' | 'all';
+    const branchId = req.query.branch_id && req.query.branch_id !== 'all'
+      ? String(req.query.branch_id)
+      : undefined;
+    const startIso = typeof req.query.start_iso === 'string' ? req.query.start_iso : undefined;
+    const endIso = typeof req.query.end_iso === 'string' ? req.query.end_iso : undefined;
+
+    const list = await salonRepository.getOrders({
+      deleted: ['active', 'deleted', 'all'].includes(deletedParam) ? deletedParam : 'active',
+      branchId,
+      startIso,
+      endIso
+    });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/orders', async (req, res) => {
@@ -5461,22 +6361,48 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.get('/api/orders/:id', async (req, res) => {
-  const order = await salonRepository.getOrderById(req.params.id) || (await salonRepository.getOrders()).find(item => item.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  res.json(order);
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to view order details.' });
+    }
+
+    const order = await salonRepository.getOrderById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    if (!hasFullPaymentLedgerAccess(admin.role)) {
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      if (
+        order.deleted_at ||
+        !isWithinKolkataToday(order.created_at) ||
+        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+      ) {
+        return res.status(403).json({
+          error: 'Access denied: Staff may only view today\'s Payment Ledger bills for their assigned branch (Asia/Kolkata).'
+        });
+      }
+    }
+
+    res.json(order);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Edit permitted order details (Manager & Owner)
+// Edit permitted order details (OWNER, ADMIN, SUPERADMIN only)
 app.patch('/api/orders/:id', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || !['owner', 'manager'].includes(admin.role)) {
-      return res.status(403).json({ error: 'Access denied: Restricted to Salon Owner and Manager.' });
+    if (!admin || !hasFullPaymentLedgerAccess(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: Editing Payment Ledger bills is restricted to OWNER, ADMIN, and SUPERADMIN.' });
     }
 
     const orderId = req.params.id;
-    const existingOrder = await salonRepository.getOrderById(orderId) || (await salonRepository.getOrders()).find(o => o.id === orderId);
+    const existingOrder = await salonRepository.getOrderById(orderId);
     if (!existingOrder) return res.status(404).json({ error: 'Order not found' });
+    if (existingOrder.deleted_at) {
+      return res.status(400).json({ error: 'Cannot edit a deleted bill. Restore it first.' });
+    }
 
     const { primary_payment_mode, discount, customer_name, customer_phone, notes, payment_status } = req.body;
     const auditChanges: Record<string, { old: any; new: any }> = {};
@@ -5519,12 +6445,12 @@ app.patch('/api/orders/:id', async (req, res) => {
     // Bill number is strictly immutable!
     delete (updates as any).bill_number;
 
-    const actor = admin.name || (req.headers['x-admin-name'] as string) || 'Manager';
+    const actor = admin.name || (req.headers['x-admin-name'] as string) || 'Owner';
     const updated = await salonRepository.updateOrder(orderId, updates);
 
     // Update corresponding payment record if present
     try {
-      const payments = await salonRepository.getPayments();
+      const payments = await salonRepository.getPayments({ deleted: 'active' });
       const match = payments.find(p => p.order_id === orderId || p.bill_number === existingOrder.bill_number);
       if (match) {
         const payUpdate: any = {
@@ -5553,11 +6479,76 @@ app.patch('/api/orders/:id', async (req, res) => {
   }
 });
 
+// Soft-delete complete Bill/Order transaction + related order_items + all linked payments (SUPERADMIN, ADMIN, OWNER only)
+app.delete('/api/orders/:id', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to delete Payment Ledger bills.'
+      });
+    }
+
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : 'Removed from active ledger';
+
+    const result = await salonRepository.softDeleteOrderTransaction(
+      req.params.id,
+      { userId: admin.id, name: admin.name },
+      reason
+    );
+    if (!result) {
+      return res.status(404).json({ error: 'Bill / order not found.' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete bill transaction.' });
+  }
+});
+
+// Restore soft-deleted Bill/Order transaction + order_items + linked payments (SUPERADMIN, ADMIN, OWNER only)
+app.post('/api/orders/:id/restore', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to restore deleted Payment Ledger bills.'
+      });
+    }
+
+    const result = await salonRepository.restoreOrderTransaction(req.params.id, {
+      userId: admin.id,
+      name: admin.name
+    });
+    if (!result) {
+      return res.status(404).json({ error: 'Bill / order not found.' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to restore bill transaction.' });
+  }
+});
+
 // Real-time WhatsApp status endpoint for polling from POS and Admin
 app.get('/api/admin/orders/:id/whatsapp/status', async (req, res) => {
   try {
-    const order = await salonRepository.getOrderById(req.params.id) || (await salonRepository.getOrders()).find(item => item.id === req.params.id);
+    const admin = await getAuthAdmin(req);
+    if (!admin) return res.status(401).json({ error: 'Authentication required.' });
+
+    const order = await salonRepository.getOrderById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    if (!hasFullPaymentLedgerAccess(admin.role)) {
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      if (
+        order.deleted_at ||
+        !isWithinKolkataToday(order.created_at) ||
+        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+      ) {
+        return res.status(403).json({ error: 'Access denied for this bill.' });
+      }
+    }
 
     res.json({
       order_id: order.id,
@@ -5581,15 +6572,18 @@ app.get('/api/admin/orders/:id/whatsapp/status', async (req, res) => {
 app.post('/api/admin/orders/:id/whatsapp/feedback', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || !['owner', 'manager', 'receptionist'].includes(admin.role)) {
-      return res.status(403).json({ error: 'Access denied: only owner, manager, or reception staff can send feedback.' });
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: insufficient role to send feedback.' });
     }
 
-    const order = await salonRepository.getOrderById(req.params.id) || (await salonRepository.getOrders()).find(item => item.id === req.params.id);
-    if (!order) return res.status(404).json({ error: 'Bill not found.' });
+    const order = await salonRepository.getOrderById(req.params.id);
+    if (!order || order.deleted_at) return res.status(404).json({ error: 'Bill not found.' });
 
-    if (admin.role !== 'owner' && admin.branch_id && order.branch_id && admin.branch_id !== order.branch_id) {
-      return res.status(403).json({ error: 'Access denied for this salon branch.' });
+    if (!hasFullPaymentLedgerAccess(admin.role)) {
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || 'tgl-gachibowli-main') !== staffBranch) {
+        return res.status(403).json({ error: 'Access denied: staff may only send WhatsApp templates for today\'s bills in their assigned branch.' });
+      }
     }
 
     // Prevent duplicate sending if already delivered or sent
@@ -5617,6 +6611,9 @@ app.post('/api/admin/orders/:id/whatsapp/feedback', async (req, res) => {
       recipientPhone: order.customer_phone,
       templateName: 'glossylooks_customer_feedback',
       orderId: order.id,
+      billNumber: order.bill_number,
+      sentByUserId: admin.id,
+      sentByUserName: admin.name,
       jobType: 'customer_feedback',
       customData: { customerName: order.customer_name }
     });
@@ -5672,14 +6669,30 @@ app.post('/api/admin/orders/:id/whatsapp/feedback', async (req, res) => {
 app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || !['owner', 'manager', 'receptionist'].includes(admin.role)) {
-      return res.status(403).json({ error: 'Access denied: only owner, manager, or reception staff can retry WhatsApp messages.' });
+    if (!admin || !canSendWhatsAppTemplates(admin.role)) {
+      return res.status(403).json({ error: 'Access denied: insufficient role to retry WhatsApp messages.' });
     }
 
-    const order = await salonRepository.getOrderById(req.params.id) || (await salonRepository.getOrders()).find(item => item.id === req.params.id);
-    if (!order) return res.status(404).json({ error: 'Bill not found.' });
+    const order = await salonRepository.getOrderById(req.params.id);
+    if (!order || order.deleted_at) return res.status(404).json({ error: 'Bill not found.' });
+
+    if (!hasFullPaymentLedgerAccess(admin.role)) {
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || 'tgl-gachibowli-main') !== staffBranch) {
+        return res.status(403).json({ error: 'Access denied: staff may only retry WhatsApp templates for today\'s bills in their assigned branch.' });
+      }
+    }
 
     const jobType = req.body?.job_type || (order.receipt_whatsapp_status === 'failed' ? 'bill_receipt' : 'customer_feedback');
+    const currentStatus = jobType === 'bill_receipt'
+      ? (order.receipt_whatsapp_status || order.whatsapp_status)
+      : order.feedback_whatsapp_status;
+    if (currentStatus !== 'failed') {
+      return res.status(409).json({
+        error: `Retry is only allowed for failed sends. Current status is '${currentStatus || 'unknown'}'.`
+      });
+    }
+
     const branchId = order.branch_id || 'tgl-gachibowli-main';
     const branch = await salonRepository.getBranchById(branchId);
     const branchName = branch?.name || 'The Glossy Looks';
@@ -5790,19 +6803,181 @@ app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// Payments & Refunds
+// Payments & Refunds (Strict Role-Based & Asia/Kolkata Today Scoping)
 // ----------------------------------------------------------------------------
 app.get('/api/payments', async (req, res) => {
-  const list = await salonRepository.getPayments();
-  res.json(list);
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to access the Payment Ledger.' });
+    }
+
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+    if (!fullAccess) {
+      // STAFF roles (RECEPTIONIST, STYLIST, POS_BILLING, MANAGER, INVENTORY_STAFF, etc.):
+      // Strictly enforce today's Asia/Kolkata window (12:00 AM - 11:59:59.999 PM) and assigned branch.
+      // Ignore any client query tampering (deleted, branch_id, start_iso, end_iso, date range).
+      const todayBounds = getKolkataTodayBounds();
+      const staffBranch = await resolveStaffAssignedBranchId(admin);
+      const list = await salonRepository.getPayments({
+        deleted: 'active',
+        branchId: staffBranch,
+        startIso: todayBounds.startIso,
+        endIso: todayBounds.endIso
+      });
+      return res.json(list);
+    }
+
+    const deletedParam = String(req.query.deleted || 'active').toLowerCase() as 'active' | 'deleted' | 'all';
+    const branchId = req.query.branch_id && req.query.branch_id !== 'all'
+      ? String(req.query.branch_id)
+      : undefined;
+    const startIso = typeof req.query.start_iso === 'string' ? req.query.start_iso : undefined;
+    const endIso = typeof req.query.end_iso === 'string' ? req.query.end_iso : undefined;
+
+    const list = await salonRepository.getPayments({
+      deleted: ['active', 'deleted', 'all'].includes(deletedParam) ? deletedParam : 'active',
+      branchId,
+      startIso,
+      endIso
+    });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export Payment Ledger CSV (OWNER, ADMIN, SUPERADMIN only)
+app.get('/api/payments/export', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !hasFullPaymentLedgerAccess(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Exporting Payment Ledger reports is restricted to OWNER, ADMIN, and SUPERADMIN.'
+      });
+    }
+
+    const branchId = req.query.branch_id && req.query.branch_id !== 'all'
+      ? String(req.query.branch_id)
+      : undefined;
+    const startIso = typeof req.query.start_iso === 'string' ? req.query.start_iso : undefined;
+    const endIso = typeof req.query.end_iso === 'string' ? req.query.end_iso : undefined;
+    const modeFilter = typeof req.query.mode === 'string' && req.query.mode !== 'all' ? req.query.mode : undefined;
+
+    const payments = await salonRepository.getPayments({
+      deleted: 'active',
+      branchId,
+      startIso,
+      endIso
+    });
+    const filtered = modeFilter ? payments.filter(p => p.payment_mode === modeFilter) : payments;
+
+    const escapeCsv = (val: any) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+    const header = ['Bill Number', 'Date & Time (IST)', 'Customer Name', 'Customer Phone', 'Branch ID', 'Payment Mode', 'Amount (INR)', 'Status', 'Order ID'];
+    const rows = filtered.map(p => [
+      p.bill_number,
+      new Date(p.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+      p.customer_name,
+      p.customer_phone || '',
+      p.branch_id || 'tgl-gachibowli-main',
+      p.payment_mode,
+      p.amount,
+      p.status,
+      p.order_id
+    ].map(escapeCsv).join(','));
+
+    const csv = [header.map(escapeCsv).join(','), ...rows].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="glossylooks-payment-ledger-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csv);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/payments/:id/refund', async (req, res) => {
-  const actor = (req.headers['x-admin-name'] as string) || 'Manager';
-  const { reason } = req.body;
-  const payment = await salonRepository.refundPayment(req.params.id, reason || 'Customer refund request', actor);
-  if (!payment) return res.status(404).json({ error: 'Payment record not found' });
-  res.json(payment);
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !hasFullPaymentLedgerAccess(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Issuing Payment Ledger refunds is restricted to OWNER, ADMIN, and SUPERADMIN.'
+      });
+    }
+    const { reason } = req.body || {};
+    const payment = await salonRepository.refundPayment(req.params.id, reason || 'Customer refund request', admin.name);
+    if (!payment) return res.status(404).json({ error: 'Payment record not found' });
+    res.json(payment);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Soft-delete Payment Ledger row -> ALWAYS deletes the complete bill/order + order_items + all linked payments together
+app.delete('/api/payments/:id', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to delete Payment Ledger records.'
+      });
+    }
+
+    const allPayments = await salonRepository.getPayments({ deleted: 'all' });
+    const targetPayment = allPayments.find(p => p.id === req.params.id);
+    if (!targetPayment) {
+      return res.status(404).json({ error: 'Payment record not found.' });
+    }
+    if (!targetPayment.order_id) {
+      return res.status(409).json({
+        error: 'Refusing partial payment deletion: payment is missing a linked order_id.'
+      });
+    }
+
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : 'Removed complete bill transaction from ledger';
+
+    const result = await salonRepository.softDeleteOrderTransaction(
+      targetPayment.order_id,
+      { userId: admin.id, name: admin.name },
+      reason
+    );
+    if (!result) {
+      return res.status(404).json({ error: 'Linked bill/order transaction not found.' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete payment ledger transaction.' });
+  }
+});
+
+// Restore Payment Ledger row -> restores the complete bill/order + order_items + all linked payments together
+app.post('/api/payments/:id/restore', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
+      return res.status(403).json({
+        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to restore deleted Payment Ledger records.'
+      });
+    }
+
+    const allPayments = await salonRepository.getPayments({ deleted: 'all' });
+    const targetPayment = allPayments.find(p => p.id === req.params.id);
+    if (!targetPayment || !targetPayment.order_id) {
+      return res.status(404).json({ error: 'Deleted payment record or linked order not found.' });
+    }
+
+    const result = await salonRepository.restoreOrderTransaction(targetPayment.order_id, {
+      userId: admin.id,
+      name: admin.name
+    });
+    if (!result) {
+      return res.status(404).json({ error: 'Linked bill/order transaction not found.' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to restore payment ledger transaction.' });
+  }
 });
 
 // ----------------------------------------------------------------------------
@@ -5985,12 +7160,12 @@ app.delete('/api/staff/:id', async (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// Reports & Analytics - OWNER & MANAGER ONLY
+// Reports & Analytics - OWNER, ADMIN, SUPERADMIN & MANAGER ONLY
 // ----------------------------------------------------------------------------
 app.get('/api/reports', async (req, res) => {
   const admin = await getAuthAdmin(req);
-  if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
-    return res.status(403).json({ error: 'Access denied: Reports & analytics are restricted to Salon Owner and Manager.' });
+  if (!admin || (!hasFullPaymentLedgerAccess(admin.role) && admin.role !== 'manager')) {
+    return res.status(403).json({ error: 'Access denied: Reports & analytics are restricted to Salon Owner, Admin, and Manager.' });
   }
   const reports = await salonRepository.getReports();
   res.json(reports);
@@ -5998,8 +7173,8 @@ app.get('/api/reports', async (req, res) => {
 
 app.get('/api/reports/detailed', async (req, res) => {
   const admin = await getAuthAdmin(req);
-  if (!admin || (admin.role !== 'owner' && admin.role !== 'manager')) {
-    return res.status(403).json({ error: 'Access denied: Sales reports are restricted to Salon Owner and Manager.' });
+  if (!admin || (!hasFullPaymentLedgerAccess(admin.role) && admin.role !== 'manager')) {
+    return res.status(403).json({ error: 'Access denied: Sales reports are restricted to Salon Owner, Admin, and Manager.' });
   }
   const period = req.query.period as any || 'today';
   const startDate = req.query.startDate as string | undefined;
@@ -6349,7 +7524,7 @@ async function startServer() {
   // Automatically process due PENDING SMAV user sync outbox retries in long-running Node processes
   const smavOutboxTimer = setInterval(() => {
     if (!process.env.GLOSSYLOOKS_INTEGRATION_KEY) return;
-    triggerNonBlockingOutboxDrain(55_000, 10);
+    triggerNonBlockingOutboxDrain(55_000);
   }, 60_000);
   if (typeof smavOutboxTimer.unref === 'function') {
     smavOutboxTimer.unref();

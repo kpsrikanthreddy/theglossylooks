@@ -1428,13 +1428,25 @@ export class SupabaseSalonRepository implements ISalonRepository {
   }
 
   // --- Appointments ---
-  public async getAppointments(filters?: { status?: string; staffId?: string; customerMobile?: string }): Promise<Appointment[]> {
+  public async getAppointments(filters?: {
+    status?: string;
+    staffId?: string;
+    customerMobile?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+  }): Promise<Appointment[]> {
+    const deletedMode = filters?.deleted || 'active';
     let query = this.client.from('appointments').select('*').order('created_at', { ascending: false });
     if (filters?.status) query = query.eq('status', filters.status);
     if (filters?.staffId) query = query.eq('assigned_staff_id', filters.staffId);
     if (filters?.customerMobile) query = query.ilike('customer_phone', `%${filters.customerMobile}%`);
     const { data } = await query;
-    const apts = (data || []) as Appointment[];
+    let apts = (data || []) as Appointment[];
+
+    if (deletedMode === 'active') {
+      apts = apts.filter(a => !a.deleted_at);
+    } else if (deletedMode === 'deleted') {
+      apts = apts.filter(a => Boolean(a.deleted_at));
+    }
 
     try {
       const { data: allItems } = await this.client.from('appointment_items').select('*');
@@ -1612,19 +1624,194 @@ export class SupabaseSalonRepository implements ISalonRepository {
     return this.updateAppointment(id, { status: 'Cancelled', notes: `Cancelled: ${reason}` }, performedBy);
   }
 
+  public async softDeleteAppointment(
+    id: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<Appointment | null> {
+    const cleanReason = (reason || '').trim() || 'Removed by authorized admin';
+    const rpcRes = await this.client.rpc('tgl_soft_delete_appointment', {
+      p_appointment_id: id,
+      p_deleted_by: actor.name,
+      p_deleted_by_user_id: actor.userId || null,
+      p_reason: cleanReason,
+    });
+
+    if (!rpcRes.error) {
+      if (!rpcRes.data) return null;
+      return (await this.getAppointmentById(id)) || (rpcRes.data as Appointment);
+    }
+
+    const isMissingRpc =
+      rpcRes.error.code === 'PGRST202' ||
+      rpcRes.error.code === '42883' ||
+      /Could not find the function/i.test(rpcRes.error.message || '');
+
+    if (!isMissingRpc) {
+      throw new Error(rpcRes.error.message || 'Failed to soft-delete appointment.');
+    }
+
+    // Fallback when Migration 025 columns exist but RPC is not yet installed
+    const existing = await this.getAppointmentById(id);
+    if (!existing) return null;
+
+    const now = new Date().toISOString();
+    const { data, error } = await this.client
+      .from('appointments')
+      .update({
+        deleted_at: now,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        deletion_reason: cleanReason,
+        updated_at: now,
+      })
+      .eq('id', id)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST204' || error.code === '42703' || /schema cache|deleted_at/i.test(error.message || '')) {
+        throw new Error(
+          'Soft-delete columns are not installed in Supabase yet. Apply database/migrations/025_appointments_payments_soft_delete_whatsapp_and_rls.sql before deleting appointments.'
+        );
+      }
+      throw error;
+    }
+
+    await this.cancelScheduledFeedbackJobByAppointment(id).catch(() => false);
+    await this.logAudit(
+      'SOFT_DELETE',
+      'Appointment',
+      id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'Appointment',
+        appointment_id: id,
+        booking_reference: existing.booking_reference,
+        customer_name: existing.customer_name,
+        customer_phone: existing.customer_phone,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        reason: cleanReason,
+        deleted_at: now,
+      })
+    );
+
+    return (data ? { ...existing, ...(data as Appointment) } : null);
+  }
+
+  public async restoreAppointment(
+    id: string,
+    actor: { userId?: string; name: string }
+  ): Promise<Appointment | null> {
+    const rpcRes = await this.client.rpc('tgl_restore_appointment', {
+      p_appointment_id: id,
+      p_restored_by: actor.name,
+      p_restored_by_user_id: actor.userId || null,
+    });
+
+    if (!rpcRes.error) {
+      if (!rpcRes.data) return null;
+      return (await this.getAppointmentById(id)) || (rpcRes.data as Appointment);
+    }
+
+    const isMissingRpc =
+      rpcRes.error.code === 'PGRST202' ||
+      rpcRes.error.code === '42883' ||
+      /Could not find the function/i.test(rpcRes.error.message || '');
+
+    if (!isMissingRpc) {
+      throw new Error(rpcRes.error.message || 'Failed to restore appointment.');
+    }
+
+    const existing = await this.getAppointmentById(id);
+    if (!existing) return null;
+
+    const now = new Date().toISOString();
+    const { data, error } = await this.client
+      .from('appointments')
+      .update({
+        deleted_at: null,
+        restored_at: now,
+        restored_by: actor.name,
+        updated_at: now,
+      })
+      .eq('id', id)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST204' || error.code === '42703' || /schema cache|deleted_at/i.test(error.message || '')) {
+        throw new Error(
+          'Soft-delete columns are not installed in Supabase yet. Apply database/migrations/025_appointments_payments_soft_delete_whatsapp_and_rls.sql.'
+        );
+      }
+      throw error;
+    }
+
+    await this.logAudit(
+      'RESTORE',
+      'Appointment',
+      id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'Appointment',
+        appointment_id: id,
+        booking_reference: existing.booking_reference,
+        customer_name: existing.customer_name,
+        restored_by: actor.name,
+        restored_by_user_id: actor.userId || null,
+        restored_at: now,
+      })
+    );
+
+    return (data ? { ...existing, ...(data as Appointment) } : null);
+  }
+
   // --- Orders & POS Invoicing ---
-  public async getOrders(filters?: { customerMobile?: string; paymentStatus?: string }): Promise<Order[]> {
+  public async getOrders(filters?: {
+    customerMobile?: string;
+    paymentStatus?: string;
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<Order[]> {
+    const deletedMode = filters?.deleted || 'active';
     let query = this.client.from('orders').select('*').order('created_at', { ascending: false });
     if (filters?.customerMobile) query = query.ilike('customer_phone', `%${filters.customerMobile}%`);
     if (filters?.paymentStatus) query = query.eq('payment_status', filters.paymentStatus);
+    if (filters?.startIso) query = query.gte('created_at', filters.startIso);
+    if (filters?.endIso) query = query.lte('created_at', filters.endIso);
     const { data } = await query;
-    const ordersList = (data || []) as Order[];
+    let ordersList = (data || []) as Order[];
+
+    for (const ord of ordersList) {
+      if (!ord.branch_id && ord.notes) {
+        const match = ord.notes.match(/\[Branch:\s*([^\]]+)\]/);
+        if (match) ord.branch_id = match[1];
+      }
+      if (!ord.branch_id) {
+        ord.branch_id = 'tgl-gachibowli-main';
+      }
+    }
+
+    if (deletedMode === 'active') {
+      ordersList = ordersList.filter(o => !o.deleted_at);
+    } else if (deletedMode === 'deleted') {
+      ordersList = ordersList.filter(o => Boolean(o.deleted_at));
+    }
+
+    if (filters?.branchId) {
+      ordersList = ordersList.filter(o => (o.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    }
 
     try {
       const { data: allItems } = await this.client.from('order_items').select('*');
       if (allItems && allItems.length > 0) {
         const itemsByOrder: Record<string, OrderItem[]> = {};
         for (const itm of allItems) {
+          if (deletedMode === 'active' && (itm as any).deleted_at) continue;
           if (!itemsByOrder[itm.order_id]) itemsByOrder[itm.order_id] = [];
           itemsByOrder[itm.order_id].push(itm);
         }
@@ -1633,10 +1820,6 @@ export class SupabaseSalonRepository implements ISalonRepository {
             ord.items = itemsByOrder[ord.id];
           } else if (!ord.items) {
             ord.items = [];
-          }
-          if (!ord.branch_id && ord.notes) {
-            const match = ord.notes.match(/\[Branch:\s*([^\]]+)\]/);
-            if (match) ord.branch_id = match[1];
           }
         }
       }
@@ -1835,12 +2018,271 @@ export class SupabaseSalonRepository implements ISalonRepository {
     return data as Order;
   }
 
+  public async softDeleteOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string },
+    reason: string
+  ): Promise<{ order: Order; affectedPayments: number } | null> {
+    const cleanReason = (reason || '').trim() || 'Removed from ledger by authorized admin';
+
+    // Always resolve to the parent Order so we never leave a bill/order inconsistent
+    let targetOrder = await this.getOrderById(orderOrPaymentId);
+    if (!targetOrder) {
+      const { data: payRow } = await this.client
+        .from('payments')
+        .select('id, order_id, bill_number')
+        .eq('id', orderOrPaymentId)
+        .maybeSingle();
+
+      if (payRow?.order_id) {
+        targetOrder = await this.getOrderById(payRow.order_id);
+      }
+      if (!targetOrder && payRow?.bill_number) {
+        const { data: ordByBill } = await this.client
+          .from('orders')
+          .select('id')
+          .eq('bill_number', payRow.bill_number)
+          .maybeSingle();
+        if (ordByBill?.id) {
+          targetOrder = await this.getOrderById(ordByBill.id);
+        }
+      }
+    }
+
+    if (!targetOrder) {
+      return null;
+    }
+
+    const rpcRes = await this.client.rpc('tgl_soft_delete_order_transaction', {
+      p_order_id: targetOrder.id,
+      p_deleted_by: actor.name,
+      p_deleted_by_user_id: actor.userId || null,
+      p_reason: cleanReason,
+    });
+
+    if (!rpcRes.error) {
+      if (!rpcRes.data) return null;
+      const payload = rpcRes.data as any;
+      const refreshedOrder = (await this.getOrderById(targetOrder.id)) || (payload.order as Order) || targetOrder;
+      return {
+        order: refreshedOrder,
+        affectedPayments: Number(payload.affected_payments ?? 1),
+      };
+    }
+
+    const isMissingRpc =
+      rpcRes.error.code === 'PGRST202' ||
+      rpcRes.error.code === '42883' ||
+      /Could not find the function/i.test(rpcRes.error.message || '');
+
+    if (!isMissingRpc) {
+      throw new Error(rpcRes.error.message || 'Failed to soft-delete bill/order transaction.');
+    }
+
+    // Coordinated fallback if Migration 025 columns exist without the RPC
+    const now = new Date().toISOString();
+    const { data: updatedOrder, error: orderErr } = await this.client
+      .from('orders')
+      .update({
+        deleted_at: now,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        deletion_reason: cleanReason,
+      })
+      .eq('id', targetOrder.id)
+      .select()
+      .maybeSingle();
+
+    if (orderErr) {
+      if (orderErr.code === 'PGRST204' || orderErr.code === '42703' || /schema cache|deleted_at/i.test(orderErr.message || '')) {
+        throw new Error(
+          'Soft-delete columns/RPCs are not installed in Supabase yet. Apply database/migrations/025_appointments_payments_soft_delete_whatsapp_and_rls.sql before deleting Payment Ledger bills.'
+        );
+      }
+      throw orderErr;
+    }
+
+    await this.client
+      .from('order_items')
+      .update({
+        deleted_at: now,
+        deleted_by: actor.name,
+        deletion_reason: cleanReason,
+      })
+      .eq('order_id', targetOrder.id);
+
+    const { data: updatedPayments } = await this.client
+      .from('payments')
+      .update({
+        deleted_at: now,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        deletion_reason: cleanReason,
+      })
+      .or(`order_id.eq.${targetOrder.id},bill_number.eq.${targetOrder.bill_number}`)
+      .select('id');
+
+    await this.cancelScheduledFeedbackJobByOrder(targetOrder.id).catch(() => false);
+
+    const affectedPayments = Array.isArray(updatedPayments) ? updatedPayments.length : 0;
+    await this.logAudit(
+      'SOFT_DELETE',
+      'PaymentLedgerBill',
+      targetOrder.id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'OrderAndPayments',
+        order_id: targetOrder.id,
+        bill_number: targetOrder.bill_number,
+        customer_name: targetOrder.customer_name,
+        customer_phone: targetOrder.customer_phone,
+        amount: targetOrder.grand_total,
+        affected_payments: affectedPayments,
+        deleted_by: actor.name,
+        deleted_by_user_id: actor.userId || null,
+        reason: cleanReason,
+        deleted_at: now,
+      })
+    );
+
+    return {
+      order: { ...targetOrder, ...(updatedOrder as Order) },
+      affectedPayments,
+    };
+  }
+
+  public async restoreOrderTransaction(
+    orderOrPaymentId: string,
+    actor: { userId?: string; name: string }
+  ): Promise<{ order: Order; restoredPayments: number } | null> {
+    let targetOrder = await this.getOrderById(orderOrPaymentId);
+    if (!targetOrder) {
+      const { data: payRow } = await this.client
+        .from('payments')
+        .select('id, order_id, bill_number')
+        .eq('id', orderOrPaymentId)
+        .maybeSingle();
+
+      if (payRow?.order_id) {
+        targetOrder = await this.getOrderById(payRow.order_id);
+      }
+      if (!targetOrder && payRow?.bill_number) {
+        const { data: ordByBill } = await this.client
+          .from('orders')
+          .select('id')
+          .eq('bill_number', payRow.bill_number)
+          .maybeSingle();
+        if (ordByBill?.id) {
+          targetOrder = await this.getOrderById(ordByBill.id);
+        }
+      }
+    }
+
+    if (!targetOrder) {
+      return null;
+    }
+
+    const rpcRes = await this.client.rpc('tgl_restore_order_transaction', {
+      p_order_id: targetOrder.id,
+      p_restored_by: actor.name,
+      p_restored_by_user_id: actor.userId || null,
+    });
+
+    if (!rpcRes.error) {
+      if (!rpcRes.data) return null;
+      const payload = rpcRes.data as any;
+      const refreshedOrder = (await this.getOrderById(targetOrder.id)) || (payload.order as Order) || targetOrder;
+      return {
+        order: refreshedOrder,
+        restoredPayments: Number(payload.restored_payments ?? 1),
+      };
+    }
+
+    const isMissingRpc =
+      rpcRes.error.code === 'PGRST202' ||
+      rpcRes.error.code === '42883' ||
+      /Could not find the function/i.test(rpcRes.error.message || '');
+
+    if (!isMissingRpc) {
+      throw new Error(rpcRes.error.message || 'Failed to restore bill/order transaction.');
+    }
+
+    const now = new Date().toISOString();
+    const { data: restoredOrder, error: orderErr } = await this.client
+      .from('orders')
+      .update({
+        deleted_at: null,
+        restored_at: now,
+        restored_by: actor.name,
+      })
+      .eq('id', targetOrder.id)
+      .select()
+      .maybeSingle();
+
+    if (orderErr) {
+      if (orderErr.code === 'PGRST204' || orderErr.code === '42703' || /schema cache|deleted_at/i.test(orderErr.message || '')) {
+        throw new Error(
+          'Soft-delete columns/RPCs are not installed in Supabase yet. Apply database/migrations/025_appointments_payments_soft_delete_whatsapp_and_rls.sql.'
+        );
+      }
+      throw orderErr;
+    }
+
+    await this.client
+      .from('order_items')
+      .update({ deleted_at: null })
+      .eq('order_id', targetOrder.id);
+
+    const { data: restoredPaymentsRows } = await this.client
+      .from('payments')
+      .update({
+        deleted_at: null,
+        restored_at: now,
+        restored_by: actor.name,
+      })
+      .or(`order_id.eq.${targetOrder.id},bill_number.eq.${targetOrder.bill_number}`)
+      .select('id');
+
+    const restoredPayments = Array.isArray(restoredPaymentsRows) ? restoredPaymentsRows.length : 0;
+    await this.logAudit(
+      'RESTORE',
+      'PaymentLedgerBill',
+      targetOrder.id,
+      actor.name,
+      JSON.stringify({
+        record_type: 'OrderAndPayments',
+        order_id: targetOrder.id,
+        bill_number: targetOrder.bill_number,
+        customer_name: targetOrder.customer_name,
+        amount: targetOrder.grand_total,
+        restored_payments: restoredPayments,
+        restored_by: actor.name,
+        restored_by_user_id: actor.userId || null,
+        restored_at: now,
+      })
+    );
+
+    return {
+      order: { ...targetOrder, ...(restoredOrder as Order) },
+      restoredPayments,
+    };
+  }
+
   // --- Payments & Refunds ---
-  public async getPayments(): Promise<PaymentRecord[]> {
-    const { data: paymentsData } = await this.client.from('payments').select('*').order('created_at', { ascending: false });
+  public async getPayments(filters?: {
+    deleted?: 'active' | 'deleted' | 'all';
+    branchId?: string;
+    startIso?: string;
+    endIso?: string;
+  }): Promise<PaymentRecord[]> {
+    const deletedMode = filters?.deleted || 'active';
+    let query = this.client.from('payments').select('*').order('created_at', { ascending: false });
+    if (filters?.startIso) query = query.gte('created_at', filters.startIso);
+    if (filters?.endIso) query = query.lte('created_at', filters.endIso);
+    const { data: paymentsData } = await query;
     let list = (paymentsData || []) as PaymentRecord[];
 
-    const orders = await this.getOrders();
+    const orders = await this.getOrders({ deleted: 'all' });
     const ordersById: Record<string, Order> = {};
     const ordersByBill: Record<string, Order> = {};
     for (const ord of orders) {
@@ -1848,9 +2290,12 @@ export class SupabaseSalonRepository implements ISalonRepository {
       ordersByBill[ord.bill_number] = ord;
     }
 
-    // Auto-seed payments from orders if payments table is empty but orders exist
-    if (list.length === 0 && orders.length > 0) {
-      for (const ord of orders) {
+    // Auto-seed payments from active orders ONLY on unfiltered active query when payments table is empty
+    const isUnfilteredActive =
+      deletedMode === 'active' && !filters?.branchId && !filters?.startIso && !filters?.endIso;
+    const activeOrders = orders.filter(o => !o.deleted_at);
+    if (isUnfilteredActive && list.length === 0 && activeOrders.length > 0) {
+      for (const ord of activeOrders) {
         try {
           const payRow: any = {
             order_id: ord.id,
@@ -1870,20 +2315,39 @@ export class SupabaseSalonRepository implements ISalonRepository {
       list = (refetch.data || []) as PaymentRecord[];
     }
 
-    return list.map(p => {
+    let enriched = list.map(p => {
       const match = ordersById[p.order_id] || ordersByBill[p.bill_number];
+      const effectiveDeletedAt = p.deleted_at || match?.deleted_at || null;
       return {
         ...p,
-        branch_id: p.branch_id || match?.branch_id,
+        branch_id: p.branch_id || match?.branch_id || 'tgl-gachibowli-main',
         subtotal: match?.subtotal !== undefined ? match.subtotal : p.amount,
         discount: match?.discount !== undefined ? match.discount : 0,
         tax_amount: match?.tax_amount !== undefined ? match.tax_amount : 0,
         receipt_whatsapp_status: match?.receipt_whatsapp_status || match?.whatsapp_status,
         receipt_whatsapp_error: match?.receipt_whatsapp_error,
         feedback_whatsapp_status: match?.feedback_whatsapp_status,
-        items: match?.items || []
+        items: match?.items || [],
+        deleted_at: effectiveDeletedAt,
+        deleted_by: p.deleted_by || match?.deleted_by || null,
+        deleted_by_user_id: p.deleted_by_user_id || match?.deleted_by_user_id || null,
+        deletion_reason: p.deletion_reason || match?.deletion_reason || null,
+        restored_at: p.restored_at || match?.restored_at || null,
+        restored_by: p.restored_by || match?.restored_by || null,
       };
     });
+
+    if (deletedMode === 'active') {
+      enriched = enriched.filter(p => !p.deleted_at);
+    } else if (deletedMode === 'deleted') {
+      enriched = enriched.filter(p => Boolean(p.deleted_at));
+    }
+
+    if (filters?.branchId) {
+      enriched = enriched.filter(p => (p.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    }
+
+    return enriched;
   }
 
   public async recordPayment(payment: Omit<PaymentRecord, 'id' | 'created_at'>, performedBy: string): Promise<PaymentRecord> {
@@ -2138,10 +2602,11 @@ export class SupabaseSalonRepository implements ISalonRepository {
   }
 
   // --- WhatsApp Message Logs ---
-  public async getWhatsAppMessageLogs(appointmentId?: string, branchId?: string): Promise<WhatsAppMessageLog[]> {
+  public async getWhatsAppMessageLogs(appointmentId?: string, branchId?: string, orderId?: string): Promise<WhatsAppMessageLog[]> {
     let query = this.client.from('whatsapp_message_logs').select('*').order('created_at', { ascending: false });
     if (appointmentId) query = query.eq('appointment_id', appointmentId);
     if (branchId) query = query.eq('branch_id', branchId);
+    if (orderId) query = query.eq('order_id', orderId);
     const { data } = await query;
     return (data || []) as WhatsAppMessageLog[];
   }
@@ -3518,9 +3983,16 @@ export class SupabaseSalonRepository implements ISalonRepository {
       status: status.toLowerCase(),
       created_at: now,
       metadata: {
+        ...(message.metadata || {}),
         salon_id: newMsg.salon_id,
         branch_id: newMsg.branch_id,
         source: sourceBadge,
+        appointment_id: newMsg.appointment_id || (message.metadata as any)?.appointment_id || null,
+        order_id: newMsg.order_id || (message.metadata as any)?.order_id || null,
+        bill_number: newMsg.bill_number || (message.metadata as any)?.bill_number || null,
+        payment_id: newMsg.payment_id || (message.metadata as any)?.payment_id || null,
+        sent_by_user_id: sentByUserId,
+        sent_by_user_name: sentByUserName,
         sent_at: (newMsg as any).sent_at || null,
         delivered_at: (newMsg as any).delivered_at || null,
         read_at: (newMsg as any).read_at || null,
@@ -3539,15 +4011,35 @@ export class SupabaseSalonRepository implements ISalonRepository {
     if (sourceBadge) insertPayload.source_badge = sourceBadge;
     if (sentByUserId) insertPayload.sent_by_user_id = sentByUserId;
     if (sentByUserName) insertPayload.sent_by_user_name = sentByUserName;
+    if (newMsg.appointment_id) insertPayload.appointment_id = newMsg.appointment_id;
+    if (newMsg.order_id) insertPayload.order_id = newMsg.order_id;
+    if (newMsg.bill_number) insertPayload.bill_number = newMsg.bill_number;
+    if (newMsg.payment_id) insertPayload.payment_id = newMsg.payment_id;
     if (newMsg.error_code) insertPayload.error_code = newMsg.error_code;
     if (newMsg.error_message) insertPayload.error_message = newMsg.error_message;
 
     try {
-      const { data, error } = await this.client
+      let { data, error } = await this.client
         .from('whatsapp_messages')
         .insert(insertPayload)
         .select()
         .maybeSingle();
+
+      while (error && (error.code === 'PGRST204' || (error.message && error.message.includes('schema cache')))) {
+        const match = error.message.match(/Could not find the '([^']+)' column/);
+        if (match && match[1] && insertPayload[match[1]] !== undefined) {
+          delete insertPayload[match[1]];
+          const retry = await this.client
+            .from('whatsapp_messages')
+            .insert(insertPayload)
+            .select()
+            .maybeSingle();
+          data = retry.data;
+          error = retry.error;
+        } else {
+          break;
+        }
+      }
 
       if (!error && data) {
         const saved: WhatsAppMessage = {

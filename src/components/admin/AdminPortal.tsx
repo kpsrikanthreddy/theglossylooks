@@ -62,6 +62,12 @@ import {
 import { ScrollToTopOnRouteChange, resetScrollPosition } from '../common/ScrollToTopOnRouteChange';
 import { WhatsAppIntegrationSection } from './WhatsAppIntegrationSection';
 import { WhatsAppInbox } from './whatsapp/WhatsAppInbox';
+import { RecordWhatsAppTemplateModal } from './RecordWhatsAppTemplateModal';
+import {
+  canDeleteOrRestoreRecords,
+  hasFullPaymentLedgerAccess,
+  canSendWhatsAppTemplates,
+} from '../../lib/rbac';
 import { 
   AdminUser, 
   AdminRole, 
@@ -366,6 +372,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [serviceSearch, setServiceSearch] = useState('');
   const [inventorySearch, setInventorySearch] = useState('');
   const [appointmentBranchFilter, setAppointmentBranchFilter] = useState('all');
+  const [appointmentDeletedFilter, setAppointmentDeletedFilter] = useState<'active' | 'deleted'>('active');
+  const [deletedAppointments, setDeletedAppointments] = useState<Appointment[]>([]);
+  const [loadingDeletedAppointments, setLoadingDeletedAppointments] = useState(false);
+
+  // Shared WhatsApp Template Modal (Appointments & Payment Ledger)
+  const [recordWhatsAppModal, setRecordWhatsAppModal] = useState<{
+    isOpen: boolean;
+    recordType: 'appointment' | 'order';
+    recordId: string;
+    recordLabel: string;
+    customerName?: string;
+    customerPhone?: string;
+  }>({
+    isOpen: false,
+    recordType: 'appointment',
+    recordId: '',
+    recordLabel: ''
+  });
 
   // POS State
   const [posCustomerName, setPosCustomerName] = useState('');
@@ -466,6 +490,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [ledgerBranchFilter, setLedgerBranchFilter] = useState('all');
   const [ledgerModeFilter, setLedgerModeFilter] = useState('all');
   const [ledgerSearch, setLedgerSearch] = useState('');
+  const [ledgerDeletedFilter, setLedgerDeletedFilter] = useState<'active' | 'deleted'>('active');
+  const [deletedPayments, setDeletedPayments] = useState<PaymentRecord[]>([]);
+  const [deletedOrders, setDeletedOrders] = useState<Order[]>([]);
+  const [loadingDeletedLedger, setLoadingDeletedLedger] = useState(false);
+  const [exportingLedgerCsv, setExportingLedgerCsv] = useState(false);
 
   // Order Details & Edit Modals
   const [orderDetailsModal, setOrderDetailsModal] = useState<{
@@ -795,11 +824,87 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
   // Role Permissions
   const role = currentUser?.role || 'staff';
-  const isOwner = role === 'owner';
-  const isManager = ['owner', 'manager'].includes(role);
-  const isReceptionist = ['owner', 'manager', 'receptionist'].includes(role);
-  const isInventoryStaff = ['owner', 'manager', 'inventory_staff'].includes(role);
+  const canDeleteOrRestore = canDeleteOrRestoreRecords(role);
+  const fullPaymentLedgerAccess = hasFullPaymentLedgerAccess(role);
+  const canSendWaTemplates = canSendWhatsAppTemplates(role);
+  const isOwner = ['owner', 'admin', 'superadmin'].includes(role);
+  const isManager = ['owner', 'admin', 'superadmin', 'manager'].includes(role);
+  const isReceptionist = ['owner', 'admin', 'superadmin', 'manager', 'receptionist', 'pos_billing'].includes(role);
+  const isInventoryStaff = ['owner', 'admin', 'superadmin', 'manager', 'inventory_staff'].includes(role);
   const isStylist = role === 'stylist';
+
+  const loadDeletedAppointments = async () => {
+    if (!canDeleteOrRestore) return;
+    setLoadingDeletedAppointments(true);
+    try {
+      const list = await api.getAppointments({ deleted: 'deleted' });
+      setDeletedAppointments(list);
+    } catch (err) {
+      toast.error(getSafeErrorMessage(err, 'Failed to load deleted appointments.'));
+    } finally {
+      setLoadingDeletedAppointments(false);
+    }
+  };
+
+  const loadDeletedLedger = async () => {
+    if (!canDeleteOrRestore) return;
+    setLoadingDeletedLedger(true);
+    try {
+      const [delPays, delOrds] = await Promise.all([
+        api.getPayments({ deleted: 'deleted' }),
+        api.getOrders({ deleted: 'deleted' })
+      ]);
+      setDeletedPayments(delPays);
+      setDeletedOrders(delOrds);
+    } catch (err) {
+      toast.error(getSafeErrorMessage(err, 'Failed to load deleted payment ledger bills.'));
+    } finally {
+      setLoadingDeletedLedger(false);
+    }
+  };
+
+  const handleExportPaymentLedgerCsv = async () => {
+    if (!fullPaymentLedgerAccess) return;
+    setExportingLedgerCsv(true);
+    try {
+      let startIso: string | undefined;
+      let endIso: string | undefined;
+      const todayKolkata = getKolkataDateString(new Date());
+      if (ledgerDateFilter === 'today') {
+        startIso = `${todayKolkata}T00:00:00.000+05:30`;
+        endIso = `${todayKolkata}T23:59:59.999+05:30`;
+      } else if (ledgerDateFilter === 'yesterday') {
+        const yDate = new Date();
+        yDate.setDate(yDate.getDate() - 1);
+        const yStr = getKolkataDateString(yDate);
+        startIso = `${yStr}T00:00:00.000+05:30`;
+        endIso = `${yStr}T23:59:59.999+05:30`;
+      } else if (ledgerDateFilter === 'custom') {
+        if (ledgerStartDate) startIso = `${ledgerStartDate}T00:00:00.000+05:30`;
+        if (ledgerEndDate) endIso = `${ledgerEndDate}T23:59:59.999+05:30`;
+      }
+      const csvText = await api.exportPaymentsCsv({
+        branchId: ledgerBranchFilter,
+        mode: ledgerModeFilter,
+        startIso,
+        endIso
+      });
+      const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `glossylooks-payment-ledger-${todayKolkata}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success('Payment Ledger CSV exported');
+    } catch (err) {
+      toast.error(getSafeErrorMessage(err, 'Failed to export Payment Ledger CSV.'));
+    } finally {
+      setExportingLedgerCsv(false);
+    }
+  };
 
   // POS Checkout Handler
   const handlePosCheckout = async (e: React.FormEvent) => {
@@ -1650,8 +1755,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             </button>
           )}
 
-          {/* 5. Payments & Reconciliation */}
-          {(isOwner || isManager || isReceptionist) && (
+          {/* 5. Payments & Reconciliation (Full access for Owner/Admin/Superadmin; Today-only Branch Ledger for Staff) */}
+          {(isOwner || isManager || isReceptionist || isStylist || isInventoryStaff) && (
             <button
               onClick={() => handleNavigateTab('payments')}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl font-medium transition-colors ${
@@ -2319,7 +2424,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           {/* 3. APPOINTMENTS MODULE */}
           {/* ================================================================= */}
           {activeTab === 'appointments' && (() => {
-            const filteredAppointments = appointments.filter(apt => {
+            const viewingDeletedApts = canDeleteOrRestore && appointmentDeletedFilter === 'deleted';
+            const sourceAppointments = viewingDeletedApts ? deletedAppointments : appointments;
+            const filteredAppointments = sourceAppointments.filter(apt => {
               if (appointmentBranchFilter === 'all') return true;
               return (apt.branch_id || 'tgl-gachibowli-main') === appointmentBranchFilter;
             });
@@ -2327,9 +2434,44 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             return (
               <div className="space-y-4">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                  <span className="text-xs font-semibold text-slate-600">
-                    Showing {filteredAppointments.length} scheduled bookings {appointmentBranchFilter !== 'all' ? `(filtered by ${branches.find(b => b.id === appointmentBranchFilter)?.name || 'branch'})` : `(all branches)`}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <span className="text-xs font-semibold text-slate-600">
+                      Showing {filteredAppointments.length} {viewingDeletedApts ? 'deleted' : 'scheduled'} bookings {appointmentBranchFilter !== 'all' ? `(filtered by ${branches.find(b => b.id === appointmentBranchFilter)?.name || 'branch'})` : `(all branches)`}
+                    </span>
+
+                    {/* Active / Deleted Filter (Strictly SUPERADMIN, ADMIN, OWNER only) */}
+                    {canDeleteOrRestore && (
+                      <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                        <button
+                          type="button"
+                          onClick={() => setAppointmentDeletedFilter('active')}
+                          className={`px-2.5 py-1 text-[11px] font-bold rounded-md transition-colors cursor-pointer ${
+                            appointmentDeletedFilter === 'active'
+                              ? 'bg-[#5B132B] text-white shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Active ({appointments.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAppointmentDeletedFilter('deleted');
+                            loadDeletedAppointments();
+                          }}
+                          className={`px-2.5 py-1 text-[11px] font-bold rounded-md transition-colors cursor-pointer flex items-center gap-1 ${
+                            appointmentDeletedFilter === 'deleted'
+                              ? 'bg-rose-600 text-white shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>Deleted{deletedAppointments.length > 0 ? ` (${deletedAppointments.length})` : ''}</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] font-medium text-slate-500">Branch:</span>
                     <select
@@ -2337,9 +2479,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       onChange={e => setAppointmentBranchFilter(e.target.value)}
                       className="px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 outline-none focus:ring-2 focus:ring-[#5B132B]/20 font-medium cursor-pointer shadow-xs"
                     >
-                      <option value="all">All Branches ({appointments.length})</option>
+                      <option value="all">All Branches ({sourceAppointments.length})</option>
                       {branches.map(b => {
-                        const count = appointments.filter(a => (a.branch_id || 'tgl-gachibowli-main') === b.id).length;
+                        const count = sourceAppointments.filter(a => (a.branch_id || 'tgl-gachibowli-main') === b.id).length;
                         return (
                           <option key={b.id} value={b.id}>
                             {b.name} ({count})
@@ -2350,7 +2492,36 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   </div>
                 </div>
 
+                {viewingDeletedApts && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
+                      <span>
+                        Viewing soft-deleted appointments archive. These records are excluded from active schedules and can be restored anytime by authorized admins.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => loadDeletedAppointments()}
+                      className="text-[11px] font-bold text-rose-700 hover:underline shrink-0 flex items-center gap-1 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${loadingDeletedAppointments ? 'animate-spin' : ''}`} />
+                      Refresh
+                    </button>
+                  </div>
+                )}
+
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
+                  {viewingDeletedApts && loadingDeletedAppointments ? (
+                    <div className="p-10 flex items-center justify-center gap-2 text-xs text-slate-500">
+                      <Loader2 className="w-4 h-4 animate-spin text-[#5B132B]" />
+                      <span>Loading deleted appointments…</span>
+                    </div>
+                  ) : filteredAppointments.length === 0 ? (
+                    <div className="p-10 text-center text-xs text-slate-500">
+                      {viewingDeletedApts ? 'No deleted appointments found.' : 'No active appointments found.'}
+                    </div>
+                  ) : (
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs">
                       <thead className="bg-[#FAF7F5] border-b border-slate-200 text-slate-600 font-semibold uppercase text-[10px] tracking-wider">
@@ -2360,7 +2531,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           <th className="p-3.5">Client & Phone</th>
                           <th className="p-3.5">Date & Slot</th>
                           <th className="p-3.5">Services</th>
-                          <th className="p-3.5">Assigned Stylist</th>
+                          <th className="p-3.5">{viewingDeletedApts ? 'Deletion Audit' : 'Assigned Stylist'}</th>
                           <th className="p-3.5">Amount</th>
                           <th className="p-3.5">Status</th>
                           <th className="p-3.5 text-right">Actions</th>
@@ -2368,7 +2539,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       </thead>
                       <tbody className="divide-y divide-slate-100">
                         {filteredAppointments.map(apt => (
-                          <tr key={apt.id} className="hover:bg-slate-50 transition-colors">
+                          <tr key={apt.id} className={`hover:bg-slate-50 transition-colors ${viewingDeletedApts ? 'bg-rose-50/20' : ''}`}>
                             <td className="p-3.5 font-mono font-bold text-[#5B132B]">{apt.booking_reference}</td>
                             <td className="p-3.5">
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-700 border border-slate-200">
@@ -2379,34 +2550,53 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <td className="p-3.5">
                               <div className="font-bold text-slate-900">{apt.customer_name}</div>
                               <div className="text-[11px] text-slate-500 font-mono">{apt.customer_phone}</div>
-                              {apt.whatsapp_status && (
-                                <button
-                                  type="button"
-                                  onClick={() => handleViewAppointmentLogs(apt)}
-                                  className={`mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all ${
-                                    apt.whatsapp_status === 'sent' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100' :
-                                    apt.whatsapp_status === 'delivered' ? 'bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100' :
-                                    apt.whatsapp_status === 'read' ? 'bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100' :
-                                    apt.whatsapp_status === 'pending_approval' ? 'bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100' :
-                                    'bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100'
-                                  }`}
-                                  title="Click to view WhatsApp delivery log history"
-                                >
-                                  <span className={`w-1.5 h-1.5 rounded-full ${
-                                    apt.whatsapp_status === 'read' ? 'bg-blue-600' :
-                                    apt.whatsapp_status === 'delivered' ? 'bg-teal-600' :
-                                    apt.whatsapp_status === 'sent' ? 'bg-emerald-600' :
-                                    apt.whatsapp_status === 'pending_approval' ? 'bg-amber-500' :
-                                    'bg-rose-600'
-                                  }`} />
-                                  <span>
-                                    {apt.whatsapp_status === 'sent' ? 'WA Sent' :
-                                     apt.whatsapp_status === 'delivered' ? 'WA Delivered' :
-                                     apt.whatsapp_status === 'read' ? 'WA Read' :
-                                     apt.whatsapp_status === 'pending_approval' ? 'Pending Approval' :
-                                     'WA Failed'}
-                                  </span>
-                                </button>
+                              {!viewingDeletedApts && apt.whatsapp_status && (
+                                <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleViewAppointmentLogs(apt)}
+                                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all cursor-pointer ${
+                                      apt.whatsapp_status === 'sent' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100' :
+                                      apt.whatsapp_status === 'delivered' ? 'bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100' :
+                                      apt.whatsapp_status === 'read' ? 'bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100' :
+                                      apt.whatsapp_status === 'retrying' || apt.whatsapp_status === 'queued' || apt.whatsapp_status === 'sending' || apt.whatsapp_status === 'scheduled' ? 'bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100' :
+                                      'bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100'
+                                    }`}
+                                    title="Click to view WhatsApp delivery log history"
+                                  >
+                                    <span className={`w-1.5 h-1.5 rounded-full ${
+                                      apt.whatsapp_status === 'read' ? 'bg-blue-600' :
+                                      apt.whatsapp_status === 'delivered' ? 'bg-teal-600' :
+                                      apt.whatsapp_status === 'sent' ? 'bg-emerald-600' :
+                                      apt.whatsapp_status === 'retrying' || apt.whatsapp_status === 'queued' || apt.whatsapp_status === 'sending' || apt.whatsapp_status === 'scheduled' ? 'bg-amber-500' :
+                                      'bg-rose-600'
+                                    }`} />
+                                    <span>
+                                      {apt.whatsapp_status === 'sent' ? 'WA Sent' :
+                                       apt.whatsapp_status === 'delivered' ? 'WA Delivered' :
+                                       apt.whatsapp_status === 'read' ? 'WA Read' :
+                                       apt.whatsapp_status === 'retrying' || apt.whatsapp_status === 'queued' || apt.whatsapp_status === 'sending' || apt.whatsapp_status === 'scheduled' ? 'WA Queued' :
+                                       'WA Failed'}
+                                    </span>
+                                  </button>
+                                  {apt.whatsapp_status === 'failed' && canSendWaTemplates && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setRecordWhatsAppModal({
+                                        isOpen: true,
+                                        recordType: 'appointment',
+                                        recordId: apt.id,
+                                        recordLabel: apt.booking_reference,
+                                        customerName: apt.customer_name,
+                                        customerPhone: apt.customer_phone
+                                      })}
+                                      className="text-[10px] font-bold text-rose-600 hover:text-rose-800 underline cursor-pointer"
+                                      title="Retry failed WhatsApp template"
+                                    >
+                                      Retry
+                                    </button>
+                                  )}
+                                </div>
                               )}
                             </td>
                           <td className="p-3.5">
@@ -2418,6 +2608,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <div className="text-[10px] text-slate-400">Total: {apt.services.reduce((a, b) => a + b.duration, 0)}m</div>
                           </td>
                           <td className="p-3.5">
+                            {viewingDeletedApts ? (
+                              <div className="text-[11px] space-y-0.5">
+                                <div className="font-semibold text-rose-700">By {apt.deleted_by || 'Admin'}</div>
+                                {apt.deleted_at && <div className="text-slate-500">{formatKolkataDateTime(apt.deleted_at)}</div>}
+                                {apt.deletion_reason && <div className="text-slate-600 italic">“{apt.deletion_reason}”</div>}
+                              </div>
+                            ) : (
                             <div className="flex items-center gap-1.5">
                               <select
                                 value={apt.assigned_staff_id || ''}
@@ -2455,9 +2652,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#5B132B] shrink-0" />
                               )}
                             </div>
+                            )}
                           </td>
                           <td className="p-3.5 font-bold text-slate-900">₹{apt.final_amount}</td>
                           <td className="p-3.5">
+                            {viewingDeletedApts ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">
+                                Deleted
+                              </span>
+                            ) : (
                             <div className="flex items-center gap-1.5">
                               <select
                                 value={apt.status}
@@ -2490,57 +2693,115 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#5B132B] shrink-0" />
                               )}
                             </div>
-                          </td>
-                          <td className="p-3.5 text-right space-x-1.5">
-                            <button
-                              onClick={() => onViewReceipt(undefined, apt, 'service_ticket')}
-                              className="p-1.5 text-slate-600 hover:text-[#5B132B] hover:bg-slate-100 rounded-lg"
-                              title="Print Service Ticket Slip"
-                            >
-                              <Printer className="w-4 h-4" />
-                            </button>
-                            {(isOwner || isManager) ? (
-                              <button
-                                type="button"
-                                onClick={() => handleOpenWhatsAppConfirm(apt)}
-                                className="inline-flex p-1.5 text-emerald-700 hover:text-white hover:bg-emerald-600 rounded-lg transition-colors"
-                                title="Send official Meta WhatsApp appointment confirmation template"
-                              >
-                                <MessageCircle className="w-4 h-4" />
-                              </button>
-                            ) : (
-                              <a
-                                href={`https://wa.me/91${apt.customer_phone}?text=${encodeURIComponent(`Hi ${apt.customer_name}, your appointment at The Glossy Looks salon is scheduled for ${apt.appointment_date} at ${apt.time_slot}. Ref: ${apt.booking_reference}`)}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-lg"
-                                title="Open WhatsApp web chat"
-                              >
-                                <MessageCircle className="w-4 h-4" />
-                              </a>
                             )}
-                            <button
-                              onClick={() => {
-                                setPosCustomerName(apt.customer_name);
-                                setPosCustomerPhone(apt.customer_phone);
-                                const items = apt.services.map(s => {
-                                  const fullSrv = services.find(x => x.id === s.id) || services[0];
-                                  return { service: fullSrv, quantity: 1, staffId: apt.assigned_staff_id };
-                                });
-                                setPosSelectedItems(items);
-                                handleNavigateTab('pos');
-                              }}
-                              className="p-1.5 text-[#5B132B] hover:bg-[#FAF4F0] rounded-lg font-bold"
-                              title="Convert to POS Bill"
-                            >
-                              <Receipt className="w-4 h-4" />
-                            </button>
+                          </td>
+                          <td className="p-3.5 text-right space-x-1 whitespace-nowrap">
+                            {viewingDeletedApts ? (
+                              canDeleteOrRestore && (
+                                <ActionButton
+                                  type="button"
+                                  loading={rowAction.isPending(`apt-restore-${apt.id}`)}
+                                  loadingText="Restoring..."
+                                  onClick={() => {
+                                    rowAction.runForKey(
+                                      `apt-restore-${apt.id}`,
+                                      async () => {
+                                        await api.restoreAppointment(apt.id, currentUser.name);
+                                        await Promise.all([loadAllData(), loadDeletedAppointments()]);
+                                      },
+                                      {
+                                        successMessage: `Appointment ${apt.booking_reference} restored to active records`,
+                                        errorFallback: 'Failed to restore appointment.'
+                                      }
+                                    );
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  <span>Restore</span>
+                                </ActionButton>
+                              )
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => onViewReceipt(undefined, apt, 'service_ticket')}
+                                  className="p-1.5 text-slate-600 hover:text-[#5B132B] hover:bg-slate-100 rounded-lg cursor-pointer"
+                                  title="Print Service Ticket Slip"
+                                >
+                                  <Printer className="w-4 h-4" />
+                                </button>
+                                {canSendWaTemplates && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setRecordWhatsAppModal({
+                                      isOpen: true,
+                                      recordType: 'appointment',
+                                      recordId: apt.id,
+                                      recordLabel: apt.booking_reference,
+                                      customerName: apt.customer_name,
+                                      customerPhone: apt.customer_phone
+                                    })}
+                                    className="inline-flex p-1.5 text-emerald-700 hover:text-white hover:bg-emerald-600 rounded-lg transition-colors cursor-pointer"
+                                    title="Send approved WhatsApp template follow-up"
+                                  >
+                                    <MessageCircle className="w-4 h-4" />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPosCustomerName(apt.customer_name);
+                                    setPosCustomerPhone(apt.customer_phone);
+                                    const items = apt.services.map(s => {
+                                      const fullSrv = services.find(x => x.id === s.id) || services[0];
+                                      return { service: fullSrv, quantity: 1, staffId: apt.assigned_staff_id };
+                                    });
+                                    setPosSelectedItems(items);
+                                    handleNavigateTab('pos');
+                                  }}
+                                  className="p-1.5 text-[#5B132B] hover:bg-[#FAF4F0] rounded-lg font-bold cursor-pointer"
+                                  title="Convert to POS Bill"
+                                >
+                                  <Receipt className="w-4 h-4" />
+                                </button>
+                                {canDeleteOrRestore && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setConfirmActionInput('');
+                                      setConfirmActionError('');
+                                      setConfirmActionModal({
+                                        isOpen: true,
+                                        title: `Delete Appointment (${apt.booking_reference})`,
+                                        description: 'Delete this appointment? This action will remove it from active records.',
+                                        confirmLabel: 'Delete Appointment',
+                                        loadingLabel: 'Deleting...',
+                                        inputLabel: 'Deletion Reason (optional)',
+                                        inputPlaceholder: 'e.g. Duplicate booking / test entry',
+                                        inputRequired: false,
+                                        onConfirm: async (reason) => {
+                                          await api.softDeleteAppointment(apt.id, (reason || '').trim(), currentUser.name);
+                                          await loadAllData();
+                                          toast.success(`Appointment ${apt.booking_reference} moved to Deleted records`);
+                                        }
+                                      });
+                                    }}
+                                    className="p-1.5 text-rose-600 hover:text-white hover:bg-rose-600 rounded-lg transition-colors cursor-pointer"
+                                    title="Delete appointment (SUPERADMIN / ADMIN / OWNER only)"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                )}
+                              </>
+                            )}
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
+                  )}
               </div>
             </div>
           );
@@ -3505,10 +3766,25 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           {/* 5. PAYMENTS & RECONCILIATION MODULE */}
           {/* ================================================================= */}
           {activeTab === 'payments' && (() => {
-            const filteredPayments = payments
+            const viewingDeletedLedger = canDeleteOrRestore && ledgerDeletedFilter === 'deleted';
+            const sourcePayments = viewingDeletedLedger ? deletedPayments : payments;
+            const sourceOrders = viewingDeletedLedger ? deletedOrders : orders;
+            const todayKolkata = getKolkataDateString(new Date());
+            const staffAssignedBranchId = currentUser?.branch_id || 'tgl-gachibowli-main';
+            const staffBranchName = branches.find(b => b.id === staffAssignedBranchId)?.name || 'Assigned Branch';
+
+            const filteredPayments = sourcePayments
               .slice()
               .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
               .filter(p => {
+                // Defensive UI guard: Staff roles strictly see ONLY today's Asia/Kolkata active records for their assigned branch
+                if (!fullPaymentLedgerAccess) {
+                  if (p.deleted_at) return false;
+                  if (getKolkataDateString(p.created_at) !== todayKolkata) return false;
+                  const pBranch = p.branch_id || 'tgl-gachibowli-main';
+                  if (pBranch !== staffAssignedBranchId) return false;
+                }
+
                 // 1. Search by Bill Number, Customer Name or Mobile
                 if (ledgerSearch.trim()) {
                   const q = ledgerSearch.trim().toLowerCase();
@@ -3520,8 +3796,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   if (!match) return false;
                 }
 
-                // 2. Branch Filter
-                if (ledgerBranchFilter !== 'all') {
+                // 2. Branch Filter (OWNER / ADMIN / SUPERADMIN only)
+                if (fullPaymentLedgerAccess && ledgerBranchFilter !== 'all') {
                   const pBranch = p.branch_id || 'tgl-gachibowli-main';
                   if (pBranch !== ledgerBranchFilter) return false;
                 }
@@ -3531,10 +3807,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   if (p.payment_mode !== ledgerModeFilter) return false;
                 }
 
-                // 4. Date Filtering in Asia/Kolkata Timezone
-                if (ledgerDateFilter !== 'all') {
+                // 4. Date Filtering in Asia/Kolkata Timezone (OWNER / ADMIN / SUPERADMIN only)
+                if (fullPaymentLedgerAccess && ledgerDateFilter !== 'all') {
                   const recordDateKolkata = getKolkataDateString(p.created_at);
-                  const todayKolkata = getKolkataDateString(new Date());
 
                   if (ledgerDateFilter === 'today') {
                     if (recordDateKolkata !== todayKolkata) return false;
@@ -3567,24 +3842,25 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 return true;
               });
 
-            // Calculate KPI Totals for Filtered Payments
-            const ledgerTotalBills = filteredPayments.length;
-            const ledgerTotalSales = filteredPayments.reduce((sum, p) => {
-              const matchingOrder = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+            // Calculate KPI Totals strictly for active filtered payments (deleted bills never included in active totals)
+            const activeForTotals = viewingDeletedLedger ? [] : filteredPayments;
+            const ledgerTotalBills = activeForTotals.length;
+            const ledgerTotalSales = activeForTotals.reduce((sum, p) => {
+              const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
               const sub = p.subtotal ?? matchingOrder?.subtotal ?? p.amount;
               return sum + Number(sub || 0);
             }, 0);
-            const ledgerTotalDiscount = filteredPayments.reduce((sum, p) => {
-              const matchingOrder = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+            const ledgerTotalDiscount = activeForTotals.reduce((sum, p) => {
+              const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
               const disc = p.discount ?? matchingOrder?.discount ?? 0;
               return sum + Number(disc || 0);
             }, 0);
-            const ledgerTotalGST = filteredPayments.reduce((sum, p) => {
-              const matchingOrder = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+            const ledgerTotalGST = activeForTotals.reduce((sum, p) => {
+              const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
               const tax = p.tax_amount ?? matchingOrder?.tax_amount ?? 0;
               return sum + Number(tax || 0);
             }, 0);
-            const ledgerTotalCollected = filteredPayments.reduce((sum, p) => {
+            const ledgerTotalCollected = activeForTotals.reduce((sum, p) => {
               if (p.status === 'Success') {
                 return sum + Number(p.amount || 0);
               }
@@ -3592,12 +3868,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             }, 0);
 
             const handleOpenOrderDetails = (p: PaymentRecord) => {
-              const ord = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+              const ord = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
               setOrderDetailsModal({ isOpen: true, order: ord || null, payment: p });
             };
 
             const handleOpenOrderEdit = (p: PaymentRecord) => {
-              const ord = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+              if (!fullPaymentLedgerAccess) return;
+              const ord = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
               setOrderEditModal({ isOpen: true, order: ord || null, payment: p });
               setEditOrderDiscount(ord?.discount ?? p.discount ?? 0);
               setEditOrderPaymentMode((ord?.primary_payment_mode || p.payment_mode || 'Cash') as any);
@@ -3614,110 +3891,187 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div>
                     <h3 className="font-serif font-bold text-base text-slate-900">
-                      Payment Ledger & Order Settlements
+                      {fullPaymentLedgerAccess ? 'Payment Ledger & Order Settlements' : "Today's Payment Ledger (Branch View)"}
                     </h3>
                     <span className="text-xs text-slate-500">
-                      Real-time settlements across UPI, Cash, Cards, and online appointment bookings (Asia/Kolkata)
+                      {fullPaymentLedgerAccess
+                        ? 'Real-time settlements across UPI, Cash, Cards, and online appointment bookings (Asia/Kolkata)'
+                        : `Showing today's (${todayKolkata}) active settlements for ${staffBranchName} only (12:00 AM – 11:59 PM IST)`}
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => loadAllData()}
-                    className="self-start sm:self-auto px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                    title="Refresh payment records from Supabase"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#5B132B]' : ''}`} />
-                    <span>Refresh Ledger</span>
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                    {canDeleteOrRestore && (
+                      <div className="inline-flex items-center bg-slate-100 p-0.5 rounded-xl border border-slate-200">
+                        <button
+                          type="button"
+                          onClick={() => setLedgerDeletedFilter('active')}
+                          className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
+                            ledgerDeletedFilter === 'active'
+                              ? 'bg-[#5B132B] text-white shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Active ({payments.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLedgerDeletedFilter('deleted');
+                            loadDeletedLedger();
+                          }}
+                          className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-1 ${
+                            ledgerDeletedFilter === 'deleted'
+                              ? 'bg-rose-600 text-white shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Deleted{deletedPayments.length > 0 ? ` (${deletedPayments.length})` : ''}</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {fullPaymentLedgerAccess && !viewingDeletedLedger && (
+                      <ActionButton
+                        type="button"
+                        loading={exportingLedgerCsv}
+                        loadingText="Exporting..."
+                        onClick={handleExportPaymentLedgerCsv}
+                        className="px-3.5 py-2 text-xs font-semibold text-[#5B132B] bg-[#FAF4F0] border border-[#E6D5CC] hover:bg-[#F3E6DE] rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Export CSV</span>
+                      </ActionButton>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => viewingDeletedLedger ? loadDeletedLedger() : loadAllData()}
+                      className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                      title="Refresh payment records"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${(loading || loadingDeletedLedger) ? 'animate-spin text-[#5B132B]' : ''}`} />
+                      <span>Refresh Ledger</span>
+                    </button>
+                  </div>
                 </div>
 
-                {/* KPI Summary Cards */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Total Bills</span>
-                    <div className="text-lg font-extrabold text-slate-900">{ledgerTotalBills}</div>
-                    <span className="text-[10px] text-slate-500">Filtered bills</span>
+                {/* Staff Today-Only Branch Restriction Banner */}
+                {!fullPaymentLedgerAccess && (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
+                    <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Staff Today-Only Scope ({todayKolkata} · {staffBranchName}): </span>
+                      Historical dates, other branches, exports, edits, refunds, and deletions are restricted to Owner, Admin, and Superadmin accounts.
+                    </div>
                   </div>
+                )}
 
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Gross Sales</span>
-                    <div className="text-lg font-extrabold text-[#5B132B]">₹{ledgerTotalSales.toFixed(2)}</div>
-                    <span className="text-[10px] text-slate-500">Before discounts</span>
+                {/* Deleted Bills Archive Notice */}
+                {viewingDeletedLedger && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900 flex items-start gap-2.5">
+                    <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Deleted Bills Archive ({filteredPayments.length}): </span>
+                      Soft-deleted bills and their linked payments/order items are completely excluded from active ledger totals and sales reports. Use Restore to reinstate a full bill transaction.
+                    </div>
                   </div>
+                )}
 
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Discounts</span>
-                    <div className="text-lg font-extrabold text-amber-700">₹{ledgerTotalDiscount.toFixed(2)}</div>
-                    <span className="text-[10px] text-slate-500">Customer savings</span>
-                  </div>
+                {/* KPI Summary Cards (Active ledger totals only — hidden when viewing Deleted Archive) */}
+                {!viewingDeletedLedger && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                    <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                        {fullPaymentLedgerAccess ? 'Total Bills' : "Today's Bills"}
+                      </span>
+                      <div className="text-lg font-extrabold text-slate-900">{ledgerTotalBills}</div>
+                      <span className="text-[10px] text-slate-500">{fullPaymentLedgerAccess ? 'Filtered bills' : staffBranchName}</span>
+                    </div>
 
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">GST (5%)</span>
-                    <div className="text-lg font-extrabold text-slate-800">₹{ledgerTotalGST.toFixed(2)}</div>
-                    <span className="text-[10px] text-slate-500">Tax component</span>
-                  </div>
+                    <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Gross Sales</span>
+                      <div className="text-lg font-extrabold text-[#5B132B]">₹{ledgerTotalSales.toFixed(2)}</div>
+                      <span className="text-[10px] text-slate-500">Before discounts</span>
+                    </div>
 
-                  <div className="bg-white p-3.5 rounded-2xl border border-emerald-200 bg-gradient-to-br from-white to-emerald-50/40 shadow-xs col-span-2 sm:col-span-1">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 block mb-1">Total Collected</span>
-                    <div className="text-lg font-extrabold text-emerald-700">₹{ledgerTotalCollected.toFixed(2)}</div>
-                    <span className="text-[10px] text-emerald-600 font-medium">Settled revenue</span>
+                    <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Discounts</span>
+                      <div className="text-lg font-extrabold text-amber-700">₹{ledgerTotalDiscount.toFixed(2)}</div>
+                      <span className="text-[10px] text-slate-500">Customer savings</span>
+                    </div>
+
+                    <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">GST (5%)</span>
+                      <div className="text-lg font-extrabold text-slate-800">₹{ledgerTotalGST.toFixed(2)}</div>
+                      <span className="text-[10px] text-slate-500">Tax component</span>
+                    </div>
+
+                    <div className="bg-white p-3.5 rounded-2xl border border-emerald-200 bg-gradient-to-br from-white to-emerald-50/40 shadow-xs col-span-2 sm:col-span-1">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 block mb-1">
+                        {fullPaymentLedgerAccess ? 'Total Collected' : "Today's Collected"}
+                      </span>
+                      <div className="text-lg font-extrabold text-emerald-700">₹{ledgerTotalCollected.toFixed(2)}</div>
+                      <span className="text-[10px] text-emerald-600 font-medium">Settled revenue</span>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {/* Filter Controls Bar */}
                 <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    {/* Date Presets */}
-                    <div className="flex flex-wrap items-center gap-1">
-                      {[
-                        { id: 'all', label: 'All Time' },
-                        { id: 'today', label: 'Today' },
-                        { id: 'yesterday', label: 'Yesterday' },
-                        { id: 'this_week', label: 'This Week' },
-                        { id: 'this_month', label: 'This Month' },
-                        { id: 'custom', label: 'Custom Range' }
-                      ].map(tab => (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          onClick={() => setLedgerDateFilter(tab.id as any)}
-                          className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                            ledgerDateFilter === tab.id
-                              ? 'bg-[#5B132B] text-white shadow-xs'
-                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                          }`}
-                        >
-                          {tab.label}
-                        </button>
-                      ))}
-                    </div>
-
-                    {/* Custom Range Inputs */}
-                    {ledgerDateFilter === 'custom' && (
-                      <div className="flex items-center gap-2 pl-2 border-l border-slate-200">
-                        <div className="flex items-center gap-1 text-xs">
-                          <span className="text-slate-500 text-[11px]">From:</span>
-                          <input
-                            type="date"
-                            value={ledgerStartDate}
-                            onChange={e => setLedgerStartDate(e.target.value)}
-                            className="p-1 text-xs bg-slate-50 border border-slate-200 rounded-md focus:bg-white"
-                          />
-                        </div>
-                        <div className="flex items-center gap-1 text-xs">
-                          <span className="text-slate-500 text-[11px]">To:</span>
-                          <input
-                            type="date"
-                            value={ledgerEndDate}
-                            onChange={e => setLedgerEndDate(e.target.value)}
-                            className="p-1 text-xs bg-slate-50 border border-slate-200 rounded-md focus:bg-white"
-                          />
-                        </div>
+                  {/* Date Presets & Custom Range strictly restricted to OWNER / ADMIN / SUPERADMIN */}
+                  {fullPaymentLedgerAccess && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1">
+                        {[
+                          { id: 'all', label: 'All Time' },
+                          { id: 'today', label: 'Today' },
+                          { id: 'yesterday', label: 'Yesterday' },
+                          { id: 'this_week', label: 'This Week' },
+                          { id: 'this_month', label: 'This Month' },
+                          { id: 'custom', label: 'Custom Range' }
+                        ].map(tab => (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            onClick={() => setLedgerDateFilter(tab.id as any)}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                              ledgerDateFilter === tab.id
+                                ? 'bg-[#5B132B] text-white shadow-xs'
+                                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                            }`}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
                       </div>
-                    )}
-                  </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-2 border-t border-slate-100">
+                      {ledgerDateFilter === 'custom' && (
+                        <div className="flex items-center gap-2 pl-2 border-l border-slate-200">
+                          <div className="flex items-center gap-1 text-xs">
+                            <span className="text-slate-500 text-[11px]">From:</span>
+                            <input
+                              type="date"
+                              value={ledgerStartDate}
+                              onChange={e => setLedgerStartDate(e.target.value)}
+                              className="p-1 text-xs bg-slate-50 border border-slate-200 rounded-md focus:bg-white"
+                            />
+                          </div>
+                          <div className="flex items-center gap-1 text-xs">
+                            <span className="text-slate-500 text-[11px]">To:</span>
+                            <input
+                              type="date"
+                              value={ledgerEndDate}
+                              onChange={e => setLedgerEndDate(e.target.value)}
+                              className="p-1 text-xs bg-slate-50 border border-slate-200 rounded-md focus:bg-white"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className={`grid grid-cols-1 ${fullPaymentLedgerAccess ? 'sm:grid-cols-3 pt-2 border-t border-slate-100' : 'sm:grid-cols-2'} gap-2.5`}>
                     {/* Search */}
                     <div className="relative">
                       <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -3725,7 +4079,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         type="search"
                         value={ledgerSearch}
                         onChange={e => setLedgerSearch(e.target.value)}
-                        placeholder="Search bill # or mobile..."
+                        placeholder="Search bill #, customer, or mobile..."
                         className="w-full pl-9 pr-8 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#5B132B]/20"
                       />
                       {ledgerSearch && (
@@ -3739,20 +4093,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       )}
                     </div>
 
-                    {/* Branch Filter */}
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-[11px] font-medium text-slate-500 shrink-0">Branch:</span>
-                      <select
-                        value={ledgerBranchFilter}
-                        onChange={e => setLedgerBranchFilter(e.target.value)}
-                        className="w-full p-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white cursor-pointer"
-                      >
-                        <option value="all">All Branches</option>
-                        {branches.map(b => (
-                          <option key={b.id} value={b.id}>{b.name}</option>
-                        ))}
-                      </select>
-                    </div>
+                    {/* Branch Filter (OWNER / ADMIN / SUPERADMIN only) */}
+                    {fullPaymentLedgerAccess && (
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[11px] font-medium text-slate-500 shrink-0">Branch:</span>
+                        <select
+                          value={ledgerBranchFilter}
+                          onChange={e => setLedgerBranchFilter(e.target.value)}
+                          className="w-full p-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white cursor-pointer"
+                        >
+                          <option value="all">All Branches</option>
+                          {branches.map(b => (
+                            <option key={b.id} value={b.id}>{b.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
                     {/* Payment Mode Filter */}
                     <div className="flex items-center gap-1.5">
@@ -3776,20 +4132,33 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
                 {/* Payments Table */}
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
-                  {filteredPayments.length === 0 ? (
+                  {viewingDeletedLedger && loadingDeletedLedger ? (
+                    <div className="p-12 flex items-center justify-center gap-2 text-xs text-slate-500">
+                      <Loader2 className="w-4 h-4 animate-spin text-[#5B132B]" />
+                      <span>Loading deleted bills archive…</span>
+                    </div>
+                  ) : filteredPayments.length === 0 ? (
                     <div className="p-12 text-center space-y-3">
                       <div className="w-14 h-14 bg-slate-100 text-slate-400 rounded-full flex items-center justify-center mx-auto">
                         <CreditCard className="w-7 h-7" />
                       </div>
                       <h4 className="font-serif font-bold text-base text-slate-800">
-                        No payment records found
+                        {viewingDeletedLedger
+                          ? 'No deleted payment ledger bills found'
+                          : fullPaymentLedgerAccess
+                            ? 'No payment records found'
+                            : "No bills recorded yet today for your branch"}
                       </h4>
                       <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                        {ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all'
-                          ? 'No payments match the active filter criteria. Try resetting the filters.'
-                          : 'Every POS bill and completed appointment payment will automatically appear here with complete audit trail and WhatsApp delivery logs.'}
+                        {viewingDeletedLedger
+                          ? 'Deleted bills and their linked payments will appear here for authorized restore and audit review.'
+                          : !fullPaymentLedgerAccess
+                            ? `Only today's (${todayKolkata}) active bills for ${staffBranchName} are visible to staff.`
+                            : (ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all')
+                              ? 'No payments match the active filter criteria. Try resetting the filters.'
+                              : 'Every POS bill and completed appointment payment will automatically appear here with complete audit trail and WhatsApp delivery logs.'}
                       </p>
-                      {(ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all') && (
+                      {fullPaymentLedgerAccess && (ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all') && (
                         <button
                           type="button"
                           onClick={() => {
@@ -3818,22 +4187,23 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <th className="p-3.5">Discount</th>
                             <th className="p-3.5">GST (5%)</th>
                             <th className="p-3.5">Paid Total</th>
-                            <th className="p-3.5">Status</th>
-                            <th className="p-3.5">Receipt WhatsApp</th>
+                            <th className="p-3.5">{viewingDeletedLedger ? 'Deletion Audit' : 'Status'}</th>
+                            {!viewingDeletedLedger && <th className="p-3.5">Receipt WhatsApp</th>}
                             <th className="p-3.5 text-right">Actions</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                           {filteredPayments.map(p => {
-                            const matchingOrder = orders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+                            const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
                             const receiptStatus = matchingOrder?.receipt_whatsapp_status || matchingOrder?.whatsapp_status || p.receipt_whatsapp_status || 'queued';
                             const branchName = branches.find(b => b.id === p.branch_id)?.name || p.branch_name || (p.branch_id === 'brn-1793346038689' ? 'Kondapur' : 'Gachibowli Main');
                             const subtotalVal = p.subtotal ?? matchingOrder?.subtotal ?? p.amount;
                             const discountVal = p.discount ?? matchingOrder?.discount ?? 0;
                             const taxVal = p.tax_amount ?? matchingOrder?.tax_amount ?? 0;
+                            const targetOrderId = matchingOrder?.id || p.order_id;
 
                             return (
-                              <tr key={p.id} className="hover:bg-slate-50 transition-colors">
+                              <tr key={p.id} className={`hover:bg-slate-50 transition-colors ${viewingDeletedLedger ? 'bg-rose-50/20' : ''}`}>
                                 <td className="p-3.5 font-mono font-bold text-[#5B132B]">
                                   {p.bill_number}
                                 </td>
@@ -3842,7 +4212,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                 </td>
                                 <td className="p-3.5">
                                   <div className="font-semibold text-slate-900">{p.customer_name}</div>
-                                  <div className="font-mono text-[11px] text-slate-500">+91 {p.customer_phone}</div>
+                                  <div className="font-mono text-[11px] text-slate-500">{p.customer_phone || 'No phone'}</div>
                                 </td>
                                 <td className="p-3.5">
                                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-700">
@@ -3868,85 +4238,181 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                   ₹{Number(p.amount || 0).toFixed(2)}
                                 </td>
                                 <td className="p-3.5">
-                                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                    p.status === 'Success' ? 'bg-emerald-100 text-emerald-800' :
-                                    p.status === 'Refunded' ? 'bg-amber-100 text-amber-800' :
-                                    'bg-rose-100 text-rose-800'
-                                  }`}>
-                                    {p.status}
-                                  </span>
-                                </td>
-                                <td className="p-3.5">
-                                  <div className="flex items-center gap-1.5">
+                                  {viewingDeletedLedger ? (
+                                    <div className="text-[11px] space-y-0.5">
+                                      <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">
+                                        Deleted
+                                      </span>
+                                      <div className="text-slate-600 font-medium">By {p.deleted_by || matchingOrder?.deleted_by || 'Admin'}</div>
+                                      {(p.deleted_at || matchingOrder?.deleted_at) && (
+                                        <div className="text-slate-400 text-[10px]">{formatKolkataDateTime((p.deleted_at || matchingOrder?.deleted_at) || undefined)}</div>
+                                      )}
+                                      {(p.deletion_reason || matchingOrder?.deletion_reason) && (
+                                        <div className="text-slate-600 italic text-[10px]">“{p.deletion_reason || matchingOrder?.deletion_reason}”</div>
+                                      )}
+                                    </div>
+                                  ) : (
                                     <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                      receiptStatus === 'delivered' || receiptStatus === 'read' ? 'bg-emerald-100 text-emerald-800' :
-                                      receiptStatus === 'sent' ? 'bg-blue-100 text-blue-800' :
-                                      receiptStatus === 'failed' ? 'bg-rose-100 text-rose-800' :
-                                      'bg-amber-100 text-amber-800'
+                                      p.status === 'Success' ? 'bg-emerald-100 text-emerald-800' :
+                                      p.status === 'Refunded' ? 'bg-amber-100 text-amber-800' :
+                                      'bg-rose-100 text-rose-800'
                                     }`}>
-                                      {receiptStatus === 'delivered' || receiptStatus === 'read' ? 'Delivered' :
-                                       receiptStatus === 'sent' ? 'Sent' :
-                                       receiptStatus === 'failed' ? 'Failed' : 'Queued'}
+                                      {p.status}
                                     </span>
-                                    {receiptStatus === 'failed' && (matchingOrder || p.order_id) && (
+                                  )}
+                                </td>
+                                {!viewingDeletedLedger && (
+                                  <td className="p-3.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                        receiptStatus === 'read' ? 'bg-sky-100 text-sky-800' :
+                                        receiptStatus === 'delivered' ? 'bg-emerald-100 text-emerald-800' :
+                                        receiptStatus === 'sent' ? 'bg-green-100 text-green-800' :
+                                        receiptStatus === 'failed' ? 'bg-rose-100 text-rose-800' :
+                                        'bg-amber-100 text-amber-800'
+                                      }`}>
+                                        {receiptStatus === 'read' ? 'Read' :
+                                         receiptStatus === 'delivered' ? 'Delivered' :
+                                         receiptStatus === 'sent' ? 'Sent' :
+                                         receiptStatus === 'failed' ? 'Failed' : 'Queued'}
+                                      </span>
+                                      {/* Retry button strictly shown ONLY for failed sends */}
+                                      {receiptStatus === 'failed' && targetOrderId && canSendWaTemplates && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleRetryPosReceipt(targetOrderId)}
+                                          className="text-[10px] font-bold text-rose-600 hover:text-rose-800 underline cursor-pointer"
+                                          title="Retry failed WhatsApp receipt"
+                                        >
+                                          Retry
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                )}
+                                <td className="p-3.5 text-right space-x-1 whitespace-nowrap">
+                                  {viewingDeletedLedger ? (
+                                    canDeleteOrRestore && (
+                                      <ActionButton
+                                        type="button"
+                                        loading={rowAction.isPending(`pay-restore-${p.id}`)}
+                                        loadingText="Restoring..."
+                                        onClick={() => {
+                                          rowAction.runForKey(
+                                            `pay-restore-${p.id}`,
+                                            async () => {
+                                              await api.restorePaymentBill(p.id, currentUser.name);
+                                              await Promise.all([loadAllData(), loadDeletedLedger()]);
+                                            },
+                                            {
+                                              successMessage: `Bill ${p.bill_number} and linked payments restored`,
+                                              errorFallback: 'Failed to restore deleted bill.'
+                                            }
+                                          );
+                                        }}
+                                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold"
+                                      >
+                                        <RotateCcw className="w-3.5 h-3.5" />
+                                        <span>Restore Bill</span>
+                                      </ActionButton>
+                                    )
+                                  ) : (
+                                    <>
+                                      {canSendWaTemplates && targetOrderId && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setRecordWhatsAppModal({
+                                            isOpen: true,
+                                            recordType: 'order',
+                                            recordId: targetOrderId,
+                                            recordLabel: p.bill_number,
+                                            customerName: p.customer_name,
+                                            customerPhone: p.customer_phone
+                                          })}
+                                          className="inline-flex p-1.5 text-emerald-700 hover:text-white hover:bg-emerald-600 rounded-lg transition-colors cursor-pointer align-middle"
+                                          title="Send approved WhatsApp template for this bill"
+                                        >
+                                          <MessageCircle className="w-4 h-4" />
+                                        </button>
+                                      )}
+
                                       <button
                                         type="button"
-                                        onClick={() => handleRetryPosReceipt(matchingOrder?.id || p.order_id)}
-                                        className="text-[10px] font-bold text-rose-600 hover:text-rose-800 underline cursor-pointer"
-                                        title="Retry sending receipt"
+                                        onClick={() => handleOpenOrderDetails(p)}
+                                        className="py-1 px-2.5 text-[11px] font-semibold text-[#5B132B] hover:bg-[#FAF4F0] rounded-lg transition-colors cursor-pointer"
+                                        title="View detailed order line items and pricing"
                                       >
-                                        Retry
+                                        Order Details
                                       </button>
-                                    )}
-                                  </div>
-                                </td>
-                                <td className="p-3.5 text-right space-x-1 whitespace-nowrap">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenOrderDetails(p)}
-                                    className="py-1 px-2.5 text-[11px] font-semibold text-[#5B132B] hover:bg-[#FAF4F0] rounded-lg transition-colors cursor-pointer"
-                                    title="View detailed order line items and pricing"
-                                  >
-                                    Order Details
-                                  </button>
 
-                                  {(isOwner || isManager) && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleOpenOrderEdit(p)}
-                                      className="py-1 px-2.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
-                                      title="Edit Order / Payment Details"
-                                    >
-                                      Edit
-                                    </button>
-                                  )}
+                                      {fullPaymentLedgerAccess && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleOpenOrderEdit(p)}
+                                          className="py-1 px-2.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                                          title="Edit Order / Payment Details"
+                                        >
+                                          Edit
+                                        </button>
+                                      )}
 
-                                  {p.status === 'Success' && isManager && (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setConfirmActionInput('');
-                                        setConfirmActionError('');
-                                        setConfirmActionModal({
-                                          isOpen: true,
-                                          title: `Refund Payment (${p.bill_number})`,
-                                          description: `Issue a refund of ₹${Number(p.amount || 0).toFixed(2)} for ${p.customer_name || 'this customer'}. This action will be recorded in the audit ledger.`,
-                                          confirmLabel: 'Confirm Refund',
-                                          loadingLabel: 'Refunding...',
-                                          inputLabel: 'Reason for Refund *',
-                                          inputPlaceholder: 'e.g. Service cancelled / duplicate charge',
-                                          inputRequired: true,
-                                          onConfirm: async (reason) => {
-                                            await api.refundPayment(p.id, (reason || '').trim(), currentUser.name);
-                                            await loadAllData();
-                                            toast.success(`Payment ${p.bill_number} refunded successfully`);
-                                          }
-                                        });
-                                      }}
-                                      className="py-1 px-2.5 text-[11px] font-bold text-rose-600 hover:bg-rose-50 rounded-lg cursor-pointer"
-                                    >
-                                      Refund
-                                    </button>
+                                      {p.status === 'Success' && fullPaymentLedgerAccess && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setConfirmActionInput('');
+                                            setConfirmActionError('');
+                                            setConfirmActionModal({
+                                              isOpen: true,
+                                              title: `Refund Payment (${p.bill_number})`,
+                                              description: `Issue a refund of ₹${Number(p.amount || 0).toFixed(2)} for ${p.customer_name || 'this customer'}. This action will be recorded in the audit ledger.`,
+                                              confirmLabel: 'Confirm Refund',
+                                              loadingLabel: 'Refunding...',
+                                              inputLabel: 'Reason for Refund *',
+                                              inputPlaceholder: 'e.g. Service cancelled / duplicate charge',
+                                              inputRequired: true,
+                                              onConfirm: async (reason) => {
+                                                await api.refundPayment(p.id, (reason || '').trim(), currentUser.name);
+                                                await loadAllData();
+                                                toast.success(`Payment ${p.bill_number} refunded successfully`);
+                                              }
+                                            });
+                                          }}
+                                          className="py-1 px-2.5 text-[11px] font-bold text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                                        >
+                                          Refund
+                                        </button>
+                                      )}
+
+                                      {canDeleteOrRestore && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setConfirmActionInput('');
+                                            setConfirmActionError('');
+                                            setConfirmActionModal({
+                                              isOpen: true,
+                                              title: `Delete Bill (${p.bill_number})`,
+                                              description: `Delete this bill? This action will remove bill ${p.bill_number} (₹${Number(p.amount || 0).toFixed(2)}) and all linked payments & order items from active records and ledger totals.`,
+                                              confirmLabel: 'Delete Bill',
+                                              loadingLabel: 'Deleting...',
+                                              inputLabel: 'Deletion Reason (optional)',
+                                              inputPlaceholder: 'e.g. Duplicate POS bill / test entry',
+                                              inputRequired: false,
+                                              onConfirm: async (reason) => {
+                                                await api.softDeletePaymentBill(p.id, (reason || '').trim(), currentUser.name);
+                                                await loadAllData();
+                                                toast.success(`Bill ${p.bill_number} and linked payments moved to Deleted archive`);
+                                              }
+                                            });
+                                          }}
+                                          className="inline-flex p-1.5 text-rose-600 hover:text-white hover:bg-rose-600 rounded-lg transition-colors cursor-pointer align-middle"
+                                          title="Soft-delete complete bill & linked payments (SUPERADMIN / ADMIN / OWNER only)"
+                                        >
+                                          <Trash2 className="w-4 h-4" />
+                                        </button>
+                                      )}
+                                    </>
                                   )}
                                 </td>
                               </tr>
@@ -7356,6 +7822,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           </form>
         </div>
       )}
+
+      {/* Shared Send WhatsApp Template Modal (Appointments & Payment Ledger) */}
+      <RecordWhatsAppTemplateModal
+        isOpen={recordWhatsAppModal.isOpen}
+        recordType={recordWhatsAppModal.recordType}
+        recordId={recordWhatsAppModal.recordId}
+        recordLabel={recordWhatsAppModal.recordLabel}
+        initialCustomerName={recordWhatsAppModal.customerName}
+        initialCustomerPhone={recordWhatsAppModal.customerPhone}
+        onClose={() => setRecordWhatsAppModal(prev => ({ ...prev, isOpen: false }))}
+        onSent={() => {
+          loadAllData();
+        }}
+      />
     </div>
   );
 };
