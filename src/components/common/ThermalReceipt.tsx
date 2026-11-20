@@ -19,6 +19,33 @@ interface ThermalReceiptProps {
   salonPhone?: string;
 }
 
+function resolveThermalBranchName(input: {
+  branchName?: string | null;
+  branchCode?: string | null;
+  branchId?: string | null;
+}): string {
+  const code = String(input.branchCode || '').trim().toUpperCase();
+  if (code === 'GACHI' || code === 'GCB-01') return 'Gachibowli';
+  if (code === 'KONDA' || code === 'KND-02') return 'Kondapur';
+
+  const id = String(input.branchId || '').trim();
+  if (id === 'tgl-gachibowli-main') return 'Gachibowli';
+  if (id === 'brn-1793346038689') return 'Kondapur';
+
+  const raw = String(input.branchName || '').trim();
+  if (raw) {
+    if (/gachibowli/i.test(raw)) return 'Gachibowli';
+    if (/kondapur/i.test(raw)) return 'Kondapur';
+    const cleaned = raw
+      .split(',')[0]
+      .replace(/\s*(Main\s+Flagship|Flagship|Branch)\s*$/i, '')
+      .trim();
+    if (cleaned) return cleaned;
+  }
+
+  return 'Gachibowli';
+}
+
 export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
   order,
   appointment,
@@ -30,6 +57,16 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
   const reprintAction = useAsyncAction();
   const [browserPrinting, setBrowserPrinting] = React.useState(false);
   const [reprintFeedback, setReprintFeedback] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const displayBranchName = order
+    ? resolveThermalBranchName({
+        branchName: order.branch_name,
+        branchCode: order.branch_code,
+        branchId: order.branch_id,
+      })
+    : resolveThermalBranchName({
+        branchId: appointment?.branch_id,
+      });
 
   const handlePrint = () => {
     if (browserPrinting) return;
@@ -46,6 +83,8 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
     setReprintFeedback(null);
     const payload = order
       ? {
+          branch_name: displayBranchName,
+          branch_code: order.branch_code || (displayBranchName === 'Kondapur' ? 'KONDA' : 'GACHI'),
           bill_number: order.bill_number,
           customer_name: order.customer_name,
           customer_phone: order.customer_phone,
@@ -56,9 +95,10 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
           total: order.grand_total,
           payment_method: order.primary_payment_mode,
           payment_status: order.payment_status,
-          date: new Date(order.created_at).toLocaleString('en-IN')
+          date: new Date(order.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
         }
       : {
+          branch_name: displayBranchName,
           booking_reference: appointment?.booking_reference,
           customer_name: appointment?.customer_name,
           customer_phone: appointment?.customer_phone,
@@ -116,13 +156,16 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
             />
             <h3 className="font-serif font-bold text-base text-slate-900 tracking-tight">THE GLOSSY LOOKS</h3>
             <p className="text-[10px] text-slate-600">Professional Women Salon & Bridal Studio</p>
-            <p className="text-[9px] text-slate-500 mt-0.5">31, Vinayak Nagar, Gachibowli, Hyderabad - 500032</p>
-            <p className="text-[9px] text-slate-500">Phone / WhatsApp: {salonPhone ? (salonPhone.startsWith('+') ? salonPhone : `+91 ${salonPhone.replace(/\D/g, '').slice(-10)}`) : '+91 9848012345'}</p>
+            <p className="text-[9px] text-slate-500 mt-0.5">Phone / WhatsApp: {salonPhone ? (salonPhone.startsWith('+') ? salonPhone : `+91 ${salonPhone.replace(/\D/g, '').slice(-10)}`) : '+91 9848012345'}</p>
             <p className="text-[9px] text-slate-400">Hours: 10:00 AM - 10:00 PM</p>
           </div>
 
           {type === 'bill' && order && (
             <>
+              <div className="flex justify-between py-0.5 text-[10px]">
+                <span className="text-slate-500">Branch:</span>
+                <span className="font-bold text-slate-900">{displayBranchName}</span>
+              </div>
               <div className="flex justify-between py-0.5 text-[10px]">
                 <span className="text-slate-500">Bill No:</span>
                 <span className="font-bold text-slate-900">{order.bill_number}</span>
@@ -179,7 +222,7 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
                 )}
                 {order.tax_amount > 0 && (
                   <div className="flex justify-between text-slate-500">
-                    <span>GST (5%):</span>
+                    <span>Tax:</span>
                     <span>₹{order.tax_amount.toFixed(2)}</span>
                   </div>
                 )}
@@ -203,6 +246,10 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
 
           {type === 'service_ticket' && appointment && (
             <>
+              <div className="flex justify-between py-0.5 text-[10px]">
+                <span className="text-slate-500">Branch:</span>
+                <span className="font-bold text-slate-900">{displayBranchName}</span>
+              </div>
               <div className="flex justify-between py-0.5 text-[10px]">
                 <span className="text-slate-500">Booking Ref:</span>
                 <span className="font-bold text-slate-900">{appointment.booking_reference}</span>

@@ -1847,41 +1847,52 @@ export class SupabaseSalonRepository implements ISalonRepository {
     return ord;
   }
 
-  public async createOrder(orderData: Omit<Order, 'id' | 'bill_number' | 'created_at'>, performedBy: string): Promise<Order> {
+  public async getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null> {
+    const clean = String(idempotencyKey || '').trim();
+    if (!clean) return null;
+    try {
+      const { data: existing } = await this.client
+        .from('orders')
+        .select('*')
+        .eq('idempotency_key', clean)
+        .maybeSingle();
+      if (!existing) return null;
+      const fullOrder = await this.getOrderById(existing.id);
+      return fullOrder || (existing as Order);
+    } catch {
+      return null;
+    }
+  }
+
+  public async createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order> {
     // 1. Check idempotency if idempotency_key is provided
     if (orderData.idempotency_key) {
-      try {
-        const { data: existing } = await this.client
-          .from('orders')
-          .select('*')
-          .eq('idempotency_key', orderData.idempotency_key)
-          .maybeSingle();
-        if (existing) {
-          const fullOrder = await this.getOrderById(existing.id);
-          if (fullOrder) return fullOrder;
-          return existing as Order;
-        }
-      } catch {
-        // Non-fatal if idempotency_key column doesn't exist yet
-      }
+      const existing = await this.getOrderByIdempotencyKey(orderData.idempotency_key);
+      if (existing) return existing;
     }
 
-    const billNum = `TGL-${new Date().getFullYear()}-${Date.now().toString().slice(-4)}`;
+    // 2. Fail closed: local bill number generation is disabled; SMAV central bill_number is mandatory
+    const centralBillNum = String(orderData.bill_number || '').trim();
+    if (!centralBillNum) {
+      throw new Error('CENTRAL_BILL_NUMBER_REQUIRED: Local bill number generation is disabled. Reserve a central bill number from SMAV before creating a bill.');
+    }
+
     const { items = [], branch_id, ...orderFields } = orderData;
-    
+
     let insertedOrder: any = null;
     const orderRow: any = {
       ...orderFields,
-      bill_number: billNum,
-      branch_id: branch_id || null
+      bill_number: centralBillNum,
+      branch_id: branch_id || null,
+      is_legacy_bill: orderData.is_legacy_bill ?? false
     };
 
     let { data, error } = await this.client.from('orders').insert(orderRow).select().single();
 
-    // Automatically strip any columns that don't exist in Supabase schema cache
+    // Automatically strip optional columns that don't exist in Supabase schema cache (NEVER strip bill_number)
     while (error && (error.code === 'PGRST204' || (error.message && error.message.includes('schema cache')))) {
       const match = error.message.match(/Could not find the '([^']+)' column/);
-      if (match && match[1] && orderRow[match[1]] !== undefined) {
+      if (match && match[1] && match[1] !== 'bill_number' && orderRow[match[1]] !== undefined) {
         const colName = match[1];
         if (colName === 'branch_id' && branch_id) {
           orderRow.notes = orderRow.notes ? `${orderRow.notes} [Branch: ${branch_id}]` : `[Branch: ${branch_id}]`;
@@ -1900,22 +1911,21 @@ export class SupabaseSalonRepository implements ISalonRepository {
 
     // Insert order line items into public.order_items
     if (insertedOrder?.id && items && items.length > 0) {
-      try {
-        const itemRows = items.map(item => ({
-          order_id: insertedOrder.id,
-          service_id: item.service_id || null,
-          product_id: item.product_id || null,
-          item_name: item.item_name,
-          item_type: item.item_type || 'service',
-          quantity: item.quantity || 1,
-          unit_price: item.unit_price,
-          total_price: item.total_price,
-          staff_id: item.staff_id || null,
-          staff_name: item.staff_name || null,
-          commission_amount: item.commission_amount || 0
-        }));
-        await this.client.from('order_items').insert(itemRows);
-      } catch (itemErr) {
+      const itemRows = items.map(item => ({
+        order_id: insertedOrder.id,
+        service_id: item.service_id || null,
+        product_id: item.product_id || null,
+        item_name: item.item_name,
+        item_type: item.item_type || 'service',
+        quantity: item.quantity || 1,
+        unit_price: item.unit_price,
+        total_price: item.total_price,
+        staff_id: item.staff_id || null,
+        staff_name: item.staff_name || null,
+        commission_amount: item.commission_amount || 0
+      }));
+      const { error: itemErr } = await this.client.from('order_items').insert(itemRows);
+      if (itemErr) {
         console.warn('⚠️ Could not insert line items into order_items table:', itemErr);
       }
     }
@@ -1935,38 +1945,43 @@ export class SupabaseSalonRepository implements ISalonRepository {
     }
 
     // Persist payment transaction in public.payments table
-    try {
-      const paymentRow: any = {
-        order_id: insertedOrder.id,
-        bill_number: insertedOrder.bill_number,
-        customer_name: insertedOrder.customer_name,
-        customer_phone: insertedOrder.customer_phone,
-        amount: Number(insertedOrder.paid_amount !== undefined ? insertedOrder.paid_amount : insertedOrder.grand_total) || 0,
-        payment_mode: insertedOrder.primary_payment_mode || 'UPI',
-        status: 'Success',
-        recorded_by: insertedOrder.cashier_name || performedBy,
-        branch_id: insertedOrder.branch_id || null,
-        created_at: insertedOrder.created_at || new Date().toISOString()
-      };
-      let { error: pErr } = await this.client.from('payments').insert(paymentRow);
-      while (pErr && (pErr.code === 'PGRST204' || (pErr.message && pErr.message.includes('schema cache')))) {
-        const match = pErr.message.match(/Could not find the '([^']+)' column/);
-        if (match && match[1] && paymentRow[match[1]] !== undefined) {
-          delete paymentRow[match[1]];
-          pErr = (await this.client.from('payments').insert(paymentRow)).error;
-        } else {
-          break;
-        }
+    const paymentRow: any = {
+      order_id: insertedOrder.id,
+      bill_number: insertedOrder.bill_number,
+      customer_name: insertedOrder.customer_name,
+      customer_phone: insertedOrder.customer_phone,
+      amount: Number(insertedOrder.paid_amount !== undefined ? insertedOrder.paid_amount : insertedOrder.grand_total) || 0,
+      payment_mode: insertedOrder.primary_payment_mode || 'UPI',
+      status: 'Success',
+      recorded_by: insertedOrder.cashier_name || performedBy,
+      branch_id: insertedOrder.branch_id || null,
+      branch_code: orderData.branch_code || insertedOrder.branch_code || null,
+      created_at: insertedOrder.created_at || new Date().toISOString()
+    };
+    let { error: pErr } = await this.client.from('payments').insert(paymentRow);
+    while (pErr && (pErr.code === 'PGRST204' || (pErr.message && pErr.message.includes('schema cache')))) {
+      const match = pErr.message.match(/Could not find the '([^']+)' column/);
+      if (match && match[1] && match[1] !== 'bill_number' && paymentRow[match[1]] !== undefined) {
+        delete paymentRow[match[1]];
+        pErr = (await this.client.from('payments').insert(paymentRow)).error;
+      } else {
+        break;
       }
-    } catch (payErr) {
-      console.warn('⚠️ Could not insert payment record into Supabase:', payErr);
+    }
+    if (pErr) {
+      console.warn('⚠️ Could not insert payment record into Supabase:', pErr);
     }
 
-    await this.logAudit('CREATE_BILL', 'Order', insertedOrder.id, performedBy, `Generated bill ${insertedOrder.bill_number} for ${insertedOrder.customer_name}`);
+    await this.logAudit('CREATE_BILL', 'Order', insertedOrder.id, performedBy, `Generated bill ${insertedOrder.bill_number} (Branch: ${orderData.branch_name || insertedOrder.branch_id || 'N/A'}) for ${insertedOrder.customer_name}`);
 
     return {
       ...insertedOrder,
       branch_id: branch_id || insertedOrder.branch_id,
+      branch_code: orderData.branch_code || insertedOrder.branch_code,
+      branch_name: orderData.branch_name || insertedOrder.branch_name,
+      smav_reservation_id: orderData.smav_reservation_id || insertedOrder.smav_reservation_id,
+      smav_bill_status: orderData.smav_bill_status || insertedOrder.smav_bill_status,
+      is_legacy_bill: insertedOrder.is_legacy_bill ?? false,
       items: items || []
     } as Order;
   }
@@ -1974,6 +1989,14 @@ export class SupabaseSalonRepository implements ISalonRepository {
   public async updateOrder(id: string, data: Partial<Order>): Promise<Order | null> {
     const updatePayload: any = { ...data };
     delete updatePayload.items;
+    // Enforce immutable bill_number: never mutate an existing order's bill_number
+    if (updatePayload.bill_number !== undefined) {
+      const existing = await this.getOrderById(id);
+      if (existing?.bill_number && updatePayload.bill_number !== existing.bill_number) {
+        throw new Error(`IMMUTABLE_BILL_NUMBER: Existing bill_number (${existing.bill_number}) cannot be modified.`);
+      }
+      delete updatePayload.bill_number;
+    }
 
     let { data: updated, error } = await this.client
       .from('orders')

@@ -349,9 +349,31 @@ export const api = {
     const qs = params.toString() ? `?${params.toString()}` : '';
     return fetchJson<Order[]>(`${API_BASE}/orders${qs}`);
   },
+  getPosPermittedBranches: () =>
+    fetchJson<{
+      branches: Array<{
+        id: string;
+        local_branch_id: string;
+        smav_branch_id?: string;
+        code: string;
+        smav_branch_code: string;
+        name: string;
+        full_name: string;
+        is_active: boolean;
+        source: 'smav' | 'local';
+      }>;
+      source: 'smav' | 'local_fallback';
+      warning?: string | null;
+    }>(`${API_BASE}/pos/branches`),
   getOrderById: (orderId: string) => fetchJson<Order>(`${API_BASE}/orders/${orderId}`),
   createOrder: (data: any, adminName?: string) =>
     fetchJson<Order>(`${API_BASE}/orders`, { method: 'POST', body: JSON.stringify(data) }, adminName),
+  retryOrderSmavFinalize: (orderId: string, adminName?: string) =>
+    fetchJson<{ success: boolean; already_finalized?: boolean; order?: Order; error?: string }>(
+      `${API_BASE}/orders/${orderId}/retry-smav-finalize`,
+      { method: 'POST' },
+      adminName
+    ),
   updateOrder: (id: string, data: Partial<Order>, adminName?: string) =>
     fetchJson<Order>(`${API_BASE}/orders/${id}`, { method: 'PATCH', body: JSON.stringify(data) }, adminName),
   softDeleteOrder: (orderId: string, reason?: string, adminName?: string) =>

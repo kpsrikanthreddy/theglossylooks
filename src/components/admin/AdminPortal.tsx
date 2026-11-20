@@ -398,7 +398,21 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [posDiscount, setPosDiscount] = useState<number>(0);
   const [posTip, setPosTip] = useState<number>(0);
   const [posPaymentMode, setPosPaymentMode] = useState<Order['primary_payment_mode'] | ''>('UPI');
-  const [posBranchId, setPosBranchId] = useState('tgl-gachibowli-main');
+  const [posBranchId, setPosBranchId] = useState('');
+  const [posPermittedBranches, setPosPermittedBranches] = useState<Array<{
+    id: string;
+    local_branch_id: string;
+    smav_branch_id?: string;
+    code: string;
+    smav_branch_code: string;
+    name: string;
+    full_name: string;
+    is_active: boolean;
+    source: 'smav' | 'local';
+  }>>([]);
+  const [posBranchesSource, setPosBranchesSource] = useState<'smav' | 'local_fallback' | 'loading'>('loading');
+  const [posBranchesWarning, setPosBranchesWarning] = useState<string | null>(null);
+  const [retryingSmavFinalize, setRetryingSmavFinalize] = useState(false);
   const [posNotes, setPosNotes] = useState('');
   const [posSuccessOrder, setPosSuccessOrder] = useState<Order | null>(null);
   const [posBillingStatus, setPosBillingStatus] = useState<string | null>(null);
@@ -662,7 +676,39 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         ? (hasKondapur ? activeBranches : [...activeBranches, defaultKondapurBranch])
         : [defaultBranchFallback, defaultKondapurBranch];
       setBranches(finalBranches);
-      setPosBranchId(prev => prev || finalBranches[0].id);
+
+      // Load permitted POS branches directly from SMAV (Gachibowli = GACHI, Kondapur = KONDA)
+      try {
+        const smavBranchesRes = await api.getPosPermittedBranches();
+        const permittedList = smavBranchesRes.branches || [];
+        setPosPermittedBranches(permittedList);
+        setPosBranchesSource(smavBranchesRes.source);
+        setPosBranchesWarning(smavBranchesRes.warning || null);
+        // Auto-select ONLY if user is restricted to a single permitted branch; otherwise require explicit selection
+        setPosBranchId(prev => {
+          if (prev && permittedList.some(b => b.id === prev)) return prev;
+          return permittedList.length === 1 ? permittedList[0].id : '';
+        });
+      } catch (branchErr) {
+        console.warn('Could not load permitted POS branches from SMAV:', branchErr);
+        const fallbackPermitted = finalBranches.map(b => {
+          const isKonda = b.id === 'brn-1793346038689' || b.name.toLowerCase().includes('kondapur') || b.smav_branch_code === 'KONDA';
+          return {
+            id: b.id,
+            local_branch_id: b.id,
+            code: b.smav_branch_code || (isKonda ? 'KONDA' : 'GACHI'),
+            smav_branch_code: b.smav_branch_code || (isKonda ? 'KONDA' : 'GACHI'),
+            name: isKonda ? 'Kondapur' : 'Gachibowli',
+            full_name: b.name,
+            is_active: true,
+            source: 'local' as const,
+          };
+        });
+        setPosPermittedBranches(fallbackPermitted);
+        setPosBranchesSource('local_fallback');
+        setPosBranchesWarning('Could not reach SMAV permitted branches endpoint.');
+        setPosBranchId(prev => (prev && fallbackPermitted.some(b => b.id === prev) ? prev : ''));
+      }
 
       // Role-gated fetches: Users & Audit logs ONLY for Owner
       if (isOwnerRole) {
@@ -911,7 +957,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     e.preventDefault();
     if (posCheckoutAction.isLoading) return;
 
-    if (!posBranchId) {
+    const selectedPermittedBranch = posPermittedBranches.find(b => b.id === posBranchId);
+    if (!posBranchId || !selectedPermittedBranch) {
+      toast.warning('Please select a permitted Salon Branch (Gachibowli / GACHI or Kondapur / KONDA) before generating a bill.');
       posBranchRef.current?.focus();
       posBranchRef.current?.reportValidity();
       return;
@@ -960,7 +1008,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
     await posCheckoutAction.run(
       async () => {
-        setPosBillingStatus('Creating bill. Please wait…');
+        setPosBillingStatus(`Reserving central bill number (${selectedPermittedBranch.smav_branch_code}) & creating bill…`);
         setPosBillingError(null);
         setPosFeedbackMessage(null);
         setPosFeedbackStatus(null);
@@ -969,7 +1017,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           idempotency_key: posIdempotencyKey,
           customer_name: posCustomerName,
           customer_phone: posCustomerPhone,
-          branch_id: posBranchId,
+          branch_id: selectedPermittedBranch.id,
+          branch_code: selectedPermittedBranch.smav_branch_code,
           items,
           subtotal,
           discount: posDiscount,
@@ -991,14 +1040,33 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         return newOrder;
       },
       {
-        successMessage: (ord) => `Bill ${ord.bill_number} generated successfully`,
-        errorFallback: 'Error creating POS bill. Please check inputs and try again.',
+        successMessage: (ord) => `Bill ${ord.bill_number} (${ord.branch_name || selectedPermittedBranch.name}) generated successfully`,
+        errorFallback: 'Error creating POS bill. Please check branch selection and SMAV connection, then try again.',
         onError: (msg) => {
           setPosBillingStatus(null);
           setPosBillingError(msg);
         }
       }
     );
+  };
+
+  const handleRetrySmavFinalize = async (orderId: string) => {
+    if (retryingSmavFinalize) return;
+    setRetryingSmavFinalize(true);
+    try {
+      const res = await api.retryOrderSmavFinalize(orderId, currentUser?.name);
+      if (res.success && res.order) {
+        setPosSuccessOrder(prev => (prev && prev.id === orderId ? { ...prev, ...res.order } : prev));
+        toast.success(`Bill ${res.order.bill_number} finalized in SMAV`);
+        loadAllData();
+      } else {
+        toast.error(res.error || 'Could not finalize bill in SMAV yet.');
+      }
+    } catch (err) {
+      toast.error(getSafeErrorMessage(err, 'Failed to finalize bill in SMAV.'));
+    } finally {
+      setRetryingSmavFinalize(false);
+    }
   };
 
   const handleResetPosForm = () => {
@@ -3318,27 +3386,40 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       {/* Modal Body / Form */}
                       <div className="p-4 sm:p-5 overflow-y-auto flex-1 space-y-4">
                         <form onSubmit={handlePosCheckout} className="space-y-4">
-                          {/* 4) Branch Dropdown (Requirement 4: Populated from live branches) */}
+                          {/* Permitted Salon Branch Selector (Loaded from SMAV: Gachibowli = GACHI, Kondapur = KONDA) */}
                           <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                              Salon Branch *
-                            </label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block text-[11px] font-bold text-slate-700">
+                                Salon Branch * (Required before bill generation)
+                              </label>
+                              {posBranchesSource === 'smav' && (
+                                <span className="text-[10px] font-semibold text-emerald-700">SMAV Permitted</span>
+                              )}
+                            </div>
                             <select
                               ref={posBranchRef}
                               required
                               value={posBranchId}
                               onChange={(e) => setPosBranchId(e.target.value)}
-                              className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-[#D4AF37]/50 font-medium text-slate-900 shadow-xs cursor-pointer"
+                              disabled={posPermittedBranches.length === 0}
+                              className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-[#D4AF37]/50 font-medium text-slate-900 shadow-xs cursor-pointer disabled:bg-slate-100 disabled:text-slate-400"
                             >
-                              <option value="" disabled>Select salon branch...</option>
-                              {branches.map((branch) => (
+                              <option value="">Select branch before generating bill…</option>
+                              {posPermittedBranches.map((branch) => (
                                 <option key={branch.id} value={branch.id}>
-                                  {branch.name} — {branch.city || branch.address || 'Flagship'}
+                                  {branch.name} ({branch.smav_branch_code})
                                 </option>
                               ))}
                             </select>
-                            {branches.length === 0 && (
-                              <p className="mt-1 text-[10px] text-amber-700">Loading branch list...</p>
+                            {posPermittedBranches.length === 0 && (
+                              <p className="mt-1 text-[10px] text-rose-700">
+                                {posBranchesSource === 'loading'
+                                  ? 'Loading permitted branches from SMAV...'
+                                  : 'No permitted branches available from SMAV for this account.'}
+                              </p>
+                            )}
+                            {posBranchesWarning && posPermittedBranches.length > 0 && (
+                              <p className="mt-1 text-[10px] text-amber-700">{posBranchesWarning}</p>
                             )}
                           </div>
 
@@ -3625,11 +3706,28 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         {/* Bill Generated Success Banner & Actions with Two-Track WhatsApp Live Status */}
                         {posSuccessOrder && (
                           <div className="mt-4 p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl text-xs text-emerald-900 space-y-3">
-                            <div className="flex items-center justify-between">
+                            <div className="flex flex-col gap-1">
                               <div className="font-bold flex items-center gap-1.5 text-sm text-emerald-950">
                                 <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                                 <span>Bill {posSuccessOrder.bill_number} Created!</span>
                               </div>
+                              <div className="text-[11px] text-emerald-800 font-medium pl-5">
+                                Branch: <span className="font-bold">{posSuccessOrder.branch_name || (posSuccessOrder.branch_code === 'KONDA' ? 'Kondapur' : 'Gachibowli')}</span>
+                                {posSuccessOrder.branch_code ? ` (${posSuccessOrder.branch_code})` : ''} · Bill No: <span className="font-mono font-bold">{posSuccessOrder.bill_number}</span>
+                              </div>
+                              {posSuccessOrder.smav_bill_status === 'finalize_pending' && (
+                                <div className="mt-1 p-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-[11px] flex items-center justify-between gap-2">
+                                  <span>SMAV finalize pending: {posSuccessOrder.smav_finalize_error || 'Temporary network issue'}</span>
+                                  <button
+                                    type="button"
+                                    disabled={retryingSmavFinalize}
+                                    onClick={() => handleRetrySmavFinalize(posSuccessOrder.id)}
+                                    className="px-2.5 py-1 bg-amber-700 hover:bg-amber-800 text-white rounded text-[10px] font-bold cursor-pointer shrink-0 disabled:opacity-50"
+                                  >
+                                    {retryingSmavFinalize ? 'Finalizing...' : 'Retry Finalize'}
+                                  </button>
+                                </div>
+                              )}
                             </div>
 
                             {/* Two Separate Live Status Badges */}
@@ -5502,7 +5600,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           </span>
                         </div>
                         <div className="text-[11px] text-slate-500 mt-0.5">
-                          Target: {job.payload?.customer_name || 'Front Desk'} · {job.payload?.bill_number || job.payload?.booking_reference || 'Ref'}
+                          Target: {job.payload?.customer_name || 'Front Desk'}
+                          {job.payload?.branch_name ? ` · Branch: ${job.payload.branch_name}` : ''}
+                          {' · '}
+                          {job.payload?.bill_number ? `Bill No: ${job.payload.bill_number}` : (job.payload?.booking_reference || 'Ref')}
                         </div>
                       </div>
 

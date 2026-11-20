@@ -356,11 +356,23 @@ export interface OrderItem {
   deletion_reason?: string | null;
 }
 
+export type SmavBillStatus = 'legacy' | 'reserved' | 'finalized' | 'finalize_pending' | 'voided';
+
 export interface Order {
   id: string;
   bill_number: string;
   invoice_number?: string;
   branch_id?: string;
+  branch_code?: string;
+  branch_name?: string;
+  smav_reservation_id?: string;
+  smav_sale_id?: string;
+  smav_bill_status?: SmavBillStatus;
+  smav_finalized_at?: string | null;
+  smav_finalize_error?: string | null;
+  smav_last_event_id?: string | null;
+  smav_last_event_at?: string | null;
+  is_legacy_bill?: boolean;
   appointment_id?: string;
   customer_id?: string;
   customer_name: string;
@@ -417,6 +429,7 @@ export interface PaymentRecord {
   notes?: string;
   recorded_by?: string;
   branch_id?: string;
+  branch_code?: string;
   branch_name?: string;
   subtotal?: number;
   discount?: number;
@@ -646,6 +659,8 @@ export interface SalonBranch {
   id: string; // e.g. 'tgl-gachibowli-main'
   name: string; // e.g. 'Gachibowli Main Flagship'
   code: string; // e.g. 'GCB-01'
+  smav_branch_code?: string; // Canonical SMAV branch code: 'GACHI' | 'KONDA'
+  smav_branch_id?: string;
   address: string;
   city: string;
   phone: string;

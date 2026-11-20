@@ -17,6 +17,8 @@ interface PrintJob {
   appointment_id?: string;
   status: 'Pending' | 'Printing' | 'Printed' | 'Failed' | 'Retried';
   payload: {
+    branch_name?: string;
+    branch_code?: string;
     bill_number?: string;
     booking_reference?: string;
     customer_name: string;
@@ -33,7 +35,6 @@ interface PrintJob {
     date?: string;
     assigned_staff?: string;
     salon_name?: string;
-    salon_address?: string;
     salon_phone?: string;
   };
   created_at: string;
@@ -90,7 +91,7 @@ class SalonPrintAgent {
           device_name: this.deviceName,
           printer_name: this.printerName,
           printer_type: this.printerType,
-          branch: '31, Vinayak Nagar, Gachibowli, Hyderabad'
+          branch: process.env.PRINT_BRANCH_NAME || 'Gachibowli'
         })
       });
       const data = await response.json();
@@ -172,16 +173,17 @@ class SalonPrintAgent {
   private printThermalBill(data: PrintJob['payload']) {
     const divider = '------------------------------------------';
     const doubleDivider = '==========================================';
+    const cleanBranch = data.branch_name || (data.branch_code === 'KONDA' ? 'Kondapur' : 'Gachibowli');
 
     console.log(doubleDivider);
     console.log('             THE GLOSSY LOOKS             ');
     console.log('         Professional Women Salon         ');
-    console.log('  31, Vinayak Nagar, Gachibowli, Hyderabad');
-    console.log('             Ph: +91 9848012345           ');
+    console.log(`             Ph: ${data.salon_phone || '+91 9848012345'}           `);
     console.log(divider);
-    console.log(`BILL NO: ${data.bill_number || 'N/A'}`);
-    console.log(`DATE:    ${data.date || new Date().toLocaleString()}`);
-    console.log(`CLIENT:  ${data.customer_name} (${data.customer_phone})`);
+    console.log(`Branch:  ${cleanBranch}`);
+    console.log(`Bill No: ${data.bill_number || 'N/A'}`);
+    console.log(`Date:    ${data.date || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
+    console.log(`Client:  ${data.customer_name} (${data.customer_phone})`);
     console.log(divider);
     console.log('ITEM / SERVICE                   QTY  AMOUNT(₹)');
     console.log(divider);
@@ -201,7 +203,7 @@ class SalonPrintAgent {
     console.log(divider);
     console.log(`SUBTOTAL:                      ₹${(data.subtotal || 0).toFixed(2)}`);
     if (data.discount) console.log(`DISCOUNT:                     -₹${data.discount.toFixed(2)}`);
-    if (data.tax) console.log(`GST (5%):                      ₹${data.tax.toFixed(2)}`);
+    if (data.tax) console.log(`TAX:                           ₹${data.tax.toFixed(2)}`);
     console.log(doubleDivider);
     console.log(`GRAND TOTAL:                   ₹${(data.total || 0).toFixed(2)}`);
     console.log(`PAYMENT: ${data.payment_method || 'UPI'} (${data.payment_status || 'Paid'})`);
@@ -213,8 +215,10 @@ class SalonPrintAgent {
 
   private printServiceTicket(data: PrintJob['payload']) {
     const divider = '------------------------------------------';
+    const cleanBranch = data.branch_name || 'Gachibowli';
     console.log(divider);
     console.log('      THE GLOSSY LOOKS - SERVICE SLIP     ');
+    console.log(`Branch:   ${cleanBranch}`);
     console.log(`SLIP REF: ${data.booking_reference || 'N/A'}`);
     console.log(`TIME:     ${data.date} at ${data.time_slot}`);
     console.log(`CLIENT:   ${data.customer_name} (${data.customer_phone})`);

@@ -159,7 +159,10 @@ async function run() {
 
     await test('Payment Ledger soft-delete atomically deletes Order + OrderItems + ALL linked Payments and excludes from reports', async () => {
       const ord = await db.createOrder({
+        bill_number: 'TGL-GACHI-20261120-0001',
         branch_id: 'tgl-gachibowli-main',
+        branch_code: 'GACHI',
+        branch_name: 'Gachibowli',
         customer_name: 'Ananya Rao',
         customer_phone: '+919848099887',
         items: [
@@ -227,7 +230,10 @@ async function run() {
     await test('Staff Payment Ledger query returns ONLY today (Asia/Kolkata) active records for assigned branch', async () => {
       const todayBounds = getKolkataTodayBounds();
       const todayBranchA = await db.createOrder({
+        bill_number: 'TGL-GACHI-20261120-0002',
         branch_id: 'tgl-gachibowli-main',
+        branch_code: 'GACHI',
+        branch_name: 'Gachibowli',
         customer_name: 'Today Gachibowli',
         customer_phone: '+919848000001',
         items: [{ item_name: 'Haircut', item_type: 'service', quantity: 1, unit_price: 500, total_price: 500 }],
@@ -236,7 +242,10 @@ async function run() {
       }, 'Staff');
 
       const todayBranchB = await db.createOrder({
+        bill_number: 'TGL-KONDA-20261120-0001',
         branch_id: 'brn-1793346038689',
+        branch_code: 'KONDA',
+        branch_name: 'Kondapur',
         customer_name: 'Today Kondapur',
         customer_phone: '+919848000002',
         items: [{ item_name: 'Haircut', item_type: 'service', quantity: 1, unit_price: 600, total_price: 600 }],
@@ -245,7 +254,10 @@ async function run() {
       }, 'Staff');
 
       const yesterdayBranchA = await db.createOrder({
+        bill_number: 'TGL-GACHI-20261118-0001',
         branch_id: 'tgl-gachibowli-main',
+        branch_code: 'GACHI',
+        branch_name: 'Gachibowli',
         customer_name: 'Yesterday Gachibowli',
         customer_phone: '+919848000003',
         items: [{ item_name: 'Facial', item_type: 'service', quantity: 1, unit_price: 1000, total_price: 1000 }],

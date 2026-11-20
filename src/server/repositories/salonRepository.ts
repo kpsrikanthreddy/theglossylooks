@@ -149,7 +149,8 @@ export interface ISalonRepository {
     endIso?: string;
   }): Promise<Order[]>;
   getOrderById(id: string): Promise<Order | null>;
-  createOrder(orderData: Omit<Order, 'id' | 'bill_number' | 'created_at'>, performedBy: string): Promise<Order>;
+  getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null>;
+  createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order>;
   updateOrder(id: string, data: Partial<Order>): Promise<Order | null>;
   updateOrderStatus(id: string, status: Order['payment_status'], performedBy: string): Promise<Order | null>;
   softDeleteOrderTransaction(

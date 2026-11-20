@@ -12,6 +12,15 @@ import {
   deriveUserSyncStatus,
   mapLocalRoleToSmavRole,
 } from './src/server/smavSync.ts';
+import {
+  fetchSmavPermittedBranches,
+  reserveSmavCentralBillNumber,
+  finalizeSmavCentralBillNumber,
+  verifySmavSaleEventRequest,
+  resolveCanonicalBranchCode,
+  resolveLocalBranchIdForCode,
+  getCleanReceiptBranchName,
+} from './src/server/smavBillNumbering.ts';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -132,109 +141,404 @@ app.use((req, _res, next) => {
 });
 
 
-// SMAV sale event signature. The sender signs `${timestamp}.${raw JSON body}`.
-function verifySmavSaleEvent(req: express.Request): boolean {
-  const secret = (process.env.SMAV_DISPATCH_SECRET || '').trim();
-  const ts = String(req.headers['x-smav-timestamp'] || '').trim();
-  const supplied = String(req.headers['x-smav-signature'] || '').trim();
-  if (secret.length < 32 || !/^\d{10}$/.test(ts) || !/^[a-f0-9]{64}$/i.test(supplied)) return false;
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
-  const raw = (req as express.Request & { rawBody?: Buffer | string }).rawBody;
-  let rawText: string | null = null;
-  if (Buffer.isBuffer(raw)) {
-    rawText = raw.toString('utf8');
-  } else if (typeof raw === 'string') {
-    rawText = raw;
-  } else if (Buffer.isBuffer(req.body)) {
-    rawText = req.body.toString('utf8');
-  } else if (typeof req.body === 'string') {
-    rawText = req.body;
-  } else if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-    try {
-      rawText = JSON.stringify(req.body);
-    } catch {
-      rawText = null;
-    }
-  }
-  if (!rawText) return false;
-  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${rawText}`).digest('hex');
-  const suppliedBuf = Buffer.from(supplied, 'hex');
-  const expectedBuf = Buffer.from(expected, 'hex');
-  return suppliedBuf.length === expectedBuf.length && crypto.timingSafeEqual(suppliedBuf, expectedBuf);
-}
-
-
-// SMAV signed server-to-server sale notification receiver. Never expose this to the browser.
+// SMAV authenticated server-to-server sale-event receiver.
+// Validates BOTH X-Integration-Key AND HMAC-SHA256 signature (X-SMAV-Timestamp + X-SMAV-Signature)
+// before reading or updating any local bill. Never expose signing secrets to the browser.
 app.post('/api/integrations/smav/sale-event', async (req, res) => {
-  if (!verifySmavSaleEvent(req)) return res.status(401).json({error:'Invalid SMAV signature'});
+  const auth = verifySmavSaleEventRequest(req);
+  if (!auth.ok) {
+    return res.status(auth.status).json({ error: auth.error || 'Invalid SMAV authentication' });
+  }
+
   let e: any = req.body || {};
   if (typeof e === 'string') {
     try { e = JSON.parse(e); } catch { e = {}; }
   } else if (Buffer.isBuffer(e)) {
     try { e = JSON.parse(e.toString('utf8')); } catch { e = {}; }
   }
-  if (!/^[0-9a-f-]{36}$/i.test(String(e.event_id || '')) || !['salon'].includes(e.source_type) || !['receipt','feedback'].includes(e.event_type))
-    return res.status(400).json({error:'Invalid SMAV event'});
+
+  const eventId = String(e.event_id || e.eventId || '').trim();
+  const sourceType = String(e.source_type || e.sourceType || 'salon').trim().toLowerCase();
+  const eventType = String(e.event_type || e.eventType || '').trim().toLowerCase();
+  const supportedEvents = [
+    'receipt',
+    'feedback',
+    'sale_recorded',
+    'sale_finalized',
+    'bill_finalized',
+    'bill_updated',
+    'payment_updated',
+    'bill_voided',
+    'sale_voided',
+    'refund',
+  ];
+
+  if (!eventId || eventId.length > 128 || !['salon', 'glossylooks'].includes(sourceType) || !supportedEvents.includes(eventType)) {
+    return res.status(400).json({ error: 'Invalid SMAV sale event envelope' });
+  }
+
   const configuredOutlet = (process.env.SMAV_SALON_OUTLET_ID || '').trim();
-  if (!configuredOutlet || e.outlet_id !== configuredOutlet) return res.status(403).json({error:'Outlet not allowed'});
-  const p = e.payload || {};
-  const key = String(e.source_key || '');
-  if (!key || key.length > 200 || !String(p.bill_number || '').trim()) return res.status(400).json({error:'Missing bill reference'});
-  const {createClient} = await import('@supabase/supabase-js');
-  const url = process.env.SUPABASE_URL, serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !serviceKey) return res.status(503).json({error:'Persistent event database unavailable'});
-  const db = createClient(url,serviceKey,{auth:{persistSession:false}});
-  const {data:old,error:oldError} = await db.from('smav_inbound_sales').select('*').eq('source_key',key).maybeSingle();
-  if (oldError) return res.status(503).json({error:oldError.message});
-  if (e.event_type === 'feedback' && !old?.native_order_id) return res.status(409).json({error:'Receipt must reconcile before feedback'});
-  if (e.event_type === 'receipt' && !old) {
-    let branchMap: Record<string,string> = {};
-    try {
-      const rawMap = (process.env.SMAV_SALON_BRANCH_MAP_JSON || '').trim();
-      if (rawMap) branchMap = JSON.parse(rawMap);
-    } catch {
-      branchMap = {};
+  const suppliedOutletId = String(e.outlet_id || e.outletId || '').trim();
+  const suppliedOutletCode = String(e.outlet_code || e.outletCode || req.headers['x-business-source'] || '').trim().toLowerCase();
+  if (configuredOutlet && suppliedOutletId && suppliedOutletId !== configuredOutlet) {
+    return res.status(403).json({ error: 'Outlet not allowed' });
+  }
+  if (!configuredOutlet && suppliedOutletCode && suppliedOutletCode !== 'glossylooks') {
+    return res.status(403).json({ error: 'Outlet not allowed' });
+  }
+  if (configuredOutlet && !suppliedOutletId && suppliedOutletCode !== 'glossylooks') {
+    return res.status(403).json({ error: 'Outlet not allowed' });
+  }
+
+  const p = e.payload || e.data || e;
+  const centralBillNumber = String(p.bill_number || p.billNumber || '').trim();
+  const localOrderRef = String(p.local_order_id || p.localOrderId || p.native_order_id || p.nativeOrderId || p.external_order_id || p.externalOrderId || '').trim();
+  const key = String(e.source_key || e.sourceKey || p.idempotency_key || p.idempotencyKey || centralBillNumber || '').trim();
+
+  if (!key || key.length > 200 || !centralBillNumber) {
+    return res.status(400).json({ error: 'Missing central bill_number reference' });
+  }
+
+  const localBranches = await salonRepository.getBranches().catch(() => []);
+  const resolvedBranchCode = resolveCanonicalBranchCode({
+    branchCode: p.branch_code || p.branchCode,
+    branchId: p.branch_id || p.branchId,
+    branchName: p.branch_name || p.branchName,
+  });
+  const resolvedBranchId =
+    (p.branch_id && localBranches.some(b => b.id === p.branch_id) ? String(p.branch_id) : null) ||
+    resolveLocalBranchIdForCode(resolvedBranchCode, localBranches) ||
+    (process.env.SMAV_SALON_DEFAULT_BRANCH_ID || '').trim() ||
+    null;
+
+  // 1. Check whether this sale-event refers to an existing GlossyLooks local bill (by local_order_id or central bill_number)
+  let existingLocalOrder: Order | null = null;
+  if (localOrderRef) {
+    existingLocalOrder = await salonRepository.getOrderById(localOrderRef);
+  }
+  if (!existingLocalOrder) {
+    existingLocalOrder = await salonRepository.getOrderById(centralBillNumber);
+  }
+
+  // Immutable bill number guard: never overwrite an existing order's bill_number
+  if (existingLocalOrder && existingLocalOrder.bill_number && existingLocalOrder.bill_number !== centralBillNumber) {
+    return res.status(409).json({
+      error: `IMMUTABLE_BILL_NUMBER_CONFLICT: Local order ${existingLocalOrder.id} is already assigned bill_number ${existingLocalOrder.bill_number}; refusing to replace with ${centralBillNumber}.`,
+    });
+  }
+
+  // 2. If updating an existing local bill (finalized/updated/voided/payment sync)
+  if (existingLocalOrder && !['receipt', 'feedback'].includes(eventType)) {
+    if (existingLocalOrder.smav_last_event_id === eventId) {
+      return res.json({
+        accepted: true,
+        duplicate: true,
+        native_order_id: existingLocalOrder.id,
+        bill_number: existingLocalOrder.bill_number,
+      });
     }
-    const branchCode = String(p.branch_code || p.branchCode || '').toUpperCase();
-    const branchId = branchMap[branchCode] || process.env.SMAV_SALON_DEFAULT_BRANCH_ID;
-    if (!branchId) return res.status(422).json({error:'Branch mapping missing'});
-    const items = Array.isArray(p.items) ? p.items : [];
-    if (!items.length || !p.customer_phone || !p.customer_name) return res.status(422).json({error:'Customer and items required'});
-    // Reserve the source key before native creation. A crashed reservation is recoverable by operator.
-    const {error:reserveError} = await db.from('smav_inbound_sales').insert({source_key:key,outlet_id:e.outlet_id,bill_number:String(p.bill_number),branch_id:branchId,status:'reserved'});
-    if (reserveError) return res.status(409).json({error:'Sale already being reconciled; retry later'});
-    try {
-      const total = Number(p.grand_total || 0);
-      const nativeItems = items.map((i:any)=>({item_name:String(i.item_name || i.itemName || i.serviceName || i.name || 'Service'),item_type:'service' as const,quantity:Number(i.quantity || 1),unit_price:Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0),total_price:Number(i.total_price ?? i.totalPrice ?? (Number(i.quantity || 1)*Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0))),staff_name:String(i.staff_name || i.stylistName || 'Station Stylist')}));
-      const native = await salonRepository.createOrder({branch_id:branchId,idempotency_key:key,customer_name:String(p.customer_name),customer_phone:String(p.customer_phone),items:nativeItems,subtotal:total,discount:0,tax_percent:0,tax_amount:0,tip_amount:0,grand_total:total,paid_amount:total,due_amount:0,payment_status:'Paid',primary_payment_mode:(p.payment_mode || 'UPI'),cashier_name:'SMAV POS',notes:`SMAV source bill ${p.bill_number}`,whatsapp_status:'queued',receipt_whatsapp_status:'queued',feedback_whatsapp_status:'scheduled'},'SMAV POS');
-      const {error:saveError} = await db.from('smav_inbound_sales').update({native_order_id:native.id,status:'recorded'}).eq('source_key',key);
-      if(saveError) throw new Error(saveError.message);
-    } catch(err:any) {
-      await db.from('smav_inbound_sales').update({status:'needs_reconciliation',last_error:String(err.message || err)}).eq('source_key',key);
-      return res.status(503).json({error:'Native order reconciliation requires review; no automatic replay'});
+
+    const nowIso = new Date().toISOString();
+    const updates: Partial<Order> = {
+      smav_last_event_id: eventId,
+      smav_last_event_at: nowIso,
+      ...(p.reservation_id || p.reservationId ? { smav_reservation_id: String(p.reservation_id || p.reservationId) } : {}),
+      ...(p.sale_id || p.saleId || p.smav_sale_id ? { smav_sale_id: String(p.sale_id || p.saleId || p.smav_sale_id) } : {}),
+      ...(resolvedBranchCode && !existingLocalOrder.branch_code ? { branch_code: resolvedBranchCode } : {}),
+    };
+
+    if (['sale_recorded', 'sale_finalized', 'bill_finalized'].includes(eventType)) {
+      updates.smav_bill_status = 'finalized';
+      updates.smav_finalized_at = String(p.finalized_at || p.finalizedAt || nowIso);
+      updates.smav_finalize_error = null;
+    } else if (['bill_voided', 'sale_voided'].includes(eventType)) {
+      updates.smav_bill_status = 'voided';
+      updates.payment_status = 'Cancelled';
+    } else if (eventType === 'refund') {
+      updates.payment_status = 'Refunded';
+    }
+
+    if (['bill_updated', 'payment_updated'].includes(eventType)) {
+      const allowedStatuses = ['Paid', 'Partial', 'Pending', 'Refunded', 'Cancelled'];
+      const nextStatus = String(p.payment_status || p.paymentStatus || '').trim();
+      if (nextStatus && allowedStatuses.includes(nextStatus)) {
+        updates.payment_status = nextStatus as Order['payment_status'];
+      }
+      if (p.paid_amount !== undefined || p.paidAmount !== undefined) {
+        const paid = Math.max(0, Number(p.paid_amount ?? p.paidAmount));
+        if (Number.isFinite(paid)) {
+          updates.paid_amount = paid;
+          updates.due_amount = Math.max(0, Number(existingLocalOrder.grand_total || 0) - paid);
+        }
+      }
+      if (p.payment_mode || p.paymentMode) {
+        updates.primary_payment_mode = String(p.payment_mode || p.paymentMode) as Order['primary_payment_mode'];
+      }
+    }
+
+    const updatedOrder = await salonRepository.updateOrder(existingLocalOrder.id, updates);
+    await salonRepository.logAudit(
+      'SMAV_SALE_EVENT',
+      'Order',
+      existingLocalOrder.id,
+      'SMAV Central',
+      `Applied verified SMAV sale-event (${eventType}, event=${eventId}) to bill ${existingLocalOrder.bill_number}`
+    );
+
+    return res.json({
+      accepted: true,
+      updated: true,
+      native_order_id: existingLocalOrder.id,
+      bill_number: existingLocalOrder.bill_number,
+      smav_bill_status: updatedOrder?.smav_bill_status || updates.smav_bill_status || existingLocalOrder.smav_bill_status,
+    });
+  }
+
+  // 3. Receipt / Feedback SMAV event reconciliation (uses SMAV's immutable central bill_number, never local generation)
+  if (!/^[0-9a-f-]{36}$/i.test(eventId)) {
+    return res.status(400).json({ error: 'Invalid SMAV event_id UUID' });
+  }
+
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !supabaseServiceKey) {
+    // Offline/JSON fallback mode: still authenticate & reconcile cleanly with central bill_number
+    if (eventType === 'receipt' && !existingLocalOrder) {
+      if (!resolvedBranchId) return res.status(422).json({ error: 'Branch mapping missing' });
+      const items = Array.isArray(p.items) ? p.items : [];
+      if (!items.length || !p.customer_phone || !p.customer_name) {
+        return res.status(422).json({ error: 'Customer and items required' });
+      }
+      const total = Number(p.grand_total ?? p.grandTotal ?? 0);
+      const nativeItems = items.map((i: any) => ({
+        item_name: String(i.item_name || i.itemName || i.serviceName || i.name || 'Service'),
+        item_type: 'service' as const,
+        quantity: Number(i.quantity || 1),
+        unit_price: Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0),
+        total_price: Number(i.total_price ?? i.totalPrice ?? (Number(i.quantity || 1) * Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0))),
+        staff_name: String(i.staff_name || i.stylistName || 'Station Stylist'),
+      }));
+      const cleanBranchName = getCleanReceiptBranchName({
+        branchId: resolvedBranchId,
+        branchCode: resolvedBranchCode,
+        branchName: p.branch_name || p.branchName,
+      });
+      existingLocalOrder = await salonRepository.createOrder({
+        bill_number: centralBillNumber,
+        branch_id: resolvedBranchId,
+        branch_code: resolvedBranchCode || 'GACHI',
+        branch_name: cleanBranchName,
+        smav_reservation_id: p.reservation_id || p.reservationId || undefined,
+        smav_sale_id: p.sale_id || p.saleId || undefined,
+        smav_bill_status: 'finalized',
+        smav_finalized_at: new Date().toISOString(),
+        smav_last_event_id: eventId,
+        smav_last_event_at: new Date().toISOString(),
+        is_legacy_bill: false,
+        idempotency_key: key,
+        customer_name: String(p.customer_name),
+        customer_phone: String(p.customer_phone),
+        items: nativeItems,
+        subtotal: Number(p.subtotal ?? total),
+        discount: Number(p.discount ?? 0),
+        tax_percent: Number(p.tax_percent ?? 0),
+        tax_amount: Number(p.tax_amount ?? 0),
+        tip_amount: Number(p.tip_amount ?? 0),
+        grand_total: total,
+        paid_amount: Number(p.paid_amount ?? total),
+        due_amount: Math.max(0, total - Number(p.paid_amount ?? total)),
+        payment_status: 'Paid',
+        primary_payment_mode: (p.payment_mode || p.paymentMode || 'UPI'),
+        cashier_name: String(p.cashier_name || 'SMAV POS'),
+        notes: `SMAV source bill ${centralBillNumber}`,
+        whatsapp_status: 'queued',
+        receipt_whatsapp_status: 'queued',
+        feedback_whatsapp_status: 'scheduled',
+      }, 'SMAV POS');
+    } else if (existingLocalOrder) {
+      await salonRepository.updateOrder(existingLocalOrder.id, {
+        smav_bill_status: 'finalized',
+        smav_last_event_id: eventId,
+        smav_last_event_at: new Date().toISOString(),
+        ...(p.sale_id || p.saleId ? { smav_sale_id: String(p.sale_id || p.saleId) } : {}),
+      });
+    }
+    if (!existingLocalOrder) {
+      return res.status(409).json({ error: 'Receipt must reconcile before feedback' });
+    }
+    return res.json({
+      accepted: true,
+      native_order_id: existingLocalOrder.id,
+      bill_number: existingLocalOrder.bill_number,
+    });
+  }
+
+  const { createClient } = await import('@supabase/supabase-js');
+  const db = createClient(supabaseUrl, supabaseServiceKey, { auth: { persistSession: false } });
+  const { data: old, error: oldError } = await db.from('smav_inbound_sales').select('*').eq('source_key', key).maybeSingle();
+  if (oldError) return res.status(503).json({ error: oldError.message });
+  if (eventType === 'feedback' && !old?.native_order_id && !existingLocalOrder) {
+    return res.status(409).json({ error: 'Receipt must reconcile before feedback' });
+  }
+
+  if (eventType === 'receipt' && !old) {
+    const branchId = resolvedBranchId || existingLocalOrder?.branch_id;
+    if (!branchId) return res.status(422).json({ error: 'Branch mapping missing' });
+
+    const { error: reserveError } = await db.from('smav_inbound_sales').insert({
+      source_key: key,
+      outlet_id: suppliedOutletId || configuredOutlet,
+      bill_number: centralBillNumber,
+      branch_id: branchId,
+      native_order_id: existingLocalOrder?.id || null,
+      status: existingLocalOrder ? 'recorded' : 'reserved',
+    });
+    if (reserveError) return res.status(409).json({ error: 'Sale already being reconciled; retry later' });
+
+    if (!existingLocalOrder) {
+      const items = Array.isArray(p.items) ? p.items : [];
+      if (!items.length || !p.customer_phone || !p.customer_name) {
+        await db.from('smav_inbound_sales').update({ status: 'needs_reconciliation', last_error: 'Customer and items required' }).eq('source_key', key);
+        return res.status(422).json({ error: 'Customer and items required' });
+      }
+      try {
+        const total = Number(p.grand_total ?? p.grandTotal ?? 0);
+        const nativeItems = items.map((i: any) => ({
+          item_name: String(i.item_name || i.itemName || i.serviceName || i.name || 'Service'),
+          item_type: 'service' as const,
+          quantity: Number(i.quantity || 1),
+          unit_price: Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0),
+          total_price: Number(i.total_price ?? i.totalPrice ?? (Number(i.quantity || 1) * Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0))),
+          staff_name: String(i.staff_name || i.stylistName || 'Station Stylist'),
+        }));
+        const cleanBranchName = getCleanReceiptBranchName({
+          branchId,
+          branchCode: resolvedBranchCode,
+          branchName: p.branch_name || p.branchName,
+        });
+        const native = await salonRepository.createOrder({
+          bill_number: centralBillNumber,
+          branch_id: branchId,
+          branch_code: resolvedBranchCode || 'GACHI',
+          branch_name: cleanBranchName,
+          smav_reservation_id: p.reservation_id || p.reservationId || undefined,
+          smav_sale_id: p.sale_id || p.saleId || undefined,
+          smav_bill_status: 'finalized',
+          smav_finalized_at: new Date().toISOString(),
+          smav_last_event_id: eventId,
+          smav_last_event_at: new Date().toISOString(),
+          is_legacy_bill: false,
+          idempotency_key: key,
+          customer_name: String(p.customer_name),
+          customer_phone: String(p.customer_phone),
+          items: nativeItems,
+          subtotal: Number(p.subtotal ?? total),
+          discount: Number(p.discount ?? 0),
+          tax_percent: Number(p.tax_percent ?? 0),
+          tax_amount: Number(p.tax_amount ?? 0),
+          tip_amount: Number(p.tip_amount ?? 0),
+          grand_total: total,
+          paid_amount: Number(p.paid_amount ?? total),
+          due_amount: Math.max(0, total - Number(p.paid_amount ?? total)),
+          payment_status: 'Paid',
+          primary_payment_mode: (p.payment_mode || p.paymentMode || 'UPI'),
+          cashier_name: String(p.cashier_name || 'SMAV POS'),
+          notes: `SMAV source bill ${centralBillNumber}`,
+          whatsapp_status: 'queued',
+          receipt_whatsapp_status: 'queued',
+          feedback_whatsapp_status: 'scheduled',
+        }, 'SMAV POS');
+        const { error: saveError } = await db.from('smav_inbound_sales').update({ native_order_id: native.id, status: 'recorded' }).eq('source_key', key);
+        if (saveError) throw new Error(saveError.message);
+      } catch (err: any) {
+        await db.from('smav_inbound_sales').update({ status: 'needs_reconciliation', last_error: String(err.message || err) }).eq('source_key', key);
+        return res.status(503).json({ error: 'Native order reconciliation requires review; no automatic replay' });
+      }
+    } else {
+      await salonRepository.updateOrder(existingLocalOrder.id, {
+        smav_bill_status: 'finalized',
+        smav_last_event_id: eventId,
+        smav_last_event_at: new Date().toISOString(),
+        ...(p.sale_id || p.saleId ? { smav_sale_id: String(p.sale_id || p.saleId) } : {}),
+      });
     }
   }
-  const {data:record,error:recordError} = await db.from('smav_inbound_sales').select('*').eq('source_key',key).single();
-  if (recordError || !record?.native_order_id) return res.status(503).json({error:'Sale not reconciled'});
-  const doneColumn = e.event_type === 'receipt' ? 'receipt_sent_at' : 'feedback_sent_at';
-  if(record[doneColumn]) return res.json({accepted:true,duplicate:true,native_order_id:record.native_order_id});
-  // Acquire an event-specific database claim. Retry on network errors only after checking delivery logs.
-  const {data:claimed,error:claimError} = await db.rpc('smav_claim_inbound_event',{p_source_key:key,p_event_type:e.event_type,p_event_id:e.event_id});
-  if(claimError) return res.status(503).json({error:claimError.message});
-  if(!claimed) return res.status(409).json({error:'Notification in progress or requires reconciliation'});
+
+  const { data: record, error: recordError } = await db.from('smav_inbound_sales').select('*').eq('source_key', key).maybeSingle();
+  const targetOrderId = record?.native_order_id || existingLocalOrder?.id;
+  if (recordError || !targetOrderId) return res.status(503).json({ error: 'Sale not reconciled' });
+
+  const doneColumn = eventType === 'receipt' ? 'receipt_sent_at' : 'feedback_sent_at';
+  if (record && record[doneColumn]) {
+    return res.json({ accepted: true, duplicate: true, native_order_id: targetOrderId, bill_number: centralBillNumber });
+  }
+
+  if (record) {
+    const { data: claimed, error: claimError } = await db.rpc('smav_claim_inbound_event', {
+      p_source_key: key,
+      p_event_type: eventType,
+      p_event_id: eventId,
+    });
+    if (claimError) return res.status(503).json({ error: claimError.message });
+    if (!claimed) return res.status(409).json({ error: 'Notification in progress or requires reconciliation' });
+  }
+
   try {
-    const native = await salonRepository.getOrderById(record.native_order_id);
+    const native = await salonRepository.getOrderById(targetOrderId);
     if (!native) throw new Error('Native order not found');
-    const branch = await salonRepository.getBranchById(record.branch_id);
-    const receipt = e.event_type === 'receipt';
-    const result = await sendBranchWhatsAppTemplate({branchId:record.branch_id,recipientPhone:native.customer_phone,orderId:native.id,jobType:receipt?'bill_receipt':'customer_feedback',templateName:receipt?'gl_bill_receipt':'glossylooks_customer_feedback',customData:{customerName:native.customer_name,billNumber:String(p.bill_number),billDate:new Date(p.billed_at || Date.now()).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),itemsSummary:native.items.map((i:any)=>`${i.item_name} (x${i.quantity})`).join(', '),grandTotal:String(native.grand_total),paymentMode:native.primary_payment_mode,branchName:branch?.name || 'The Glossy Looks'}});
+    const branchIdForWa = record?.branch_id || native.branch_id || resolvedBranchId || 'tgl-gachibowli-main';
+    const branch = await salonRepository.getBranchById(branchIdForWa);
+    const cleanBranchName = getCleanReceiptBranchName({
+      branchId: branchIdForWa,
+      branchCode: native.branch_code || resolvedBranchCode,
+      branchName: native.branch_name || branch?.name,
+      localBranch: branch,
+    });
+    const receipt = eventType === 'receipt';
+    const result = await sendBranchWhatsAppTemplate({
+      branchId: branchIdForWa,
+      recipientPhone: native.customer_phone,
+      orderId: native.id,
+      jobType: receipt ? 'bill_receipt' : 'customer_feedback',
+      templateName: receipt ? 'gl_bill_receipt' : 'glossylooks_customer_feedback',
+      customData: {
+        customerName: native.customer_name,
+        billNumber: native.bill_number || centralBillNumber,
+        billDate: new Date(p.billed_at || native.created_at || Date.now()).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        itemsSummary: (native.items || []).map((i: any) => `${i.item_name} (x${i.quantity})`).join(', '),
+        grandTotal: String(native.grand_total),
+        paymentMode: native.primary_payment_mode,
+        branchName: cleanBranchName,
+      },
+    });
     if (!result.sent) throw new Error(result.error || 'WhatsApp not accepted by Meta');
-    await db.from('smav_inbound_sales').update({[doneColumn]:new Date().toISOString()}).eq('source_key',key);
-    await salonRepository.updateOrder(native.id,receipt?{receipt_whatsapp_status:'sent',receipt_whatsapp_message_id:result.messageId,receipt_whatsapp_sent_at:new Date().toISOString()}:{feedback_whatsapp_status:'sent',feedback_whatsapp_message_id:result.messageId,feedback_whatsapp_sent_at:new Date().toISOString()});
-    return res.json({accepted:true,native_order_id:native.id});
-  }catch(err:any){
-    await db.from('smav_inbound_sales').update({last_error:String(err.message || err).slice(0,500)}).eq('source_key',key);
-    return res.status(503).json({error:'WhatsApp dispatch failed; inspect message logs before retry'});
+    if (record) {
+      await db.from('smav_inbound_sales').update({ [doneColumn]: new Date().toISOString() }).eq('source_key', key);
+    }
+    await salonRepository.updateOrder(
+      native.id,
+      receipt
+        ? {
+            receipt_whatsapp_status: 'sent',
+            receipt_whatsapp_message_id: result.messageId,
+            receipt_whatsapp_sent_at: new Date().toISOString(),
+            smav_last_event_id: eventId,
+            smav_last_event_at: new Date().toISOString(),
+          }
+        : {
+            feedback_whatsapp_status: 'sent',
+            feedback_whatsapp_message_id: result.messageId,
+            feedback_whatsapp_sent_at: new Date().toISOString(),
+            smav_last_event_id: eventId,
+            smav_last_event_at: new Date().toISOString(),
+          }
+    );
+    return res.json({ accepted: true, native_order_id: native.id, bill_number: native.bill_number });
+  } catch (err: any) {
+    if (record) {
+      await db.from('smav_inbound_sales').update({ last_error: String(err.message || err).slice(0, 500) }).eq('source_key', key);
+    }
+    return res.status(503).json({ error: 'WhatsApp dispatch failed; inspect message logs before retry' });
   }
 });
 
@@ -5202,11 +5506,48 @@ async function checkBranchAccess(req: express.Request, branchId: string): Promis
   return { authorized: true, admin, branch };
 }
 
-// Public / Operational endpoint for branches (used by POS billing and customer booking)
+// Public / Operational endpoint for branches (enriched with canonical SMAV branch codes: GACHI / KONDA)
 app.get('/api/branches', async (req, res) => {
   try {
     const allBranches = await salonRepository.getBranches();
-    return res.json(allBranches);
+    const enriched = allBranches.map(b => ({
+      ...b,
+      smav_branch_code: resolveCanonicalBranchCode({ localBranch: b }) || b.smav_branch_code || b.code,
+    }));
+    return res.json(enriched);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POS Permitted Branches loaded from SMAV for central bill numbering (Gachibowli = GACHI, Kondapur = KONDA)
+app.get('/api/pos/branches', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to load permitted POS branches.' });
+    }
+
+    const localBranches = await salonRepository.getBranches();
+    const smavResult = await fetchSmavPermittedBranches({
+      admin,
+      localBranches,
+    });
+
+    // If user is branch-restricted staff/manager and SMAV fell back locally, honor assigned branch if present
+    let permitted = smavResult.branches;
+    if (smavResult.source === 'local_fallback' && !hasFullPaymentLedgerAccess(admin.role) && admin.branch_id) {
+      const assigned = permitted.filter(b => b.id === admin.branch_id || b.local_branch_id === admin.branch_id);
+      if (assigned.length > 0) {
+        permitted = assigned;
+      }
+    }
+
+    return res.json({
+      branches: permitted,
+      source: smavResult.source,
+      warning: smavResult.warning || null,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -5216,7 +5557,10 @@ app.get('/api/branches', async (req, res) => {
 app.get('/api/admin/branches', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    const allBranches = await salonRepository.getBranches();
+    const allBranches = (await salonRepository.getBranches()).map(b => ({
+      ...b,
+      smav_branch_code: resolveCanonicalBranchCode({ localBranch: b }) || b.smav_branch_code || b.code,
+    }));
     if (!admin) {
       return res.json(allBranches);
     }
@@ -6196,7 +6540,8 @@ app.get('/api/orders', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const actor = (req.headers['x-admin-name'] as string) || 'Cashier';
+    const authAdmin = await getAuthAdmin(req);
+    const actor = authAdmin?.name || (req.headers['x-admin-name'] as string) || 'Cashier';
     const {
       customer_name,
       customer_phone,
@@ -6213,10 +6558,9 @@ app.post('/api/orders', async (req, res) => {
       notes,
       appointment_id,
       branch_id,
+      branch_code,
       idempotency_key
     } = req.body;
-
-    const key = idempotency_key || (req.headers['x-idempotency-key'] as string);
 
     if (!customer_name || !items || !items.length) {
       return res.status(400).json({ error: 'Missing customer or order items' });
@@ -6233,16 +6577,138 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    const effectiveBranchId = branch_id || 'tgl-gachibowli-main';
+    // 1. Require explicit Branch selection (Gachibowli = GACHI, Kondapur = KONDA) before bill generation
+    const requestedBranchId = String(branch_id || '').trim();
+    const requestedBranchCode = String(branch_code || '').trim().toUpperCase();
+    if (!requestedBranchId && !requestedBranchCode) {
+      return res.status(400).json({
+        error: 'Branch selection is required before bill generation (Gachibowli / GACHI or Kondapur / KONDA).'
+      });
+    }
+
+    const localBranches = await salonRepository.getBranches();
+    const matchedLocalBranch =
+      (requestedBranchId ? localBranches.find(b => b.id === requestedBranchId) : undefined) ||
+      (requestedBranchCode
+        ? localBranches.find(
+            b => resolveCanonicalBranchCode({ localBranch: b }) === requestedBranchCode
+          )
+        : undefined) ||
+      null;
+
+    const canonicalBranchCode = resolveCanonicalBranchCode({
+      branchCode: requestedBranchCode || undefined,
+      branchId: requestedBranchId || undefined,
+      localBranch: matchedLocalBranch,
+    });
+
+    if (!canonicalBranchCode) {
+      return res.status(400).json({
+        error: 'Unrecognized salon branch. Please select a valid branch (Gachibowli = GACHI or Kondapur = KONDA).'
+      });
+    }
+
+    const effectiveBranchId =
+      matchedLocalBranch?.id ||
+      resolveLocalBranchIdForCode(canonicalBranchCode, localBranches) ||
+      requestedBranchId;
+    const cleanBranchName = getCleanReceiptBranchName({
+      branchId: effectiveBranchId,
+      branchCode: canonicalBranchCode,
+      localBranch: matchedLocalBranch,
+    });
+
+    // Verify staff branch permission when authenticated as non-owner/admin
+    if (authAdmin && !hasFullPaymentLedgerAccess(authAdmin.role) && authAdmin.branch_id) {
+      const assignedCode = resolveCanonicalBranchCode({ branchId: authAdmin.branch_id });
+      if (effectiveBranchId !== authAdmin.branch_id && assignedCode && assignedCode !== canonicalBranchCode) {
+        return res.status(403).json({
+          error: `Access denied: Your account is not permitted to generate bills for branch ${cleanBranchName} (${canonicalBranchCode}).`
+        });
+      }
+    }
+
+    const rawIdemKey = String(idempotency_key || (req.headers['x-idempotency-key'] as string) || '').trim();
+    const effectiveIdempotencyKey =
+      rawIdemKey || `gl-bill-${canonicalBranchCode}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+    // 2. Idempotency check BEFORE calling SMAV reserve so retries never reserve duplicate central bill numbers
+    const existingOrder = await salonRepository.getOrderByIdempotencyKey(effectiveIdempotencyKey);
+    if (existingOrder) {
+      // If previously committed locally but finalize is pending, attempt idempotent finalize now
+      if (existingOrder.smav_bill_status === 'finalize_pending') {
+        const retryFin = await finalizeSmavCentralBillNumber({
+          reservationId: existingOrder.smav_reservation_id,
+          billNumber: existingOrder.bill_number,
+          branchId: existingOrder.branch_id || effectiveBranchId,
+          branchCode: existingOrder.branch_code || canonicalBranchCode,
+          branchName: existingOrder.branch_name || cleanBranchName,
+          localOrderId: existingOrder.id,
+          idempotencyKey: effectiveIdempotencyKey,
+          order: existingOrder,
+          finalizedBy: actor,
+          finalizedByUserId: authAdmin?.id,
+          centralAuthId: authAdmin?.central_auth_id,
+        });
+        if (retryFin.ok) {
+          const updated = await salonRepository.updateOrder(existingOrder.id, {
+            smav_bill_status: 'finalized',
+            smav_sale_id: retryFin.saleId || existingOrder.smav_sale_id,
+            smav_finalized_at: retryFin.finalizedAt || new Date().toISOString(),
+            smav_finalize_error: null,
+          });
+          return res.status(200).json(updated || existingOrder);
+        }
+      }
+      return res.status(200).json(existingOrder);
+    }
+
+    // 3. Call SMAV Reserve API BEFORE local bill creation (NO local bill number generation)
+    const reserveResult = await reserveSmavCentralBillNumber({
+      branchId: effectiveBranchId,
+      branchCode: canonicalBranchCode,
+      branchName: cleanBranchName,
+      idempotencyKey: effectiveIdempotencyKey,
+      requestedBy: actor,
+      requestedByUserId: authAdmin?.id,
+      centralAuthId: authAdmin?.central_auth_id,
+    });
+
+    if (!reserveResult.ok || !reserveResult.billNumber) {
+      const statusCode =
+        reserveResult.status >= 400 && reserveResult.status < 600 ? reserveResult.status : 503;
+      return res.status(statusCode).json({
+        error:
+          reserveResult.error ||
+          'Failed to reserve central bill number from SMAV. Bill was not created.',
+        code: 'SMAV_BILL_RESERVE_FAILED',
+      });
+    }
+
+    const immutableCentralBillNumber = reserveResult.billNumber;
+    const finalizedBranchCode = reserveResult.branchCode || canonicalBranchCode;
+    const finalizedBranchName = getCleanReceiptBranchName({
+      branchId: effectiveBranchId,
+      branchCode: finalizedBranchCode,
+      branchName: reserveResult.branchName || cleanBranchName,
+      localBranch: matchedLocalBranch,
+    });
+
     const now = new Date().toISOString();
     // Exactly 2 minutes after bill creation as required
     const feedbackScheduledTime = new Date(Date.now() + 2 * 60 * 1000).toISOString();
 
-    // 1. Generate the bill and save the order first with initial state
+    // 4. Commit local bill transaction FIRST using the immutable central bill number
     const order = await salonRepository.createOrder({
-      idempotency_key: key,
+      bill_number: immutableCentralBillNumber,
+      idempotency_key: effectiveIdempotencyKey,
       appointment_id,
       branch_id: effectiveBranchId,
+      branch_code: finalizedBranchCode,
+      branch_name: finalizedBranchName,
+      smav_reservation_id: reserveResult.reservationId,
+      smav_bill_status: 'reserved',
+      is_legacy_bill: false,
       customer_name,
       customer_phone: normalized.e164 || customer_phone,
       items,
@@ -6265,7 +6731,89 @@ app.post('/api/orders', async (req, res) => {
       feedback_whatsapp_source: 'AUTO_FEEDBACK'
     }, actor);
 
-    // 2. Schedule automatic feedback job for 2 minutes after completion (only if not already sent/queued)
+    // 5. Call SMAV Finalize API ONLY AFTER the local bill transaction is committed
+    const finalizeResult = await finalizeSmavCentralBillNumber({
+      reservationId: reserveResult.reservationId,
+      billNumber: immutableCentralBillNumber,
+      branchId: effectiveBranchId,
+      branchCode: finalizedBranchCode,
+      branchName: finalizedBranchName,
+      localOrderId: order.id,
+      idempotencyKey: effectiveIdempotencyKey,
+      order,
+      finalizedBy: actor,
+      finalizedByUserId: authAdmin?.id,
+      centralAuthId: authAdmin?.central_auth_id,
+    });
+
+    if (finalizeResult.ok) {
+      const finalizedAt = finalizeResult.finalizedAt || new Date().toISOString();
+      await salonRepository.updateOrder(order.id, {
+        smav_bill_status: 'finalized',
+        smav_sale_id: finalizeResult.saleId,
+        smav_finalized_at: finalizedAt,
+        smav_finalize_error: null,
+      });
+      order.smav_bill_status = 'finalized';
+      order.smav_sale_id = finalizeResult.saleId;
+      order.smav_finalized_at = finalizedAt;
+      order.smav_finalize_error = null;
+    } else {
+      const finalizeErr = String(finalizeResult.error || 'SMAV finalize failed').slice(0, 500);
+      await salonRepository.updateOrder(order.id, {
+        smav_bill_status: 'finalize_pending',
+        smav_finalize_error: finalizeErr,
+      });
+      order.smav_bill_status = 'finalize_pending';
+      order.smav_finalize_error = finalizeErr;
+      await salonRepository.logAudit(
+        'SMAV_FINALIZE_PENDING',
+        'Order',
+        order.id,
+        actor,
+        `Local bill ${order.bill_number} committed; SMAV finalize pending retry: ${finalizeErr}`
+      );
+    }
+
+    // 6. Queue thermal print job in Supabase mode if auto-print device exists (JSON repo already auto-queues in createOrder)
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const devs = await salonRepository.getPrintDevices();
+        const billDevice = devs.find(d => d.is_online && d.auto_print_bill);
+        if (billDevice) {
+          await salonRepository.queuePrintJob({
+            device_id: billDevice.id,
+            job_type: 'bill',
+            order_id: order.id,
+            payload: {
+              branch_name: finalizedBranchName,
+              branch_code: finalizedBranchCode,
+              bill_number: order.bill_number,
+              customer_name: order.customer_name,
+              customer_phone: order.customer_phone,
+              items: (order.items || []).map(i => ({
+                name: i.item_name,
+                quantity: i.quantity,
+                price: i.total_price,
+                staff: i.staff_name,
+              })),
+              subtotal: order.subtotal,
+              discount: order.discount,
+              tax: order.tax_amount,
+              tip: order.tip_amount,
+              total: order.grand_total,
+              payment_method: order.primary_payment_mode,
+              payment_status: order.payment_status,
+              date: new Date(order.created_at || now).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+            },
+          });
+        }
+      } catch (printErr) {
+        console.warn('⚠️ Auto-print queue skipped:', printErr);
+      }
+    }
+
+    // 7. Schedule automatic feedback job for 2 minutes after completion (only if not already sent/queued)
     const alreadySentOrQueued = await salonRepository.isFeedbackAlreadySentOrClaimed(appointment_id || undefined, order.id);
     if (!alreadySentOrQueued) {
       await salonRepository.createScheduledFeedbackJob({
@@ -6285,7 +6833,7 @@ app.post('/api/orders', async (req, res) => {
       console.log(`[Feedback Scheduler] Feedback already sent or queued for appointment ${appointment_id} or order ${order.id}. Skipping duplicate scheduling.`);
     }
 
-    // 3. Mark appointment completed if linked
+    // 8. Mark appointment completed if linked
     if (appointment_id) {
       try {
         const apt = await salonRepository.getAppointmentById(appointment_id);
@@ -6300,9 +6848,7 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // 4. Immediately send the approved WhatsApp template: gl_bill_receipt
-    const branch = await salonRepository.getBranchById(effectiveBranchId);
-    const branchName = branch?.name || 'The Glossy Looks';
+    // 9. Immediately send the approved WhatsApp template: gl_bill_receipt with the immutable central bill number
     const itemsSummary = (order.items || []).map(i => `${i.item_name} (x${i.quantity})`).join(', ');
     const billDate = new Date(order.created_at || now).toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
@@ -6328,7 +6874,7 @@ app.post('/api/orders', async (req, res) => {
         itemsSummary: itemsSummary || 'Salon Services',
         grandTotal: String(order.grand_total),
         paymentMode: order.primary_payment_mode || 'UPI',
-        branchName: branchName
+        branchName: finalizedBranchName
       }
     });
 
@@ -6353,8 +6899,72 @@ app.post('/api/orders', async (req, res) => {
     order.feedback_whatsapp_status = 'scheduled';
     order.feedback_whatsapp_scheduled_at = feedbackScheduledTime;
 
-    // Return the created order with fresh live statuses
+    // Return the created order with immutable central bill number and fresh live statuses
     res.status(201).json(order);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Retry SMAV central bill finalize for any committed bill whose finalize call transiently failed
+app.post('/api/orders/:id/retry-smav-finalize', async (req, res) => {
+  try {
+    const admin = await getAuthAdmin(req);
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to retry SMAV bill finalization.' });
+    }
+    const order = await salonRepository.getOrderById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.is_legacy_bill) {
+      return res.status(400).json({ error: 'Legacy historical bills are preserved as-is and do not require SMAV finalization.' });
+    }
+    if (order.smav_bill_status === 'finalized') {
+      return res.json({ success: true, already_finalized: true, order });
+    }
+
+    const branchCode = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || 'GACHI';
+    const branchName = order.branch_name || getCleanReceiptBranchName({ branchId: order.branch_id, branchCode });
+    const result = await finalizeSmavCentralBillNumber({
+      reservationId: order.smav_reservation_id,
+      billNumber: order.bill_number,
+      branchId: order.branch_id || 'tgl-gachibowli-main',
+      branchCode,
+      branchName,
+      localOrderId: order.id,
+      idempotencyKey: order.idempotency_key || order.bill_number,
+      order,
+      finalizedBy: admin.name,
+      finalizedByUserId: admin.id,
+      centralAuthId: admin.central_auth_id,
+    });
+
+    if (!result.ok) {
+      await salonRepository.updateOrder(order.id, {
+        smav_bill_status: 'finalize_pending',
+        smav_finalize_error: String(result.error || 'Finalize retry failed').slice(0, 500),
+      });
+      return res.status(result.status >= 400 && result.status < 600 ? result.status : 503).json({
+        success: false,
+        error: result.error || 'SMAV finalize retry failed',
+      });
+    }
+
+    const updated = await salonRepository.updateOrder(order.id, {
+      smav_bill_status: 'finalized',
+      smav_sale_id: result.saleId || order.smav_sale_id,
+      smav_finalized_at: result.finalizedAt || new Date().toISOString(),
+      smav_finalize_error: null,
+    });
+
+    await salonRepository.logAudit(
+      'SMAV_FINALIZE_RETRIED',
+      'Order',
+      order.id,
+      admin.name,
+      `Finalized central bill ${order.bill_number} in SMAV`
+    );
+
+    return res.json({ success: true, order: updated || order });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -7328,12 +7938,39 @@ app.post('/api/print-jobs/reprint', async (req, res) => {
     return res.status(400).json({ error: 'No print device registered' });
   }
 
+  // Strip street address, city, PIN code, and GSTIN from thermal receipt payloads
+  const cleanPayload: Record<string, any> = { ...(payload || {}) };
+  delete cleanPayload.salon_address;
+  delete cleanPayload.address;
+  delete cleanPayload.city;
+  delete cleanPayload.pin_code;
+  delete cleanPayload.pincode;
+  delete cleanPayload.gstin;
+  delete cleanPayload.gst_number;
+
+  if (order_id) {
+    const order = await salonRepository.getOrderById(order_id);
+    if (order) {
+      cleanPayload.bill_number = order.bill_number;
+      cleanPayload.branch_code = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || 'GACHI';
+      cleanPayload.branch_name = order.branch_name || getCleanReceiptBranchName({
+        branchId: order.branch_id,
+        branchCode: cleanPayload.branch_code,
+      });
+    }
+  } else if (appointment_id) {
+    const apt = await salonRepository.getAppointmentById(appointment_id);
+    if (apt) {
+      cleanPayload.branch_name = getCleanReceiptBranchName({ branchId: apt.branch_id });
+    }
+  }
+
   const job = await salonRepository.queuePrintJob({
     device_id: activeDevice.id,
     job_type: job_type || 'bill',
     order_id,
     appointment_id,
-    payload
+    payload: cleanPayload
   });
 
   res.json(job);

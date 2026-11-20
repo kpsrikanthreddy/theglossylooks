@@ -2852,8 +2852,27 @@ export class SalonDatabase implements ISalonRepository {
     };
   }
 
-  public async createOrder(orderData: Omit<Order, 'id' | 'bill_number' | 'created_at'>, performedBy: string): Promise<Order> {
-    const billNum = `TGL-${new Date().getFullYear()}-${1000 + this.data.orders.length + 1}`;
+  public async getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null> {
+    const clean = String(idempotencyKey || '').trim();
+    if (!clean) return null;
+    const found = this.data.orders.find(o => o.idempotency_key === clean);
+    if (!found) return null;
+    return this.getOrderById(found.id);
+  }
+
+  public async createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order> {
+    // 1. Idempotency check before creating any new bill
+    if (orderData.idempotency_key) {
+      const existing = await this.getOrderByIdempotencyKey(orderData.idempotency_key);
+      if (existing) return existing;
+    }
+
+    // 2. Fail closed: local bill number generation is removed; SMAV central bill_number is mandatory
+    const centralBillNum = String(orderData.bill_number || '').trim();
+    if (!centralBillNum) {
+      throw new Error('CENTRAL_BILL_NUMBER_REQUIRED: Local bill number generation is disabled. Reserve a central bill number from SMAV before creating a bill.');
+    }
+
     const cashier = this.resolveStaff(performedBy || orderData.cashier_name);
     const resolvedItems = (orderData.items || []).map(item => {
       const itemStaff = this.resolveStaff(item.staff_id || item.staff_name);
@@ -2864,11 +2883,21 @@ export class SalonDatabase implements ISalonRepository {
       };
     });
 
+    const matchedBranch = this.data.branches.find(b => b.id === orderData.branch_id);
+    const cleanBranchName = orderData.branch_name || (
+      matchedBranch?.name?.toLowerCase().includes('kondapur') || orderData.branch_id === 'brn-1793346038689'
+        ? 'Kondapur'
+        : 'Gachibowli'
+    );
+    const resolvedBranchCode = orderData.branch_code || (cleanBranchName.toLowerCase().includes('kondapur') ? 'KONDA' : 'GACHI');
+
     const newOrder: Order = {
       ...orderData,
-      id: `ord-${Date.now()}`,
-      bill_number: billNum,
-      invoice_number: `INV-${new Date().getFullYear()}-${(this.data.orders.length + 1).toString().padStart(4, '0')}`,
+      id: `ord-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+      bill_number: centralBillNum,
+      branch_code: resolvedBranchCode,
+      branch_name: cleanBranchName,
+      is_legacy_bill: orderData.is_legacy_bill ?? false,
       cashier_id: cashier ? cashier.id : orderData.cashier_id,
       cashier_name: cashier ? cashier.name : (orderData.cashier_name || 'Cashier'),
       items: resolvedItems,
@@ -2881,6 +2910,7 @@ export class SalonDatabase implements ISalonRepository {
       cust.total_spend += newOrder.paid_amount;
       cust.loyalty_points += Math.floor(newOrder.paid_amount * 0.05); // 5% loyalty reward
       cust.last_visit_at = new Date().toISOString();
+      cust.latest_bill_number = newOrder.bill_number;
     } else {
       cust = {
         id: `cust-${Date.now()}`,
@@ -2890,6 +2920,7 @@ export class SalonDatabase implements ISalonRepository {
         total_spend: newOrder.paid_amount,
         visit_count: 1,
         saved_addresses: [],
+        latest_bill_number: newOrder.bill_number,
         last_visit_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
@@ -2900,7 +2931,6 @@ export class SalonDatabase implements ISalonRepository {
 
     // Automatic Inventory Reduction for consumable items linked to billed services/products
     orderData.items.forEach(item => {
-      // Find matching product by name or keyword
       const prod = this.data.products.find(p => p.name.toLowerCase().includes(item.item_name.toLowerCase()) || item.item_name.toLowerCase().includes(p.name.toLowerCase()));
       if (prod && prod.current_stock > 0) {
         prod.current_stock = Math.max(0, prod.current_stock - item.quantity);
@@ -2923,9 +2953,12 @@ export class SalonDatabase implements ISalonRepository {
     // Record Payment Entry
     if (newOrder.paid_amount > 0) {
       const payment: PaymentRecord = {
-        id: `pay-${Date.now()}`,
+        id: `pay-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
         order_id: newOrder.id,
         bill_number: newOrder.bill_number,
+        branch_id: newOrder.branch_id,
+        branch_code: newOrder.branch_code,
+        branch_name: newOrder.branch_name,
         customer_name: newOrder.customer_name,
         customer_phone: newOrder.customer_phone,
         amount: newOrder.paid_amount,
@@ -2939,7 +2972,7 @@ export class SalonDatabase implements ISalonRepository {
       this.data.payments.unshift(payment);
     }
 
-    // Auto-Print trigger (PrintProvider abstraction)
+    // Auto-Print trigger (thermal receipt payload with Branch + central Bill No; NO street address/city/PIN/GSTIN)
     const billDevice = this.data.print_devices.find(d => d.is_online && d.auto_print_bill);
     if (billDevice) {
       this.queuePrintJob({
@@ -2947,8 +2980,9 @@ export class SalonDatabase implements ISalonRepository {
         job_type: 'bill',
         order_id: newOrder.id,
         payload: {
+          branch_name: newOrder.branch_name,
+          branch_code: newOrder.branch_code,
           bill_number: newOrder.bill_number,
-          invoice_number: newOrder.invoice_number,
           customer_name: newOrder.customer_name,
           customer_phone: newOrder.customer_phone,
           items: newOrder.items.map(i => ({
@@ -2969,7 +3003,7 @@ export class SalonDatabase implements ISalonRepository {
       });
     }
 
-    await this.logAudit('CREATE', 'Order', newOrder.id, performedBy, `Generated Bill: ${newOrder.bill_number} for ₹${newOrder.grand_total}`);
+    await this.logAudit('CREATE', 'Order', newOrder.id, performedBy, `Generated Bill: ${newOrder.bill_number} (Branch: ${newOrder.branch_name}/${newOrder.branch_code}) for ₹${newOrder.grand_total}`);
     this.save();
     return newOrder;
   }
@@ -2977,7 +3011,14 @@ export class SalonDatabase implements ISalonRepository {
   public async updateOrder(id: string, data: Partial<Order>): Promise<Order | null> {
     const idx = this.data.orders.findIndex(o => o.id === id);
     if (idx === -1) return null;
-    this.data.orders[idx] = { ...this.data.orders[idx], ...data };
+    const existing = this.data.orders[idx];
+    const safeData: Partial<Order> = { ...data };
+    // Enforce immutable bill_number: never allow altering an existing bill's number
+    if (safeData.bill_number !== undefined && existing.bill_number && safeData.bill_number !== existing.bill_number) {
+      throw new Error(`IMMUTABLE_BILL_NUMBER: Existing bill_number (${existing.bill_number}) cannot be modified.`);
+    }
+    delete safeData.bill_number;
+    this.data.orders[idx] = { ...existing, ...safeData };
     this.save();
     return this.data.orders[idx];
   }
