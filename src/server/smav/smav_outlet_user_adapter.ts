@@ -75,13 +75,17 @@ export class SmavOutletUserAdapter {
       ? config.timeoutMs
       : DEFAULT_SYNC_TIMEOUT_MS;
 
-    if (config.gatewayUrl?.trim()) {
+    const configuredGatewayUrl = config.gatewayUrl?.trim().replace(/\/+$/, '') || '';
+    const gatewayValueIsEdgeFunction = /\/functions\/v1\/[^/?#]+(?:[?#].*)?$/i.test(configuredGatewayUrl);
+
+    if (configuredGatewayUrl && !gatewayValueIsEdgeFunction) {
       this.useCentralGateway = true;
-      this.gatewayOrEdgeUrl = config.gatewayUrl.trim().replace(/\/+$/, '');
+      this.gatewayOrEdgeUrl = configuredGatewayUrl;
     } else {
       this.useCentralGateway = false;
       const smavSupabaseUrl = (process.env.SMAV_SUPABASE_URL || '').trim().replace(/\/+$/, '');
       this.gatewayOrEdgeUrl = (
+        (gatewayValueIsEdgeFunction ? configuredGatewayUrl : '') ||
         config.edgeFunctionUrl ||
         process.env.SMAV_EDGE_FUNCTION_URL ||
         (smavSupabaseUrl ? `${smavSupabaseUrl}/functions/v1/smav-identity-admin` : '') ||
