@@ -2,7 +2,15 @@ import {
   syncUserToSmavAndPersist,
   setSmavUserStatusAndPersist,
   resetSmavUserPasswordAndPersist,
+  executeCommittedOutboxSync,
+  generateSyncIdempotencyKey,
   handleIncomingSmavWebhook,
+  retrySmavSyncForUser,
+  processPendingSmavUserSyncOutbox,
+  triggerNonBlockingOutboxDrain,
+  reconcileAdminUsersToSmav,
+  deriveUserSyncStatus,
+  mapLocalRoleToSmavRole,
 } from './src/server/smavSync.ts';
 /**
  * @license
@@ -18,6 +26,11 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { salonRepository } from './src/server/db.ts';
+import {
+  isIdempotencyKeyConflictError,
+  isMigration024RequiredError,
+  isCentralAuthLinkForbiddenError,
+} from './src/server/repositories/salonRepository.ts';
 import type {
   WhatsAppMessageStatus,
   Order,
@@ -580,29 +593,38 @@ app.get(['/api/auth/admin/me', '/auth/admin/me', '/api/admin/me', '/admin/me'], 
 });
 
 // User Management - RESTRICTED TO OWNER ONLY
-app.get('/api/admin/users', async (req, res) => {
-  const admin = await getAuthAdmin(req);
-  if (!admin || admin.role !== 'owner') {
-    return res.status(403).json({ error: 'Access denied: Only the Salon Owner can view and manage staff accounts.' });
-  }
-  const users = await salonRepository.getUsers();
-  const safeUsers = users.map(u => ({
+function formatSafeAdminUser(u: any) {
+  return {
     id: u.id,
     user_id: u.user_id,
     username: u.username || u.user_id,
     name: u.name,
     email: u.email,
     role: u.role,
+    smav_role: mapLocalRoleToSmavRole(u.role),
     phone: u.phone,
     is_active: u.is_active,
-    central_auth_id: u.central_auth_id,
-    central_auth_status: u.central_auth_status,
-    central_last_synced_at: u.central_last_synced_at,
-    last_login_at: u.last_login_at,
+    central_auth_id: u.central_auth_id || null,
+    central_auth_status: u.central_auth_status || (u.is_active ? 'ACTIVE' : 'DISABLED'),
+    central_last_synced_at: u.central_last_synced_at || null,
+    central_sync_status: deriveUserSyncStatus(u),
+    central_sync_error: u.central_sync_error || null,
+    central_sync_last_attempt_at: u.central_sync_last_attempt_at || null,
+    last_login_at: u.last_login_at || null,
     created_at: u.created_at,
-    updated_at: u.updated_at
-  }));
-  res.json(safeUsers);
+    updated_at: u.updated_at,
+  };
+}
+
+app.get('/api/admin/users', async (req, res) => {
+  const admin = await getAuthAdmin(req);
+  if (!admin || admin.role !== 'owner') {
+    return res.status(403).json({ error: 'Access denied: Only the Salon Owner can view and manage staff accounts.' });
+  }
+  // Opportunistically drain due PENDING outbox retries in the background without blocking UI load
+  triggerNonBlockingOutboxDrain(30_000);
+  const users = await salonRepository.getUsers();
+  res.json(users.map(formatSafeAdminUser));
 });
 
 app.post('/api/admin/users', async (req, res) => {
@@ -610,68 +632,134 @@ app.post('/api/admin/users', async (req, res) => {
   if (!admin || admin.role !== 'owner') {
     return res.status(403).json({ error: 'Access denied: Only the Salon Owner can create new staff users.' });
   }
+  if (req.body?.central_auth_id !== undefined) {
+    return res.status(403).json({
+      error: 'Ordinary Admin User creation cannot assign arbitrary central_auth_id values. SMAV must issue a verified Central Auth UUID.',
+      code: 'CENTRAL_AUTH_LINK_FORBIDDEN',
+    });
+  }
   const { name, email, phone, role, user_id, username, password } = req.body;
   if (!name || !role) {
     return res.status(400).json({ error: 'Staff name and role are required.' });
   }
 
+  const rawPassword = typeof password === 'string' ? password.trim() : '';
+  if (rawPassword && rawPassword.length < 8) {
+    return res.status(400).json({ error: 'Initial password must be at least 8 characters to satisfy SMAV Central Auth requirements.' });
+  }
+
   const normalizedEmail = (
     email ? String(email) : `${String(name).toLowerCase().replace(/[^a-z0-9]/g, '')}@theglossylooks.com`
   ).trim().toLowerCase();
-  const normalizedUserCode = String(user_id || '').trim().toUpperCase();
-  const normalizedUsername = String(username || user_id || '').trim().toLowerCase();
-
-  // Prevent duplicate local & Central Auth accounts
-  const existingUsers = await salonRepository.getUsers();
-  const duplicate = existingUsers.find(u =>
-    (u.email && u.email.trim().toLowerCase() === normalizedEmail) ||
-    (normalizedUserCode && u.user_id && u.user_id.trim().toUpperCase() === normalizedUserCode) ||
-    (normalizedUsername && u.username && u.username.trim().toLowerCase() === normalizedUsername)
-  );
-  if (duplicate) {
-    return res.status(409).json({
-      error: `A staff account already exists with this email or Staff ID (${duplicate.user_id}). Edit the existing account instead.`
-    });
+  if (!normalizedEmail.includes('@')) {
+    return res.status(400).json({ error: 'A valid email address is required.' });
   }
 
-  const rawPassword = typeof password === 'string' ? password.trim() : '';
-  const newUser = await salonRepository.createUser({
-    name: String(name).trim(),
-    email: normalizedEmail,
-    phone: phone ? String(phone).trim() : '',
-    role,
-    user_id: normalizedUserCode,
-    ...(normalizedUsername ? { username: normalizedUsername } : {}),
-    password_hash: hashSalonPassword(rawPassword || crypto.randomBytes(18).toString('base64url')),
-    is_active: true
-  }, admin.name);
+  const normalizedUserCode = String(user_id || '').trim().toUpperCase();
+  const normalizedUsername = String(username || user_id || '').trim().toLowerCase();
+  const explicitIdemKey = typeof req.headers['x-idempotency-key'] === 'string'
+    ? req.headers['x-idempotency-key'].trim()
+    : '';
 
-  const smavSync = await syncUserToSmavAndPersist(newUser, {
-    ...(rawPassword ? { initialPassword: rawPassword } : {}),
-    idempotencyKey: req.headers['x-idempotency-key'] as string | undefined,
-    performedBy: admin.name,
-  });
+  const createIdempotencyKey = generateSyncIdempotencyKey(
+    normalizedUserCode || normalizedEmail.replace(/[^a-z0-9]/gi, '').slice(0, 24),
+    'USER_CREATED',
+    explicitIdemKey || undefined
+  );
 
-  const refreshed = (await salonRepository.getUsers()).find(u => String(u.id) === String(newUser.id)) || newUser;
-  res.status(201).json({
-    smavSync,
-    id: refreshed.id,
-    user_id: refreshed.user_id,
-    username: refreshed.username || refreshed.user_id,
-    name: refreshed.name,
-    email: refreshed.email,
-    role: refreshed.role,
-    phone: refreshed.phone,
-    is_active: refreshed.is_active,
-    central_auth_id: refreshed.central_auth_id || smavSync.centralAuthId,
-    central_auth_status: refreshed.central_auth_status,
-  });
+  try {
+    // If the caller supplied an explicit X-Idempotency-Key that already exists, delegate directly
+    // to createUserWithSmavOutbox so the DB verifies the exact payload fingerprint + password match.
+    const existingIdemRow = explicitIdemKey
+      ? await salonRepository.getSmavUserSyncOutboxByIdempotencyKey(explicitIdemKey)
+      : null;
+
+    if (!existingIdemRow) {
+      // Prevent duplicate local & Central Auth accounts
+      const existingUsers = await salonRepository.getUsers();
+      const duplicate = existingUsers.find(u =>
+        (u.email && u.email.trim().toLowerCase() === normalizedEmail) ||
+        (normalizedUserCode && u.user_id && u.user_id.trim().toUpperCase() === normalizedUserCode) ||
+        (normalizedUsername && u.username && u.username.trim().toLowerCase() === normalizedUsername)
+      );
+      if (duplicate) {
+        return res.status(409).json({
+          error: `A staff account already exists with this email or Staff ID (${duplicate.user_id}). Edit the existing account instead.`
+        });
+      }
+    }
+
+    const { user: newUser, outboxItem, created } = await salonRepository.createUserWithSmavOutbox(
+      {
+        name: String(name).trim(),
+        email: normalizedEmail,
+        phone: phone ? String(phone).trim() : '',
+        role,
+        user_id: normalizedUserCode,
+        ...(normalizedUsername ? { username: normalizedUsername } : {}),
+        password_hash: hashSalonPassword(rawPassword || crypto.randomBytes(18).toString('base64url')),
+        is_active: true,
+        central_sync_status: 'PENDING',
+      },
+      {
+        idempotency_key: createIdempotencyKey,
+        event_type: 'USER_CREATED',
+        action: 'upsert_user',
+        max_attempts: 6,
+        credential_mode: rawPassword ? 'explicit' : 'generated',
+        ...(rawPassword
+          ? { verifyReplayPassword: (storedHash: string) => verifySalonPassword(storedHash, rawPassword) }
+          : {}),
+      },
+      admin.name
+    );
+
+    const smavSync = await executeCommittedOutboxSync({
+      outboxItem,
+      created,
+      user: newUser,
+      ...(rawPassword ? { transientInitialPassword: rawPassword } : {}),
+      performedBy: admin.name,
+    });
+
+    const refreshed = (await salonRepository.getUsers()).find(u => String(u.id) === String(newUser.id)) || newUser;
+    return res.status(created ? 201 : 200).json({
+      smavSync,
+      ...formatSafeAdminUser({
+        ...refreshed,
+        central_auth_id: refreshed.central_auth_id || smavSync.centralAuthId,
+        central_sync_status: refreshed.central_sync_status || smavSync.syncStatus,
+        central_sync_error: refreshed.central_sync_error ?? smavSync.error ?? null,
+      }),
+    });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    if (isCentralAuthLinkForbiddenError(err)) {
+      return res.status(403).json({ error: err.message, code: 'CENTRAL_AUTH_LINK_FORBIDDEN' });
+    }
+    if (isIdempotencyKeyConflictError(err)) {
+      return res.status(409).json({ error: err.message, conflict: true });
+    }
+    return res.status(500).json({ error: err?.message || 'Failed to create staff user.' });
+  }
 });
 
 app.patch('/api/admin/users/:id', async (req, res) => {
   const admin = await getAuthAdmin(req);
   if (!admin || admin.role !== 'owner') {
     return res.status(403).json({ error: 'Access denied: Only the Salon Owner can edit staff accounts.' });
+  }
+  if (req.body?.central_auth_id !== undefined) {
+    return res.status(403).json({
+      error: 'Ordinary Admin User updates cannot assign or modify central_auth_id. Use verified SMAV linking or audited manual reconciliation.',
+      code: 'CENTRAL_AUTH_LINK_FORBIDDEN',
+    });
   }
   const { name, email, phone, role, user_id, username, is_active } = req.body;
   const allUsers = await salonRepository.getUsers();
@@ -683,6 +771,10 @@ app.patch('/api/admin/users/:id', async (req, res) => {
   const normalizedEmail = email !== undefined ? String(email).trim().toLowerCase() : undefined;
   const normalizedUserCode = user_id !== undefined ? String(user_id).trim().toUpperCase() : undefined;
   const normalizedUsername = username !== undefined ? String(username).trim().toLowerCase() : undefined;
+
+  if (normalizedEmail !== undefined && !normalizedEmail.includes('@')) {
+    return res.status(400).json({ error: 'A valid email address is required.' });
+  }
 
   // Prevent duplicates when editing email, user_id, or username
   if (normalizedEmail !== undefined || normalizedUserCode !== undefined || normalizedUsername !== undefined) {
@@ -700,65 +792,122 @@ app.patch('/api/admin/users/:id', async (req, res) => {
     }
   }
 
-  // UUID-preserving email change: ensure Central Auth UUID is linked before changing email
-  let linkedStaff = existingStaff;
-  const emailChanged =
-    normalizedEmail !== undefined &&
-    normalizedEmail !== String(existingStaff.email || '').trim().toLowerCase();
+  try {
+    // UUID-preserving email change: resolve & link Central Auth UUID before mutating email
+    let linkedStaff = existingStaff;
+    const emailChanged =
+      normalizedEmail !== undefined &&
+      normalizedEmail !== String(existingStaff.email || '').trim().toLowerCase();
 
-  if (emailChanged && !existingStaff.central_auth_id) {
-    const preLink = await syncUserToSmavAndPersist(existingStaff, { performedBy: admin.name });
-    const reloaded = (await salonRepository.getUsers()).find(u => String(u.id) === String(existingStaff.id));
-    if (reloaded) linkedStaff = reloaded;
-    if (!linkedStaff.central_auth_id && !preLink.centralAuthId) {
-      return res.status(409).json({
-        error: 'Cannot change email before Central Auth UUID is linked. Run SMAV sync first so no duplicate Central Auth user is created.'
+    if (emailChanged && !existingStaff.central_auth_id) {
+      const preLink = await syncUserToSmavAndPersist(existingStaff, {
+        eventType: 'RECONCILE_USER',
+        performedBy: admin.name,
+      });
+      const reloaded = (await salonRepository.getUsers()).find(u => String(u.id) === String(existingStaff.id));
+      if (reloaded) linkedStaff = reloaded;
+      if (!linkedStaff.central_auth_id && !preLink.centralAuthId) {
+        return res.status(409).json({
+          error: 'Cannot change email before Central Auth UUID is linked. Use Retry Sync first so no duplicate Central Auth user is created.'
+        });
+      }
+    }
+
+    const roleChanged = role !== undefined && role !== existingStaff.role;
+    const nextIsActive = is_active !== undefined ? Boolean(is_active) : Boolean(existingStaff.is_active);
+    const statusChanged = is_active !== undefined && nextIsActive !== Boolean(existingStaff.is_active);
+
+    const isStatusOnlyToggle =
+      is_active !== undefined &&
+      name === undefined &&
+      normalizedEmail === undefined &&
+      phone === undefined &&
+      role === undefined &&
+      normalizedUserCode === undefined &&
+      normalizedUsername === undefined;
+
+    const resolvedEventType =
+      isStatusOnlyToggle || (statusChanged && !nextIsActive)
+        ? (nextIsActive ? 'USER_ACTIVATED' : 'USER_DEACTIVATED')
+        : emailChanged
+          ? 'EMAIL_CHANGED'
+          : roleChanged
+            ? 'ROLE_CHANGED'
+            : statusChanged && nextIsActive
+              ? 'USER_ACTIVATED'
+              : 'USER_UPDATED';
+
+    const effectiveCentralAuthId = linkedStaff.central_auth_id || existingStaff.central_auth_id;
+    const resolvedAction =
+      !nextIsActive && (isStatusOnlyToggle || statusChanged)
+        ? 'set_status'
+        : effectiveCentralAuthId
+          ? 'update_user'
+          : 'upsert_user';
+
+    const updateIdempotencyKey = generateSyncIdempotencyKey(
+      existingStaff,
+      resolvedEventType,
+      req.headers['x-idempotency-key'] as string | undefined
+    );
+
+    const atomicUpdate = await salonRepository.updateUserWithSmavOutbox(
+      req.params.id,
+      {
+        ...(name !== undefined && { name: String(name).trim() }),
+        ...(normalizedEmail !== undefined && { email: normalizedEmail }),
+        ...(phone !== undefined && { phone: String(phone).trim() }),
+        ...(role !== undefined && { role }),
+        ...(normalizedUserCode !== undefined && { user_id: normalizedUserCode }),
+        ...(normalizedUsername !== undefined && { username: normalizedUsername }),
+        ...(is_active !== undefined && { is_active }),
+      },
+      {
+        idempotency_key: updateIdempotencyKey,
+        event_type: resolvedEventType,
+        action: resolvedAction,
+        max_attempts: 6,
+      },
+      admin.name
+    );
+
+    if (!atomicUpdate) return res.status(404).json({ error: 'User not found' });
+
+    const { user: updated, outboxItem, created } = atomicUpdate;
+
+    const smavSync = await executeCommittedOutboxSync({
+      outboxItem,
+      created,
+      user: updated,
+      performedBy: admin.name,
+    });
+
+    const refreshed = (await salonRepository.getUsers()).find(u => String(u.id) === String(updated.id)) || updated;
+    return res.json({
+      smavSync,
+      ...formatSafeAdminUser({
+        ...refreshed,
+        central_auth_id: refreshed.central_auth_id || smavSync.centralAuthId,
+        central_sync_status: refreshed.central_sync_status || smavSync.syncStatus,
+        central_sync_error: refreshed.central_sync_error ?? smavSync.error ?? null,
+      }),
+    });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
       });
     }
+    if (isCentralAuthLinkForbiddenError(err)) {
+      return res.status(403).json({ error: err.message, code: 'CENTRAL_AUTH_LINK_FORBIDDEN' });
+    }
+    if (isIdempotencyKeyConflictError(err)) {
+      return res.status(409).json({ error: err.message, conflict: true });
+    }
+    return res.status(500).json({ error: err?.message || 'Failed to update staff account.' });
   }
-
-  const updated = await salonRepository.updateUser(req.params.id, {
-    ...(name !== undefined && { name: String(name).trim() }),
-    ...(normalizedEmail !== undefined && { email: normalizedEmail }),
-    ...(phone !== undefined && { phone: String(phone).trim() }),
-    ...(role !== undefined && { role }),
-    ...(normalizedUserCode !== undefined && { user_id: normalizedUserCode }),
-    ...(normalizedUsername !== undefined && { username: normalizedUsername }),
-    ...(is_active !== undefined && { is_active }),
-    ...(linkedStaff.central_auth_id && !existingStaff.central_auth_id ? { central_auth_id: linkedStaff.central_auth_id } : {}),
-  }, admin.name);
-
-  if (!updated) return res.status(404).json({ error: 'User not found' });
-
-  const isStatusOnlyToggle =
-    is_active !== undefined &&
-    name === undefined &&
-    normalizedEmail === undefined &&
-    phone === undefined &&
-    role === undefined &&
-    normalizedUserCode === undefined &&
-    normalizedUsername === undefined;
-
-  const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
-  const smavSync = isStatusOnlyToggle
-    ? await setSmavUserStatusAndPersist(updated, Boolean(updated.is_active), { idempotencyKey, performedBy: admin.name })
-    : await syncUserToSmavAndPersist(updated, { idempotencyKey, performedBy: admin.name });
-
-  const refreshed = (await salonRepository.getUsers()).find(u => String(u.id) === String(updated.id)) || updated;
-  res.json({
-    smavSync,
-    id: refreshed.id,
-    user_id: refreshed.user_id,
-    username: refreshed.username || refreshed.user_id,
-    name: refreshed.name,
-    email: refreshed.email,
-    role: refreshed.role,
-    phone: refreshed.phone,
-    is_active: refreshed.is_active,
-    central_auth_id: refreshed.central_auth_id || smavSync.centralAuthId,
-    central_auth_status: refreshed.central_auth_status,
-    last_login_at: refreshed.last_login_at
-  });
 });
 
 app.post('/api/admin/users/:id/reset-password', async (req, res) => {
@@ -767,20 +916,182 @@ app.post('/api/admin/users/:id/reset-password', async (req, res) => {
     return res.status(403).json({ error: 'Access denied: Only the Salon Owner can reset passwords.' });
   }
   const { new_password } = req.body;
-  if (!new_password || String(new_password).trim().length < 4) {
-    return res.status(400).json({ error: 'New password must be at least 4 characters.' });
+  const cleanPassword = String(new_password || '').trim();
+  if (cleanPassword.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters to satisfy SMAV Central Auth requirements.' });
   }
-  const cleanPassword = String(new_password).trim();
-  const success = await salonRepository.resetUserPassword(req.params.id, hashSalonPassword(cleanPassword), admin.name);
-  if (!success) return res.status(404).json({ error: 'User not found' });
+
   const staff = (await salonRepository.getUsers()).find(u => String(u.id) === String(req.params.id));
-  const smavSync = staff
-    ? await resetSmavUserPasswordAndPersist(staff, cleanPassword, {
-        idempotencyKey: req.headers['x-idempotency-key'] as string | undefined,
-        performedBy: admin.name,
-      })
-    : { synced: false, outletCode: 'glossylooks' as const, status: 'failed', error: 'Staff missing' };
-  res.json({ success: true, smavSync, message: 'Local password reset; inspect smavSync for central status.' });
+  if (!staff) {
+    return res.status(404).json({
+      success: false,
+      localUpdated: false,
+      centralSynced: false,
+      error: 'User not found',
+    });
+  }
+
+  const explicitIdemKey = typeof req.headers['x-idempotency-key'] === 'string'
+    ? req.headers['x-idempotency-key'].trim()
+    : '';
+
+  // Pre-mutation idempotency guard: never mutate local password on conflicting or already-finalized key
+  if (explicitIdemKey) {
+    try {
+      const existingAudit = await salonRepository.getSmavUserSyncOutboxByIdempotencyKey(explicitIdemKey);
+      if (existingAudit) {
+        if (
+          String(existingAudit.local_user_id || '') !== String(staff.id) ||
+          existingAudit.action !== 'reset_password' ||
+          existingAudit.event_type !== 'PASSWORD_RESET'
+        ) {
+          return res.status(409).json({
+            success: false,
+            localUpdated: false,
+            centralSynced: false,
+            conflict: true,
+            error: `Idempotency key "${explicitIdemKey}" was already used for another user or operation.`,
+          });
+        }
+        if (existingAudit.status === 'SYNCED') {
+          if (!verifySalonPassword(String(staff.password_hash || ''), cleanPassword)) {
+            return res.status(409).json({
+              success: false,
+              localUpdated: false,
+              centralSynced: false,
+              conflict: true,
+              error: `Idempotency key "${explicitIdemKey}" was already used with a different password.`,
+            });
+          }
+          return res.json({
+            success: true,
+            localUpdated: true,
+            centralSynced: true,
+            partialFailure: false,
+            passwordResetRequired: false,
+            smavSync: {
+              synced: true,
+              syncStatus: 'SYNCED' as const,
+              outletCode: 'glossylooks' as const,
+              status: 'idempotent_replay',
+              outboxId: existingAudit.id,
+              idempotencyKey: explicitIdemKey,
+              centralAuthId: existingAudit.response_central_auth_id || staff.central_auth_id,
+              email: staff.email,
+            },
+            message: 'Password reset was already completed for this idempotency key.',
+          });
+        }
+        return res.status(409).json({
+          success: false,
+          localUpdated: false,
+          centralSynced: false,
+          conflict: true,
+          passwordResetRequired: true,
+          error:
+            existingAudit.last_error ||
+            'Previous password reset with this idempotency key failed. Submit a new Reset Password request with a fresh idempotency key.',
+        });
+      }
+    } catch (idemErr: any) {
+      if (isMigration024RequiredError(idemErr)) {
+        return res.status(503).json({
+          success: false,
+          localUpdated: false,
+          centralSynced: false,
+          code: 'MIGRATION_024_REQUIRED',
+          migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+          error: idemErr.message,
+        });
+      }
+      return res.status(500).json({
+        success: false,
+        localUpdated: false,
+        centralSynced: false,
+        error: idemErr?.message || 'Unable to verify idempotency key.',
+      });
+    }
+  }
+
+  // Step 1: Update local password hash securely (explicit failure reporting if local DB write fails)
+  try {
+    const localUpdated = await salonRepository.resetUserPassword(
+      staff.id,
+      hashSalonPassword(cleanPassword),
+      admin.name
+    );
+    if (!localUpdated) {
+      return res.status(500).json({
+        success: false,
+        localUpdated: false,
+        centralSynced: false,
+        partialFailure: false,
+        passwordResetRequired: true,
+        error: 'Failed to update local Glossy Looks password; SMAV Central Auth was not modified.',
+      });
+    }
+  } catch (localErr: any) {
+    return res.status(500).json({
+      success: false,
+      localUpdated: false,
+      centralSynced: false,
+      partialFailure: false,
+      passwordResetRequired: true,
+      error: `Local Glossy Looks password update failed (${localErr?.message || 'database error'}); SMAV Central Auth was not modified.`,
+    });
+  }
+
+  // Step 2: Synchronous Central Auth password reset (transient credential only; never stored in outbox/logs)
+  try {
+    const smavSync = await resetSmavUserPasswordAndPersist(staff, cleanPassword, {
+      idempotencyKey: explicitIdemKey || undefined,
+      performedBy: admin.name,
+    });
+    return res.json({
+      success: smavSync.synced,
+      localUpdated: true,
+      centralSynced: smavSync.synced,
+      partialFailure: !smavSync.synced,
+      passwordResetRequired: Boolean(smavSync.passwordResetRequired),
+      smavSync,
+      ...(smavSync.error ? { error: smavSync.error } : {}),
+      message: smavSync.synced
+        ? 'Password updated locally and synced to SMAV Central Auth.'
+        : `Local Glossy Looks password was updated, but SMAV Central Auth password sync failed (${smavSync.error || smavSync.syncStatus}). Re-submit Reset Password to sync credentials securely.`,
+    });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        success: false,
+        localUpdated: true,
+        centralSynced: false,
+        partialFailure: true,
+        passwordResetRequired: true,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+        error: err.message,
+      });
+    }
+    if (isIdempotencyKeyConflictError(err)) {
+      return res.status(409).json({
+        success: false,
+        localUpdated: true,
+        centralSynced: false,
+        partialFailure: true,
+        conflict: true,
+        passwordResetRequired: true,
+        error: err.message,
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      localUpdated: true,
+      centralSynced: false,
+      partialFailure: true,
+      passwordResetRequired: true,
+      error: 'Local Glossy Looks password was updated, but SMAV Central Auth password sync encountered an unexpected error. Re-submit Reset Password to sync credentials securely.',
+    });
+  }
 });
 
 app.delete('/api/admin/users/:id', async (req, res) => {
@@ -788,28 +1099,156 @@ app.delete('/api/admin/users/:id', async (req, res) => {
   if (!admin || admin.role !== 'owner') {
     return res.status(403).json({ error: 'Access denied: Only the Salon Owner can deactivate staff accounts.' });
   }
-  const before = (await salonRepository.getUsers()).find(u => String(u.id) === String(req.params.id));
-  const ok = await salonRepository.deleteUser(req.params.id, admin.name);
-  const smavSync = ok && before
-    ? await setSmavUserStatusAndPersist(before, false, {
-        idempotencyKey: req.headers['x-idempotency-key'] as string | undefined,
-        performedBy: admin.name,
-      })
-    : null;
-  res.json({ success: ok, smavSync });
+  const deactivateIdempotencyKey = generateSyncIdempotencyKey(
+    req.params.id,
+    'USER_DEACTIVATED',
+    req.headers['x-idempotency-key'] as string | undefined
+  );
+  try {
+    const atomicDeactivate = await salonRepository.updateUserWithSmavOutbox(
+      req.params.id,
+      { is_active: false },
+      {
+        idempotency_key: deactivateIdempotencyKey,
+        event_type: 'USER_DEACTIVATED',
+        action: 'set_status',
+        max_attempts: 6,
+      },
+      admin.name
+    );
+    if (!atomicDeactivate) {
+      return res.json({ success: false, smavSync: null });
+    }
+    const smavSync = await executeCommittedOutboxSync({
+      outboxItem: atomicDeactivate.outboxItem,
+      created: atomicDeactivate.created,
+      user: atomicDeactivate.user,
+      performedBy: admin.name,
+    });
+    return res.json({ success: true, smavSync });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    if (isIdempotencyKeyConflictError(err)) {
+      return res.status(409).json({ error: err.message, conflict: true });
+    }
+    return res.status(500).json({ error: err?.message || 'Failed to deactivate staff account.' });
+  }
 });
 
-// Owner-triggered one-time migration / reconciliation of existing staff (no passwords copied).
-app.post('/api/admin/users/sync-smav', async (req, res) => {
+// Owner-authorized single-user Retry Sync action
+app.post('/api/admin/users/:id/retry-smav-sync', async (req, res) => {
   const admin = await getAuthAdmin(req);
-  if (!admin || admin.role !== 'owner') return res.status(403).json({ error: 'Owner only' });
-  const users = await salonRepository.getUsers();
-  const results = [];
-  for (const u of users) {
-    const syncRes = await syncUserToSmavAndPersist(u, { performedBy: admin.name });
-    results.push({ userId: u.user_id, ...syncRes });
+  if (!admin || admin.role !== 'owner') {
+    return res.status(403).json({ error: 'Access denied: Only the Salon Owner can retry SMAV synchronization.' });
   }
-  res.json({ results });
+  try {
+    const smavSync = await retrySmavSyncForUser(req.params.id, admin.name);
+    const refreshed = (await salonRepository.getUsers()).find(u => String(u.id) === String(req.params.id));
+    if (!refreshed) {
+      return res.status(404).json({ error: 'Staff user not found', smavSync });
+    }
+    return res.json({
+      smavSync,
+      user: formatSafeAdminUser(refreshed),
+    });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    if (isCentralAuthLinkForbiddenError(err)) {
+      return res.status(403).json({ error: err.message, code: 'CENTRAL_AUTH_LINK_FORBIDDEN' });
+    }
+    return res.status(500).json({ error: err?.message || 'Retry SMAV synchronization failed.' });
+  }
+});
+
+// Owner-only inspection of durable SMAV user sync outbox (sanitized; zero secrets)
+app.get('/api/admin/users/smav-outbox', async (req, res) => {
+  const admin = await getAuthAdmin(req);
+  if (!admin || admin.role !== 'owner') {
+    return res.status(403).json({ error: 'Owner only' });
+  }
+  try {
+    const localUserId = typeof req.query.user_id === 'string' ? req.query.user_id.trim() : undefined;
+    const status = typeof req.query.status === 'string' ? req.query.status.trim().toUpperCase() : undefined;
+    const limit = Number(req.query.limit || 50);
+    const items = await salonRepository.getSmavUserSyncOutbox({ localUserId, status, limit });
+    return res.json({ items });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    return res.status(500).json({ error: err?.message || 'Unable to read SMAV sync outbox.' });
+  }
+});
+
+// Safe initial reconciliation endpoint (defaults to dryRun: true; never overwrites/deletes ambiguous accounts)
+app.post(['/api/admin/users/reconcile-smav', '/api/admin/users/sync-smav'], async (req, res) => {
+  const admin = await getAuthAdmin(req);
+  if (!admin || admin.role !== 'owner') {
+    return res.status(403).json({ error: 'Owner only' });
+  }
+  try {
+    const dryRun = req.body?.dryRun !== false;
+    const userIds = Array.isArray(req.body?.userIds) ? req.body.userIds.map(String) : undefined;
+    const report = await reconcileAdminUsersToSmav({
+      dryRun,
+      performedBy: admin.name,
+      userIds,
+    });
+    return res.json(report);
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    return res.status(500).json({ error: err?.message || 'SMAV reconciliation failed.' });
+  }
+});
+
+// Authorized durable outbox processor endpoint (for Vercel Cron or Owner manual drain)
+app.all(['/api/cron/smav-user-sync-outbox', '/cron/smav-user-sync-outbox'], async (req, res) => {
+  try {
+    const cronSecret = (process.env.CRON_SECRET || '').trim();
+    const authHeader = String(req.headers['authorization'] || '').trim();
+    const isCronAuthorized = Boolean(cronSecret && authHeader === `Bearer ${cronSecret}`);
+    if (!isCronAuthorized) {
+      const admin = await getAuthAdmin(req);
+      if (!admin || admin.role !== 'owner') {
+        return res.status(401).json({ error: 'Unauthorized outbox worker invocation' });
+      }
+    }
+    const limit = Number(req.query.limit || req.body?.limit || 20);
+    const summary = await processPendingSmavUserSyncOutbox({ limit });
+    return res.json({ success: true, ...summary });
+  } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        success: false,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+        error: err.message,
+      });
+    }
+    return res.status(500).json({ success: false, error: err?.message || 'Outbox processing failed' });
+  }
 });
 
 // Central SMAV -> Glossy Looks bidirectional webhook endpoint
@@ -5448,6 +5887,12 @@ app.post('/api/staff', async (req, res) => {
 
 app.patch('/api/staff/:id', async (req, res) => {
   try {
+    if (req.body?.central_auth_id !== undefined) {
+      return res.status(403).json({
+        error: 'Ordinary staff updates cannot assign or modify central_auth_id. Use verified SMAV linking or audited manual reconciliation.',
+        code: 'CENTRAL_AUTH_LINK_FORBIDDEN',
+      });
+    }
     const actor = (req.headers['x-admin-name'] as string) || 'Manager';
     const existingStaff = await salonRepository.getStaffById(req.params.id);
     if (!existingStaff) {
@@ -5497,10 +5942,23 @@ app.patch('/api/staff/:id', async (req, res) => {
         })
       : null;
 
-    res.json({ ...staff, ...(smavSync ? { smavSync } : {}) });
+    return res.json({ ...staff, ...(smavSync ? { smavSync } : {}) });
   } catch (err: any) {
+    if (isMigration024RequiredError(err)) {
+      return res.status(503).json({
+        error: err.message,
+        code: 'MIGRATION_024_REQUIRED',
+        migrationRequired: 'database/migrations/024_smav_user_sync_outbox.sql',
+      });
+    }
+    if (isCentralAuthLinkForbiddenError(err)) {
+      return res.status(403).json({ error: err.message, code: 'CENTRAL_AUTH_LINK_FORBIDDEN' });
+    }
+    if (isIdempotencyKeyConflictError(err)) {
+      return res.status(409).json({ error: err.message, conflict: true });
+    }
     console.error('Unable to update staff profile:', err);
-    res.status(400).json({ error: err?.message || 'Unable to update staff profile.' });
+    return res.status(400).json({ error: err?.message || 'Unable to update staff profile.' });
   }
 });
 
@@ -5887,6 +6345,15 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
   });
+
+  // Automatically process due PENDING SMAV user sync outbox retries in long-running Node processes
+  const smavOutboxTimer = setInterval(() => {
+    if (!process.env.GLOSSYLOOKS_INTEGRATION_KEY) return;
+    triggerNonBlockingOutboxDrain(55_000, 10);
+  }, 60_000);
+  if (typeof smavOutboxTimer.unref === 'function') {
+    smavOutboxTimer.unref();
+  }
 }
 
 // A local/AI Studio process needs an HTTP listener. On Vercel the exported

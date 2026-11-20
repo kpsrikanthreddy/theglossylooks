@@ -10,6 +10,7 @@
 
 import {
   SmavOutletUserAdapter,
+  type FetchLike,
   type OutletUserSyncPayload,
   type SmavSyncAdapterResponse,
 } from './smav_outlet_user_adapter.ts';
@@ -23,12 +24,16 @@ export class GlossyLooksSmavAuthAdapter extends SmavOutletUserAdapter {
     edgeFunctionUrl?: string;
     integrationKey?: string;
     outletCode?: string;
+    fetchImpl?: FetchLike;
+    timeoutMs?: number;
   }) {
     super({
       outletCode: config?.outletCode || 'glossylooks',
-      integrationKey: config?.integrationKey || process.env.GLOSSYLOOKS_INTEGRATION_KEY || '',
-      gatewayUrl: config?.gatewayUrl || process.env.SMAV_GATEWAY_URL,
-      edgeFunctionUrl: config?.edgeFunctionUrl || process.env.SMAV_EDGE_FUNCTION_URL,
+      integrationKey: config?.integrationKey !== undefined ? config.integrationKey : (process.env.GLOSSYLOOKS_INTEGRATION_KEY || ''),
+      gatewayUrl: config?.gatewayUrl !== undefined ? config.gatewayUrl : process.env.SMAV_GATEWAY_URL,
+      edgeFunctionUrl: config?.edgeFunctionUrl !== undefined ? config.edgeFunctionUrl : process.env.SMAV_EDGE_FUNCTION_URL,
+      fetchImpl: config?.fetchImpl,
+      timeoutMs: config?.timeoutMs,
     });
   }
 

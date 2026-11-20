@@ -9,6 +9,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import type {
   User,
   Customer,
@@ -49,9 +50,54 @@ import type {
   WhatsAppInboxFilter,
   CustomerServiceWindowInfo,
   WhatsAppWebhookEvent,
-  WhatsAppInboxDiagnostics
+  WhatsAppInboxDiagnostics,
+  SmavUserSyncOutboxItem,
+  SmavUserSyncEventType,
+  SmavUserSyncAction
 } from '../types/salon.ts';
-import type { ISalonRepository } from './repositories/salonRepository.ts';
+import {
+  CentralAuthLinkForbiddenError,
+  IdempotencyKeyConflictError,
+  type ISalonRepository,
+} from './repositories/salonRepository.ts';
+
+function deriveDeterministicDbUserCode(role: string | undefined, idempotencyKey: string): string {
+  const prefix =
+    role === 'owner'
+      ? 'OWN'
+      : role === 'manager'
+        ? 'MGR'
+        : role === 'receptionist'
+          ? 'REC'
+          : 'STY';
+  const digest = crypto
+    .createHash('sha256')
+    .update(`tgl_user_code:${String(idempotencyKey || '').trim()}`)
+    .digest('hex')
+    .slice(0, 6)
+    .toUpperCase();
+  return `TGL-${prefix}-${digest}`;
+}
+
+function canonicalizeDbJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeDbJson);
+  if (value && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const val = (value as Record<string, unknown>)[key];
+      if (val !== undefined) sorted[key] = canonicalizeDbJson(val);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+function computeDbRequestFingerprint(input: Record<string, unknown>): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(canonicalizeDbJson(input)))
+    .digest('hex');
+}
 
 export interface DatabaseData {
   settings: SalonSettings;
@@ -89,6 +135,7 @@ export interface DatabaseData {
   whatsapp_conversations?: WhatsAppConversation[];
   whatsapp_messages?: WhatsAppMessage[];
   whatsapp_webhook_events?: WhatsAppWebhookEvent[];
+  smav_user_sync_outbox?: SmavUserSyncOutboxItem[];
 }
 
 const DATA_FILE = path.join(process.cwd(), 'data', 'salon_store.json');
@@ -1917,35 +1964,8 @@ class SalonDatabase implements ISalonRepository {
     };
     this.data.users.push(newUser);
 
-    // Simultaneously create staff record so Staff & Rosters, POS, and Bookings reflect immediately
-    const newStaff: Staff = {
-      id: `stf-${Date.now()}`,
-      user_id: newUser.id,
-      admin_user_id: newUser.user_id,
-      name: newUser.name,
-      phone: newUser.phone,
-      email: newUser.email,
-      role: this.formatRoleTitle(newUser.role),
-      branch_id: newUser.branch_id || 'tgl-gachibowli-main',
-      joining_date: new Date().toISOString().split('T')[0],
-      salary_type: 'monthly',
-      base_salary: 35000,
-      commission_rate: 10,
-      skills: ['Salon Care', 'Client Styling'],
-      working_hours: '10:00 AM - 08:00 PM',
-      is_active: newUser.is_active,
-      ...(newUser.username !== undefined && { username: newUser.username }),
-      ...(newUser.central_auth_id !== undefined && { central_auth_id: newUser.central_auth_id }),
-      ...(newUser.central_auth_status !== undefined && { central_auth_status: newUser.central_auth_status }),
-      ...(newUser.central_auth_linked_at !== undefined && { central_auth_linked_at: newUser.central_auth_linked_at }),
-      ...(newUser.central_outlet_code !== undefined && { central_outlet_code: newUser.central_outlet_code }),
-      ...(newUser.central_sync_version !== undefined && { central_sync_version: newUser.central_sync_version }),
-      ...(newUser.central_last_synced_at !== undefined && { central_last_synced_at: newUser.central_last_synced_at }),
-      ...(newUser.central_sync_origin !== undefined && { central_sync_origin: newUser.central_sync_origin }),
-      created_at: new Date().toISOString()
-    };
-    this.data.staff.push(newStaff);
-
+    // Operational staff profiles (job title, salary, commission, skills) are NOT fabricated here;
+    // they are created explicitly via Staff Management when operational scheduling is configured.
     await this.logAudit('CREATE', 'User', newUser.id, performedBy, `Created staff account: ${newUser.name} (User ID: ${newUser.user_id}, Role: ${newUser.role.toUpperCase()})`);
     this.save();
     return newUser;
@@ -1956,104 +1976,95 @@ class SalonDatabase implements ISalonRepository {
     if (idx === -1) return null;
     const old = this.data.users[idx];
     const oldName = old.name;
-    const updatedUser: User = { ...old, ...updateData, updated_at: new Date().toISOString() };
-    this.data.users[idx] = updatedUser;
 
-    // 1. Immediately synchronize corresponding staff record
-    let staffIdx = this.data.staff.findIndex(s => s.user_id === id || s.admin_user_id === old.user_id || s.id === id);
-    if (staffIdx !== -1) {
-      this.data.staff[staffIdx] = {
-        ...this.data.staff[staffIdx],
-        name: updatedUser.name,
-        phone: updatedUser.phone,
-        email: updatedUser.email,
-        is_active: updatedUser.is_active,
-        admin_user_id: updatedUser.user_id,
-        ...(updatedUser.username !== undefined && { username: updatedUser.username }),
-        ...(updatedUser.central_auth_id !== undefined && { central_auth_id: updatedUser.central_auth_id }),
-        ...(updatedUser.central_auth_status !== undefined && { central_auth_status: updatedUser.central_auth_status }),
-        ...(updatedUser.central_auth_linked_at !== undefined && { central_auth_linked_at: updatedUser.central_auth_linked_at }),
-        ...(updatedUser.central_outlet_code !== undefined && { central_outlet_code: updatedUser.central_outlet_code }),
-        ...(updatedUser.central_sync_version !== undefined && { central_sync_version: updatedUser.central_sync_version }),
-        ...(updatedUser.central_last_synced_at !== undefined && { central_last_synced_at: updatedUser.central_last_synced_at }),
-        ...(updatedUser.central_sync_origin !== undefined && { central_sync_origin: updatedUser.central_sync_origin }),
-        ...(updateData.branch_id !== undefined && { branch_id: updateData.branch_id }),
-        ...(updateData.role && { role: this.formatRoleTitle(updatedUser.role) })
-      };
-    } else {
-      const newStaff: Staff = {
-        id: `stf-${Date.now()}`,
-        user_id: updatedUser.id,
-        admin_user_id: updatedUser.user_id,
-        name: updatedUser.name,
-        phone: updatedUser.phone,
-        email: updatedUser.email,
-        role: this.formatRoleTitle(updatedUser.role),
-        branch_id: updatedUser.branch_id || 'tgl-gachibowli-main',
-        joining_date: new Date().toISOString().split('T')[0],
-        salary_type: 'monthly',
-        base_salary: 35000,
-        commission_rate: 10,
-        skills: ['Salon Care', 'Client Styling'],
-        is_active: updatedUser.is_active,
-        ...(updatedUser.username !== undefined && { username: updatedUser.username }),
-        ...(updatedUser.central_auth_id !== undefined && { central_auth_id: updatedUser.central_auth_id }),
-        ...(updatedUser.central_auth_status !== undefined && { central_auth_status: updatedUser.central_auth_status }),
-        ...(updatedUser.central_auth_linked_at !== undefined && { central_auth_linked_at: updatedUser.central_auth_linked_at }),
-        ...(updatedUser.central_outlet_code !== undefined && { central_outlet_code: updatedUser.central_outlet_code }),
-        ...(updatedUser.central_sync_version !== undefined && { central_sync_version: updatedUser.central_sync_version }),
-        ...(updatedUser.central_last_synced_at !== undefined && { central_last_synced_at: updatedUser.central_last_synced_at }),
-        ...(updatedUser.central_sync_origin !== undefined && { central_sync_origin: updatedUser.central_sync_origin }),
-        created_at: new Date().toISOString()
-      };
-      this.data.staff.push(newStaff);
-      staffIdx = this.data.staff.length - 1;
+    // Strictly forbid ordinary user updates from assigning, changing, or clearing central_auth_id (even when NULL)
+    const safeUpdateData: Partial<User> = { ...updateData };
+    if (safeUpdateData.central_auth_id !== undefined) {
+      const currentCid = String(old.central_auth_id || '').trim().toLowerCase();
+      const incomingCid = String(safeUpdateData.central_auth_id || '').trim().toLowerCase();
+      if (incomingCid !== currentCid) {
+        throw new CentralAuthLinkForbiddenError(
+          'Ordinary user updates cannot assign or modify central_auth_id. Use verified SMAV linking or audited manual reconciliation.'
+        );
+      }
+      delete safeUpdateData.central_auth_id;
     }
 
-    const staffId = this.data.staff[staffIdx].id;
+    const updatedUser: User = { ...old, ...safeUpdateData, updated_at: new Date().toISOString() };
+    this.data.users[idx] = updatedUser;
+
+    // 1. Synchronize linked staff record ONLY if one already exists, mirroring ONLY changed identity/sync fields
+    //    WITHOUT touching operational job title (role), salary, commission, skills, working_hours, or central_auth_id.
+    const staffIdx = this.data.staff.findIndex(s => s.user_id === id || s.admin_user_id === old.user_id || s.id === id);
+    if (staffIdx !== -1) {
+      const existingStaff = this.data.staff[staffIdx];
+      this.data.staff[staffIdx] = {
+        ...existingStaff,
+        ...(safeUpdateData.name !== undefined && { name: updatedUser.name }),
+        ...(safeUpdateData.phone !== undefined && { phone: updatedUser.phone }),
+        ...(safeUpdateData.email !== undefined && { email: updatedUser.email }),
+        ...(safeUpdateData.is_active !== undefined && { is_active: updatedUser.is_active }),
+        ...(safeUpdateData.user_id !== undefined && { admin_user_id: updatedUser.user_id }),
+        ...(safeUpdateData.username !== undefined && { username: updatedUser.username }),
+        ...(safeUpdateData.central_auth_status !== undefined && { central_auth_status: updatedUser.central_auth_status }),
+        ...(safeUpdateData.central_auth_linked_at !== undefined && { central_auth_linked_at: updatedUser.central_auth_linked_at }),
+        ...(safeUpdateData.central_outlet_code !== undefined && { central_outlet_code: updatedUser.central_outlet_code }),
+        ...(safeUpdateData.central_sync_version !== undefined && { central_sync_version: updatedUser.central_sync_version }),
+        ...(safeUpdateData.central_last_synced_at !== undefined && { central_last_synced_at: updatedUser.central_last_synced_at }),
+        ...(safeUpdateData.central_sync_origin !== undefined && { central_sync_origin: updatedUser.central_sync_origin }),
+        ...(safeUpdateData.central_sync_status !== undefined && { central_sync_status: updatedUser.central_sync_status }),
+        ...(safeUpdateData.central_sync_error !== undefined && { central_sync_error: updatedUser.central_sync_error }),
+        ...(safeUpdateData.central_sync_last_attempt_at !== undefined && { central_sync_last_attempt_at: updatedUser.central_sync_last_attempt_at }),
+        ...(safeUpdateData.branch_id !== undefined && { branch_id: updatedUser.branch_id }),
+      };
+    }
+
+    const staffId = staffIdx !== -1 ? this.data.staff[staffIdx].id : undefined;
     const newName = updatedUser.name;
-    const staffIds = [id, staffId, updatedUser.user_id];
+    const staffIds = [id, ...(staffId ? [staffId] : []), updatedUser.user_id];
 
-    // 2. Cascade updated name to all appointments referencing this staff
-    this.data.appointments.forEach(apt => {
-      if (staffIds.includes(apt.assigned_staff_id || '') || (apt.assigned_staff_name && apt.assigned_staff_name.toLowerCase() === oldName.toLowerCase())) {
-        apt.assigned_staff_id = staffId;
-        apt.assigned_staff_name = newName;
-      }
-      (apt.services || []).forEach(srv => {
-        if (staffIds.includes(srv.staff_id || '') || (srv.staff_name && srv.staff_name.toLowerCase() === oldName.toLowerCase())) {
-          srv.staff_id = staffId;
-          srv.staff_name = newName;
+    if (newName !== oldName) {
+      // 2. Cascade updated name to all appointments referencing this staff
+      this.data.appointments.forEach(apt => {
+        if (staffIds.includes(apt.assigned_staff_id || '') || (apt.assigned_staff_name && apt.assigned_staff_name.toLowerCase() === oldName.toLowerCase())) {
+          if (staffId) apt.assigned_staff_id = staffId;
+          apt.assigned_staff_name = newName;
+        }
+        (apt.services || []).forEach(srv => {
+          if (staffIds.includes(srv.staff_id || '') || (srv.staff_name && srv.staff_name.toLowerCase() === oldName.toLowerCase())) {
+            if (staffId) srv.staff_id = staffId;
+            srv.staff_name = newName;
+          }
+        });
+      });
+
+      // 3. Cascade updated name to all orders referencing this staff
+      this.data.orders.forEach(order => {
+        if (staffIds.includes(order.cashier_id || '') || (order.cashier_name && order.cashier_name.toLowerCase() === oldName.toLowerCase())) {
+          order.cashier_name = newName;
+        }
+        (order.items || []).forEach(item => {
+          if (staffIds.includes(item.staff_id || '') || (item.staff_name && item.staff_name.toLowerCase() === oldName.toLowerCase())) {
+            if (staffId) item.staff_id = staffId;
+            item.staff_name = newName;
+          }
+        });
+      });
+
+      // 4. Cascade updated name to gallery
+      this.data.gallery.forEach(g => {
+        if (g.artist_name && g.artist_name.toLowerCase() === oldName.toLowerCase()) {
+          g.artist_name = newName;
         }
       });
-    });
 
-    // 3. Cascade updated name to all orders referencing this staff
-    this.data.orders.forEach(order => {
-      if (staffIds.includes(order.cashier_id || '') || (order.cashier_name && order.cashier_name.toLowerCase() === oldName.toLowerCase())) {
-        order.cashier_name = newName;
-      }
-      (order.items || []).forEach(item => {
-        if (staffIds.includes(item.staff_id || '') || (item.staff_name && item.staff_name.toLowerCase() === oldName.toLowerCase())) {
-          item.staff_id = staffId;
-          item.staff_name = newName;
+      // 5. Cascade updated name to branches
+      this.data.branches.forEach(b => {
+        if (staffIds.includes(b.manager_id || '') || b.manager_name?.toLowerCase() === oldName.toLowerCase()) {
+          b.manager_name = newName;
         }
       });
-    });
-
-    // 4. Cascade updated name to gallery
-    this.data.gallery.forEach(g => {
-      if (g.artist_name && g.artist_name.toLowerCase() === oldName.toLowerCase()) {
-        g.artist_name = newName;
-      }
-    });
-
-    // 5. Cascade updated name to branches
-    this.data.branches.forEach(b => {
-      if (staffIds.includes(b.manager_id || '') || b.manager_name?.toLowerCase() === oldName.toLowerCase()) {
-        b.manager_name = newName;
-      }
-    });
+    }
 
     await this.logAudit('UPDATE', 'User', id, performedBy, `Updated staff profile: ${updatedUser.name} (User ID: ${updatedUser.user_id})`);
     this.save();
@@ -2165,27 +2176,43 @@ class SalonDatabase implements ISalonRepository {
     if (idx === -1) return null;
     const old = this.data.staff[idx];
     const oldName = old.name;
-    const updatedStaff: Staff = { ...old, ...data };
+
+    // Strictly forbid ordinary staff updates from assigning or modifying central_auth_id (even when NULL)
+    const safeData: Partial<Staff> = { ...data };
+    if (safeData.central_auth_id !== undefined) {
+      const currentCid = String(old.central_auth_id || '').trim().toLowerCase();
+      const incomingCid = String(safeData.central_auth_id || '').trim().toLowerCase();
+      if (incomingCid !== currentCid) {
+        throw new CentralAuthLinkForbiddenError(
+          'Ordinary staff updates cannot assign or modify central_auth_id. Use verified SMAV linking or audited manual reconciliation.'
+        );
+      }
+      delete safeData.central_auth_id;
+    }
+    delete safeData.central_auth_status;
+    delete safeData.central_auth_linked_at;
+    delete safeData.central_outlet_code;
+    delete safeData.central_sync_version;
+    delete safeData.central_last_synced_at;
+    delete safeData.central_sync_origin;
+    delete safeData.central_sync_status;
+    delete safeData.central_sync_error;
+    delete safeData.central_sync_last_attempt_at;
+
+    const updatedStaff: Staff = { ...old, ...safeData };
     this.data.staff[idx] = updatedStaff;
 
-    // Synchronize corresponding user record
+    // Synchronize corresponding user record (non-protected fields only)
     const userIdx = this.data.users.findIndex(u => u.id === updatedStaff.user_id || u.user_id === updatedStaff.admin_user_id || u.id === id);
     if (userIdx !== -1) {
       this.data.users[userIdx] = {
         ...this.data.users[userIdx],
-        ...(data.name !== undefined && { name: data.name }),
-        ...(data.phone !== undefined && { phone: data.phone }),
-        ...(data.email !== undefined && { email: data.email }),
-        ...(data.is_active !== undefined && { is_active: data.is_active }),
-        ...(data.branch_id !== undefined && { branch_id: data.branch_id }),
-        ...(data.username !== undefined && { username: data.username }),
-        ...(data.central_auth_id !== undefined && { central_auth_id: data.central_auth_id }),
-        ...(data.central_auth_status !== undefined && { central_auth_status: data.central_auth_status }),
-        ...(data.central_auth_linked_at !== undefined && { central_auth_linked_at: data.central_auth_linked_at }),
-        ...(data.central_outlet_code !== undefined && { central_outlet_code: data.central_outlet_code }),
-        ...(data.central_sync_version !== undefined && { central_sync_version: data.central_sync_version }),
-        ...(data.central_last_synced_at !== undefined && { central_last_synced_at: data.central_last_synced_at }),
-        ...(data.central_sync_origin !== undefined && { central_sync_origin: data.central_sync_origin }),
+        ...(safeData.name !== undefined && { name: safeData.name }),
+        ...(safeData.phone !== undefined && { phone: safeData.phone }),
+        ...(safeData.email !== undefined && { email: safeData.email }),
+        ...(safeData.is_active !== undefined && { is_active: safeData.is_active }),
+        ...(safeData.branch_id !== undefined && { branch_id: safeData.branch_id }),
+        ...(safeData.username !== undefined && { username: safeData.username }),
         updated_at: new Date().toISOString()
       };
     }
@@ -4074,6 +4101,661 @@ class SalonDatabase implements ISalonRepository {
       waba_phone_number_id: '918985799459',
       active_conversations_count: activeCount
     };
+  }
+
+  // ==========================================================================
+  // Durable SMAV User Synchronization Outbox (Atomic & Bounded Retries)
+  // ==========================================================================
+
+  private buildSanitizedSmavPayloadForUser(
+    user: User,
+    action: Exclude<SmavUserSyncAction, 'reset_password'>
+  ): Record<string, any> {
+    const email = String(user.email || '').trim().toLowerCase();
+    const username = String(user.username || user.user_id || '').trim().toLowerCase() || undefined;
+    const role = user.role === 'owner' || user.role === 'manager' ? 'ADMIN' : 'POS_BILLING';
+    if (action === 'set_status') {
+      return {
+        ...(user.central_auth_id ? { userId: user.central_auth_id } : {}),
+        externalStaffId: String(user.id),
+        email,
+        role,
+        isActive: Boolean(user.is_active),
+      };
+    }
+    return {
+      ...(user.central_auth_id ? { userId: user.central_auth_id } : {}),
+      externalStaffId: String(user.id),
+      email,
+      fullName: String(user.name || '').trim(),
+      ...(username ? { username } : {}),
+      phone: String(user.phone || '').trim(),
+      role,
+      isActive: Boolean(user.is_active),
+    };
+  }
+
+  public async createUserWithSmavOutbox(
+    userData: Omit<User, 'id' | 'created_at' | 'updated_at'>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+      credential_mode?: 'explicit' | 'generated';
+      verifyReplayPassword?: (storedPasswordHash: string) => boolean;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; atomic: boolean; idempotentReplay?: boolean }> {
+    if (userData.central_auth_id !== undefined) {
+      throw new CentralAuthLinkForbiddenError(
+        'Cannot assign arbitrary central_auth_id during Admin User creation. SMAV must return a verified Central Auth UUID.'
+      );
+    }
+
+    const resolvedUserCode =
+      String(userData.user_id || '').trim().toUpperCase() ||
+      deriveDeterministicDbUserCode(userData.role, outbox.idempotency_key);
+    const resolvedUsername = String(userData.username || resolvedUserCode).trim().toLowerCase();
+    const credentialMode: 'explicit' | 'generated' = outbox.credential_mode === 'explicit' ? 'explicit' : 'generated';
+
+    const fingerprint = computeDbRequestFingerprint({
+      op: 'create_user',
+      user_code: resolvedUserCode,
+      name: String(userData.name || '').trim(),
+      email: String(userData.email || '').trim().toLowerCase(),
+      phone: String(userData.phone || '').trim(),
+      role: String(userData.role || '').trim().toLowerCase(),
+      username: resolvedUsername,
+      branch_id: userData.branch_id || 'tgl-gachibowli-main',
+      is_active: userData.is_active !== false,
+      credential_mode: credentialMode,
+      event_type: outbox.event_type,
+      action: outbox.action,
+    });
+
+    // Pre-mutation idempotency detection & payload/password mismatch guard
+    const existingOutbox = await this.getSmavUserSyncOutboxByIdempotencyKey(outbox.idempotency_key);
+    if (existingOutbox) {
+      const mismatch =
+        existingOutbox.event_type !== outbox.event_type ||
+        existingOutbox.action !== outbox.action ||
+        (existingOutbox.request_fingerprint && existingOutbox.request_fingerprint !== fingerprint);
+      if (mismatch) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${outbox.idempotency_key}" was already used with a different create-user payload.`
+        );
+      }
+      if (!existingOutbox.local_user_id) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${outbox.idempotency_key}" references a deleted user record.`
+        );
+      }
+      const existingUser = this.data.users.find(u => String(u.id) === String(existingOutbox.local_user_id));
+      if (!existingUser) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${outbox.idempotency_key}" references a missing user record.`
+        );
+      }
+      if (outbox.verifyReplayPassword && !outbox.verifyReplayPassword(String(existingUser.password_hash || ''))) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${outbox.idempotency_key}" was already used with a different password.`
+        );
+      }
+      return {
+        user: { ...existingUser },
+        outboxItem: existingOutbox,
+        created: false,
+        atomic: true,
+        idempotentReplay: true,
+      };
+    }
+
+    const user = await this.createUser(
+      {
+        ...userData,
+        user_id: resolvedUserCode,
+        username: resolvedUsername,
+        central_sync_status: 'PENDING',
+        central_sync_error: null,
+      },
+      performedBy
+    );
+    const payload = this.buildSanitizedSmavPayloadForUser(user, outbox.action);
+    const { item, created } = await this.enqueueSmavUserSyncEvent({
+      idempotency_key: outbox.idempotency_key,
+      local_user_id: String(user.id),
+      event_type: outbox.event_type,
+      action: outbox.action,
+      payload,
+      performed_by: performedBy,
+      max_attempts: outbox.max_attempts ?? 6,
+      request_fingerprint: fingerprint,
+    });
+    const refreshed = this.data.users.find(u => String(u.id) === String(user.id)) || user;
+    return { user: { ...refreshed }, outboxItem: item, created, atomic: true, idempotentReplay: !created };
+  }
+
+  public async updateUserWithSmavOutbox(
+    id: string,
+    updateData: Partial<User>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; atomic: boolean; idempotentReplay?: boolean } | null> {
+    if (updateData.central_auth_id !== undefined) {
+      throw new CentralAuthLinkForbiddenError(
+        'Ordinary Admin User updates cannot assign or modify central_auth_id. Use verified SMAV linking or audited manual reconciliation.'
+      );
+    }
+
+    const fingerprint = computeDbRequestFingerprint({
+      op: 'update_user',
+      local_user_id: String(id),
+      event_type: outbox.event_type,
+      action: outbox.action,
+      updates: {
+        ...(updateData.name !== undefined && { name: updateData.name }),
+        ...(updateData.email !== undefined && { email: updateData.email }),
+        ...(updateData.phone !== undefined && { phone: updateData.phone }),
+        ...(updateData.role !== undefined && { role: updateData.role }),
+        ...(updateData.user_id !== undefined && { user_id: updateData.user_id }),
+        ...(updateData.username !== undefined && { username: updateData.username }),
+        ...(updateData.is_active !== undefined && { is_active: updateData.is_active }),
+        ...(updateData.branch_id !== undefined && { branch_id: updateData.branch_id }),
+      },
+    });
+
+    // Pre-mutation idempotency detection: replay must NOT mutate user, and mismatch throws 409 conflict
+    const existingOutbox = await this.getSmavUserSyncOutboxByIdempotencyKey(outbox.idempotency_key);
+    if (existingOutbox) {
+      const mismatch =
+        String(existingOutbox.local_user_id || '') !== String(id) ||
+        existingOutbox.event_type !== outbox.event_type ||
+        existingOutbox.action !== outbox.action ||
+        (existingOutbox.request_fingerprint && existingOutbox.request_fingerprint !== fingerprint);
+      if (mismatch) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${outbox.idempotency_key}" was already used with a different update-user payload.`
+        );
+      }
+      const existingUser = this.data.users.find(u => String(u.id) === String(id));
+      if (!existingUser) return null;
+      return {
+        user: { ...existingUser },
+        outboxItem: existingOutbox,
+        created: false,
+        atomic: true,
+        idempotentReplay: true,
+      };
+    }
+
+    const existing = this.data.users.find(u => String(u.id) === String(id));
+    if (!existing) return null;
+
+    const updated = await this.updateUser(
+      id,
+      { ...updateData, central_sync_status: 'PENDING', central_sync_error: null },
+      performedBy
+    );
+    if (!updated) return null;
+
+    const payload = this.buildSanitizedSmavPayloadForUser(updated, outbox.action);
+    const { item, created } = await this.enqueueSmavUserSyncEvent({
+      idempotency_key: outbox.idempotency_key,
+      local_user_id: String(updated.id),
+      event_type: outbox.event_type,
+      action: outbox.action,
+      payload,
+      performed_by: performedBy,
+      max_attempts: outbox.max_attempts ?? 6,
+      request_fingerprint: fingerprint,
+    });
+    const refreshed = this.data.users.find(u => String(u.id) === String(updated.id)) || updated;
+    return { user: { ...refreshed }, outboxItem: item, created, atomic: true, idempotentReplay: !created };
+  }
+
+  public async linkVerifiedCentralAuthId(input: {
+    local_user_id: string;
+    verified_central_auth_id: string;
+    verification_source: 'smav_sync_response';
+    evidence_ref: string;
+    performed_by?: string;
+  }): Promise<User> {
+    const cleanEvidence = String(input.evidence_ref || '').trim();
+    const cleanCid = String(input.verified_central_auth_id || '').trim();
+    if (!cleanCid || !cleanEvidence) {
+      throw new CentralAuthLinkForbiddenError('Verified Central Auth UUID and evidence reference are required.');
+    }
+    if (input.verification_source !== 'smav_sync_response') {
+      throw new CentralAuthLinkForbiddenError(`Invalid verification_source: ${input.verification_source}`);
+    }
+
+    const idx = this.data.users.findIndex(u => String(u.id) === String(input.local_user_id));
+    if (idx === -1) {
+      throw new Error(`User not found for verified Central Auth linking (${input.local_user_id}).`);
+    }
+    const user = this.data.users[idx];
+
+    if (user.central_auth_id) {
+      if (user.central_auth_id.toLowerCase() === cleanCid.toLowerCase()) {
+        return { ...user };
+      }
+      throw new CentralAuthLinkForbiddenError(
+        `User ${user.id} already has central_auth_id ${user.central_auth_id}. Reassignment requires audited manual reconciliation.`
+      );
+    }
+
+    const matchingEvidence = (this.data.smav_user_sync_outbox || []).find(
+      o =>
+        o.id === cleanEvidence &&
+        String(o.local_user_id || '') === String(input.local_user_id) &&
+        o.status === 'SYNCED' &&
+        String(o.response_central_auth_id || '').toLowerCase() === cleanCid.toLowerCase()
+    );
+    if (!matchingEvidence) {
+      throw new CentralAuthLinkForbiddenError(
+        `No verified SYNCED outbox evidence (${cleanEvidence}) found for user ${input.local_user_id} and UUID ${cleanCid}.`
+      );
+    }
+
+    const duplicateOwner = this.data.users.find(
+      u =>
+        String(u.id) !== String(user.id) &&
+        u.central_auth_id &&
+        u.central_auth_id.toLowerCase() === cleanCid.toLowerCase()
+    );
+    if (duplicateOwner) {
+      throw new CentralAuthLinkForbiddenError(
+        `Central Auth UUID ${cleanCid} is already linked to another user (${duplicateOwner.id}).`
+      );
+    }
+
+    const nowIso = new Date().toISOString();
+    this.data.users[idx] = {
+      ...user,
+      central_auth_id: cleanCid,
+      central_auth_linked_at: user.central_auth_linked_at || nowIso,
+      central_outlet_code: user.central_outlet_code || 'glossylooks',
+      updated_at: nowIso,
+    };
+
+    // Link unlinked staff mirror(s) without overwriting existing staff central_auth_id
+    for (let i = 0; i < this.data.staff.length; i++) {
+      const s = this.data.staff[i];
+      if (String(s.user_id) === String(user.id) && !s.central_auth_id) {
+        const staffDup = this.data.staff.some(
+          other => other.id !== s.id && other.central_auth_id?.toLowerCase() === cleanCid.toLowerCase()
+        );
+        if (!staffDup) {
+          this.data.staff[i] = {
+            ...s,
+            central_auth_id: cleanCid,
+            central_auth_linked_at: s.central_auth_linked_at || nowIso,
+            central_outlet_code: s.central_outlet_code || 'glossylooks',
+          };
+        }
+      }
+    }
+
+    await this.logAudit(
+      'SMAV_VERIFIED_LINK',
+      'User',
+      user.id,
+      input.performed_by || 'SMAV Sync',
+      `Linked verified Central Auth UUID ${cleanCid} (${input.verification_source}:${cleanEvidence})`
+    );
+    this.save();
+    return { ...this.data.users[idx] };
+  }
+
+  public async enqueueSmavUserSyncEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    performed_by?: string;
+    max_attempts?: number;
+    request_fingerprint?: string | null;
+  }): Promise<{ item: SmavUserSyncOutboxItem; created: boolean }> {
+    if (!this.data.smav_user_sync_outbox) this.data.smav_user_sync_outbox = [];
+    const fingerprint =
+      input.request_fingerprint ||
+      computeDbRequestFingerprint({
+        op: 'enqueue',
+        local_user_id: String(input.local_user_id),
+        event_type: input.event_type,
+        action: input.action,
+        payload: input.payload || {},
+      });
+
+    const existing = this.data.smav_user_sync_outbox.find(
+      e => e.idempotency_key === input.idempotency_key
+    );
+    if (existing) {
+      const mismatch =
+        String(existing.local_user_id || '') !== String(input.local_user_id) ||
+        existing.event_type !== input.event_type ||
+        existing.action !== input.action ||
+        (existing.request_fingerprint && existing.request_fingerprint !== fingerprint);
+      if (mismatch) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${input.idempotency_key}" was already used with a different sync payload.`
+        );
+      }
+      return { item: { ...existing }, created: false };
+    }
+
+    const now = new Date().toISOString();
+    const item: SmavUserSyncOutboxItem = {
+      id: `outbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      idempotency_key: input.idempotency_key,
+      request_fingerprint: fingerprint,
+      local_user_id: input.local_user_id,
+      audit_local_user_id: input.local_user_id,
+      event_type: input.event_type,
+      action: input.action,
+      payload: input.payload || {},
+      status: 'PENDING',
+      attempts: 0,
+      max_attempts: Math.min(20, Math.max(1, input.max_attempts ?? 6)),
+      next_retry_at: now,
+      locked_at: null,
+      last_http_status: null,
+      last_error: null,
+      conflict: false,
+      response_central_auth_id: null,
+      performed_by: input.performed_by || 'System',
+      created_at: now,
+      updated_at: now,
+      synced_at: null
+    };
+
+    this.data.smav_user_sync_outbox.unshift(item);
+    if (this.data.smav_user_sync_outbox.length > 2000) {
+      this.data.smav_user_sync_outbox = this.data.smav_user_sync_outbox.slice(0, 2000);
+    }
+
+    const userIdx = this.data.users.findIndex(u => String(u.id) === String(input.local_user_id));
+    if (userIdx !== -1) {
+      this.data.users[userIdx] = {
+        ...this.data.users[userIdx],
+        central_sync_status: 'PENDING',
+        central_sync_error: null,
+        central_sync_outbox_id: item.id,
+        updated_at: now
+      };
+    }
+
+    this.save();
+    return { item: { ...item }, created: true };
+  }
+
+  public async recordSmavSyncAuditEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    status: 'SYNCED' | 'FAILED';
+    last_http_status?: number | null;
+    last_error?: string | null;
+    conflict?: boolean;
+    response_central_auth_id?: string | null;
+    performed_by?: string;
+    request_fingerprint?: string | null;
+  }): Promise<SmavUserSyncOutboxItem> {
+    if (!this.data.smav_user_sync_outbox) this.data.smav_user_sync_outbox = [];
+    const fingerprint =
+      input.request_fingerprint ||
+      computeDbRequestFingerprint({
+        op: 'audit',
+        local_user_id: String(input.local_user_id),
+        event_type: input.event_type,
+        action: input.action,
+      });
+
+    const existing = this.data.smav_user_sync_outbox.find(e => e.idempotency_key === input.idempotency_key);
+    if (existing) {
+      const mismatch =
+        String(existing.local_user_id || '') !== String(input.local_user_id) ||
+        existing.event_type !== input.event_type ||
+        existing.action !== input.action ||
+        (existing.request_fingerprint && existing.request_fingerprint !== fingerprint);
+      if (mismatch) {
+        throw new IdempotencyKeyConflictError(
+          `Idempotency key "${input.idempotency_key}" was already used for another user or operation.`
+        );
+      }
+      return { ...existing };
+    }
+
+    const now = new Date().toISOString();
+    const item: SmavUserSyncOutboxItem = {
+      id: `outbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      idempotency_key: input.idempotency_key,
+      request_fingerprint: fingerprint,
+      local_user_id: input.local_user_id,
+      audit_local_user_id: input.local_user_id,
+      event_type: input.event_type,
+      action: input.action,
+      payload: input.payload || {},
+      status: input.status,
+      attempts: 1,
+      max_attempts: 1,
+      next_retry_at: now,
+      locked_at: null,
+      last_http_status: input.last_http_status ?? null,
+      last_error: input.last_error ?? null,
+      conflict: Boolean(input.conflict),
+      response_central_auth_id: input.response_central_auth_id ?? null,
+      performed_by: input.performed_by || 'Owner',
+      created_at: now,
+      updated_at: now,
+      synced_at: input.status === 'SYNCED' ? now : null
+    };
+    this.data.smav_user_sync_outbox.unshift(item);
+    if (this.data.smav_user_sync_outbox.length > 2000) {
+      this.data.smav_user_sync_outbox = this.data.smav_user_sync_outbox.slice(0, 2000);
+    }
+    this.save();
+    return { ...item };
+  }
+
+  public async claimSmavUserSyncEventById(id: string): Promise<SmavUserSyncOutboxItem | null> {
+    if (!this.data.smav_user_sync_outbox) return null;
+    const idx = this.data.smav_user_sync_outbox.findIndex(item => item.id === id);
+    if (idx === -1) return null;
+    const row = this.data.smav_user_sync_outbox[idx];
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    if (
+      !row.local_user_id ||
+      row.status !== 'PENDING' ||
+      row.conflict ||
+      row.action === 'reset_password' ||
+      row.attempts >= row.max_attempts ||
+      new Date(row.next_retry_at).getTime() > nowMs
+    ) {
+      return null;
+    }
+    const updated: SmavUserSyncOutboxItem = {
+      ...row,
+      status: 'PROCESSING',
+      attempts: row.attempts + 1,
+      locked_at: nowIso,
+      updated_at: nowIso,
+    };
+    this.data.smav_user_sync_outbox[idx] = updated;
+    this.save();
+    return { ...updated };
+  }
+
+  public async claimDueSmavUserSyncEvents(limit = 20, staleLockMinutes = 5): Promise<SmavUserSyncOutboxItem[]> {
+    if (!this.data.smav_user_sync_outbox) this.data.smav_user_sync_outbox = [];
+    const nowMs = Date.now();
+    const safeStaleMins = Math.min(60, Math.max(1, staleLockMinutes));
+    const staleLockCutoffMs = nowMs - safeStaleMins * 60 * 1000;
+    const nowIso = new Date(nowMs).toISOString();
+
+    let mutated = false;
+
+    // 1. Mark orphaned rows (deleted local user, local_user_id IS NULL) as FAILED while preserving audit history
+    for (let i = 0; i < this.data.smav_user_sync_outbox.length; i++) {
+      const row = this.data.smav_user_sync_outbox[i];
+      if (!row.local_user_id && (row.status === 'PENDING' || row.status === 'PROCESSING')) {
+        this.data.smav_user_sync_outbox[i] = {
+          ...row,
+          status: 'FAILED',
+          locked_at: null,
+          last_error: row.last_error || 'Local user record was deleted; historical outbox entry preserved for audit.',
+          updated_at: nowIso,
+        };
+        mutated = true;
+      }
+    }
+
+    // 2. Permanently fail any stale PROCESSING locks that have already reached max_attempts at claim time
+    for (let i = 0; i < this.data.smav_user_sync_outbox.length; i++) {
+      const row = this.data.smav_user_sync_outbox[i];
+      if (
+        row.local_user_id &&
+        row.status === 'PROCESSING' &&
+        row.locked_at &&
+        new Date(row.locked_at).getTime() < staleLockCutoffMs &&
+        row.attempts >= row.max_attempts
+      ) {
+        this.data.smav_user_sync_outbox[i] = {
+          ...row,
+          status: 'FAILED',
+          locked_at: null,
+          last_error: 'Worker lock timed out after maximum retry attempts.',
+          updated_at: nowIso,
+        };
+        const userIdx = this.data.users.findIndex(
+          u => String(u.id) === String(row.local_user_id) && u.central_sync_outbox_id === row.id
+        );
+        if (userIdx !== -1) {
+          this.data.users[userIdx] = {
+            ...this.data.users[userIdx],
+            central_sync_status: 'FAILED',
+            central_sync_error: 'Worker lock timed out after maximum retry attempts.',
+            central_sync_last_attempt_at: nowIso,
+            updated_at: nowIso,
+          };
+          const staffIdx = this.data.staff.findIndex(s => String(s.user_id) === String(row.local_user_id));
+          if (staffIdx !== -1) {
+            this.data.staff[staffIdx] = {
+              ...this.data.staff[staffIdx],
+              central_sync_status: 'FAILED',
+              central_sync_error: 'Worker lock timed out after maximum retry attempts.',
+              central_sync_last_attempt_at: nowIso,
+            };
+          }
+        }
+        mutated = true;
+      }
+    }
+
+    // 3. Claim strictly bounded due events (unified claim-time attempt increment: +1 on EVERY transition into PROCESSING)
+    const due = this.data.smav_user_sync_outbox
+      .filter(item => {
+        if (!item.local_user_id) return false;
+        if (item.conflict) return false;
+        if (item.action === 'reset_password') return false;
+        if (item.attempts >= item.max_attempts) return false;
+        if (item.status === 'PENDING' && new Date(item.next_retry_at).getTime() <= nowMs) {
+          return true;
+        }
+        if (
+          item.status === 'PROCESSING' &&
+          item.locked_at &&
+          new Date(item.locked_at).getTime() < staleLockCutoffMs
+        ) {
+          return true;
+        }
+        return false;
+      })
+      .sort((a, b) => a.next_retry_at.localeCompare(b.next_retry_at))
+      .slice(0, Math.max(1, Math.min(limit, 100)));
+
+    const claimedIds = new Set(due.map(d => d.id));
+    const claimed: SmavUserSyncOutboxItem[] = [];
+    for (let i = 0; i < this.data.smav_user_sync_outbox.length; i++) {
+      const row = this.data.smav_user_sync_outbox[i];
+      if (claimedIds.has(row.id)) {
+        const updated: SmavUserSyncOutboxItem = {
+          ...row,
+          status: 'PROCESSING',
+          attempts: row.attempts + 1,
+          locked_at: nowIso,
+          updated_at: nowIso
+        };
+        this.data.smav_user_sync_outbox[i] = updated;
+        claimed.push({ ...updated });
+        mutated = true;
+      }
+    }
+
+    if (mutated) this.save();
+    return claimed;
+  }
+
+  public async getSmavUserSyncOutbox(filters?: {
+    localUserId?: string;
+    status?: string;
+    limit?: number;
+  }): Promise<SmavUserSyncOutboxItem[]> {
+    const list = [...(this.data.smav_user_sync_outbox || [])];
+    const filtered = list.filter(item => {
+      if (
+        filters?.localUserId &&
+        String(item.local_user_id || item.audit_local_user_id || '') !== String(filters.localUserId)
+      ) {
+        return false;
+      }
+      if (filters?.status && item.status !== filters.status) {
+        return false;
+      }
+      return true;
+    });
+    filtered.sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const max = filters?.limit ? Math.max(1, Math.min(filters.limit, 200)) : 50;
+    return filtered.slice(0, max).map(item => ({ ...item }));
+  }
+
+  public async getSmavUserSyncOutboxById(id: string): Promise<SmavUserSyncOutboxItem | null> {
+    const found = (this.data.smav_user_sync_outbox || []).find(item => item.id === id);
+    return found ? { ...found } : null;
+  }
+
+  public async getSmavUserSyncOutboxByIdempotencyKey(idempotencyKey: string): Promise<SmavUserSyncOutboxItem | null> {
+    const cleanKey = String(idempotencyKey || '').trim();
+    if (!cleanKey) return null;
+    const found = (this.data.smav_user_sync_outbox || []).find(item => item.idempotency_key === cleanKey);
+    return found ? { ...found } : null;
+  }
+
+  public async updateSmavUserSyncEvent(
+    id: string,
+    data: Partial<SmavUserSyncOutboxItem>
+  ): Promise<SmavUserSyncOutboxItem | null> {
+    if (!this.data.smav_user_sync_outbox) return null;
+    const idx = this.data.smav_user_sync_outbox.findIndex(item => item.id === id);
+    if (idx === -1) return null;
+    const updated: SmavUserSyncOutboxItem = {
+      ...this.data.smav_user_sync_outbox[idx],
+      ...data,
+      updated_at: new Date().toISOString()
+    };
+    this.data.smav_user_sync_outbox[idx] = updated;
+    this.save();
+    return { ...updated };
   }
 }
 

@@ -40,8 +40,67 @@ import {
   WhatsAppConversation,
   WhatsAppMessage,
   WhatsAppInboxFilter,
-  WhatsAppInboxDiagnostics
+  WhatsAppInboxDiagnostics,
+  SmavSyncStatus,
+  SmavOutletRole,
+  AdminRole
 } from '../types/salon';
+
+export interface SmavSyncClientResult {
+  synced: boolean;
+  syncStatus: SmavSyncStatus;
+  outletCode?: 'glossylooks';
+  status?: string;
+  outboxId?: string;
+  idempotencyKey?: string;
+  centralAuthId?: string;
+  email?: string;
+  username?: string;
+  role?: string;
+  isNewUser?: boolean;
+  mustChangePassword?: boolean;
+  conflict?: boolean;
+  retryScheduledAt?: string | null;
+  passwordResetRequired?: boolean;
+  error?: string;
+}
+
+export interface SmavReconciliationUserAudit {
+  localUserId: string;
+  userCode: string;
+  name: string;
+  email: string;
+  rbacRole: AdminRole;
+  mappedSmavRole: SmavOutletRole;
+  isActive: boolean;
+  centralAuthId: string | null;
+  staffProfileId: string | null;
+  staffJobTitle: string | null;
+  staffEmail: string | null;
+  staffCentralAuthId: string | null;
+  currentSyncStatus: SmavSyncStatus;
+  classification: 'ALREADY_SYNCED' | 'READY_UPDATE_BY_UUID' | 'READY_LINK_OR_CREATE' | 'NEEDS_MANUAL_REVIEW';
+  anomalies: string[];
+  recommendedAction: string;
+  syncResult?: SmavSyncClientResult;
+}
+
+export interface SmavReconciliationReport {
+  dryRun: boolean;
+  generatedAt: string;
+  summary: {
+    totalAdminUsers: number;
+    alreadySynced: number;
+    readyUpdateByUuid: number;
+    readyLinkOrCreate: number;
+    needsManualReview: number;
+    syncedNow: number;
+    pendingNow: number;
+    failedNow: number;
+    skippedAmbiguous: number;
+  };
+  users: SmavReconciliationUserAudit[];
+}
 
 const API_BASE = '/api';
 
@@ -142,16 +201,23 @@ export const api = {
   getAdminMe: () => fetchJson<AdminUser>(`${API_BASE}/auth/admin/me`),
   getAdminUsers: () => fetchJson<User[]>(`${API_BASE}/admin/users`),
   createAdminUser: (data: Partial<User>, adminName?: string) =>
-    fetchJson<User>(`${API_BASE}/admin/users`, { method: 'POST', body: JSON.stringify(data) }, adminName),
+    fetchJson<User & { smavSync?: SmavSyncClientResult }>(`${API_BASE}/admin/users`, { method: 'POST', body: JSON.stringify(data) }, adminName),
   updateAdminUser: (id: string, data: Partial<User>, adminName?: string) =>
-    fetchJson<User>(`${API_BASE}/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }, adminName),
+    fetchJson<User & { smavSync?: SmavSyncClientResult }>(`${API_BASE}/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }, adminName),
   resetAdminUserPassword: (id: string, newPassword: string, adminName?: string) =>
-    fetchJson<{ success: boolean; message: string }>(`${API_BASE}/admin/users/${id}/reset-password`, {
+    fetchJson<{ success: boolean; message: string; smavSync?: SmavSyncClientResult }>(`${API_BASE}/admin/users/${id}/reset-password`, {
       method: 'POST',
       body: JSON.stringify({ new_password: newPassword })
     }, adminName),
   deleteAdminUser: (id: string, adminName?: string) =>
-    fetchJson<{ success: boolean }>(`${API_BASE}/admin/users/${id}`, { method: 'DELETE' }, adminName),
+    fetchJson<{ success: boolean; smavSync?: SmavSyncClientResult | null }>(`${API_BASE}/admin/users/${id}`, { method: 'DELETE' }, adminName),
+  retryAdminUserSmavSync: (id: string, adminName?: string) =>
+    fetchJson<{ smavSync: SmavSyncClientResult; user: User }>(`${API_BASE}/admin/users/${id}/retry-smav-sync`, { method: 'POST' }, adminName),
+  reconcileAdminUsersSmav: (params?: { dryRun?: boolean; userIds?: string[] }, adminName?: string) =>
+    fetchJson<SmavReconciliationReport>(`${API_BASE}/admin/users/reconcile-smav`, {
+      method: 'POST',
+      body: JSON.stringify({ dryRun: params?.dryRun !== false, ...(params?.userIds ? { userIds: params.userIds } : {}) })
+    }, adminName),
 
   // Categories & Services & Packages
   getCategories: () => fetchJson<ServiceCategory[]>(`${API_BASE}/categories`),

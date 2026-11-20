@@ -4,7 +4,8 @@
  *
  * Reusable across any salon, restaurant, retail store, or future outlet portal.
  * Supports bidirectional synchronization between an Outlet Admin portal and
- * Central SMAV Supabase Auth (`smav-identity-admin` / SMAV Print Agent Gateway):
+ * Central SMAV Identity Sync API (`POST /api/integrations/<outletCode>/users/sync`
+ * or Central SMAV Supabase Edge Function `smav-identity-admin`):
  *
  * - Single-source user creation: name, username, email, role, initialPassword (never stored in plaintext)
  * - Idempotent updates matched by existing Central Auth UUID or `(source, external_id)`
@@ -21,7 +22,7 @@ export interface OutletUserSyncPayload {
   fullName: string;
   username?: string;
   phone?: string;
-  role?: 'OWNER' | 'MANAGER' | 'ADMIN' | 'STAFF' | 'STYLIST' | 'RECEPTIONIST' | 'CASHIER' | string;
+  role?: 'ADMIN' | 'POS_BILLING' | 'OWNER' | 'MANAGER' | 'STAFF' | 'STYLIST' | 'RECEPTIONIST' | 'CASHIER' | string;
   isActive?: boolean;
   initialPassword?: string;
   newPassword?: string;
@@ -34,11 +35,21 @@ export interface SmavSyncAdapterResponse {
   userId?: string;
   email?: string;
   username?: string;
-  role?: 'ADMIN' | 'STAFF';
+  role?: 'ADMIN' | 'POS_BILLING' | 'STAFF' | string;
   isNewUser?: boolean;
   mustChangePassword?: boolean;
   conflict?: boolean;
+  retryable?: boolean;
   details?: any;
+}
+
+export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+const DEFAULT_SYNC_TIMEOUT_MS = 15000;
+
+function isRetryableHttpStatus(status?: number): boolean {
+  if (!status) return true; // Network failure / timeout
+  return status === 408 || status === 429 || status >= 500;
 }
 
 export class SmavOutletUserAdapter {
@@ -46,15 +57,24 @@ export class SmavOutletUserAdapter {
   protected readonly gatewayOrEdgeUrl: string;
   protected readonly integrationKey: string;
   protected readonly useCentralGateway: boolean;
+  protected readonly fetchImpl: FetchLike;
+  protected readonly timeoutMs: number;
 
   constructor(config: {
     outletCode: string;
     integrationKey?: string;
     gatewayUrl?: string;
     edgeFunctionUrl?: string;
+    fetchImpl?: FetchLike;
+    timeoutMs?: number;
   }) {
     this.outletCode = String(config.outletCode || '').trim().toLowerCase();
     this.integrationKey = (config.integrationKey || '').trim();
+    this.fetchImpl = config.fetchImpl || fetch;
+    this.timeoutMs = typeof config.timeoutMs === 'number' && config.timeoutMs > 0
+      ? config.timeoutMs
+      : DEFAULT_SYNC_TIMEOUT_MS;
+
     if (config.gatewayUrl?.trim()) {
       this.useCentralGateway = true;
       this.gatewayOrEdgeUrl = config.gatewayUrl.trim().replace(/\/+$/, '');
@@ -68,6 +88,16 @@ export class SmavOutletUserAdapter {
         'https://qykdwswatopylzvqhgog.supabase.co/functions/v1/smav-identity-admin'
       ).trim();
     }
+  }
+
+  public resolveTargetUrl(): string {
+    if (!this.useCentralGateway) {
+      return this.gatewayOrEdgeUrl;
+    }
+    if (/\/users\/sync$/i.test(this.gatewayOrEdgeUrl)) {
+      return this.gatewayOrEdgeUrl;
+    }
+    return `${this.gatewayOrEdgeUrl}/api/integrations/${encodeURIComponent(this.outletCode)}/users/sync`;
   }
 
   private buildHeaders(idempotencyKey?: string): Record<string, string> {
@@ -91,14 +121,17 @@ export class SmavOutletUserAdapter {
     if (!this.integrationKey) {
       return {
         success: false,
+        status: 503,
+        retryable: false,
         message: `Integration key not configured for outlet "${this.outletCode}".`,
       };
     }
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
     try {
-      const targetUrl = this.useCentralGateway
-        ? `${this.gatewayOrEdgeUrl}/api/integrations/outlets/${encodeURIComponent(this.outletCode)}/users/sync`
-        : this.gatewayOrEdgeUrl;
+      const targetUrl = this.resolveTargetUrl();
 
       const payload = this.useCentralGateway
         ? {
@@ -115,10 +148,11 @@ export class SmavOutletUserAdapter {
             ...body,
           };
 
-      const res = await fetch(targetUrl, {
+      const res = await this.fetchImpl(targetUrl, {
         method: 'POST',
         headers: this.buildHeaders(idempotencyKey),
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
       const data = await res.json().catch(() => ({}));
@@ -130,24 +164,35 @@ export class SmavOutletUserAdapter {
         data?.results?.[0]?.userId ||
         data?.results?.[0]?.centralAuthId;
 
+      const isConflict = res.status === 409 || Boolean(data?.conflict);
+      const isSuccess = Boolean(res.ok && data?.success !== false && !isConflict);
+
       return {
-        success: Boolean(res.ok && data?.success !== false),
+        success: isSuccess,
         status: res.status,
-        message: data?.message || data?.error || (res.ok ? 'Synchronized' : `HTTP ${res.status}`),
+        message: data?.message || data?.error || (isSuccess ? 'Synchronized' : `HTTP ${res.status}`),
         userId: resolvedUserId ? String(resolvedUserId) : undefined,
         email: data?.email || data?.user?.email,
         username: data?.username || data?.user?.username,
         role: data?.role || data?.user?.role,
         isNewUser: Boolean(data?.isNewUser),
         mustChangePassword: data?.mustChangePassword,
-        conflict: res.status === 409,
+        conflict: isConflict,
+        retryable: !isSuccess && !isConflict && isRetryableHttpStatus(res.status),
         details: data,
       };
     } catch (err: any) {
+      const isAbort = err?.name === 'AbortError';
       return {
         success: false,
-        message: `SMAV synchronization failed: ${err?.message || 'Network error'}`,
+        status: isAbort ? 408 : undefined,
+        retryable: true,
+        message: isAbort
+          ? `SMAV synchronization timed out after ${Math.round(this.timeoutMs / 1000)}s`
+          : `SMAV synchronization failed: ${err?.message || 'Network error'}`,
       };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -160,13 +205,13 @@ export class SmavOutletUserAdapter {
       'upsert-user',
       user.userId ? 'update_user' : 'upsert_user',
       {
-        userId: user.userId,
-        externalStaffId: user.externalStaffId,
+        ...(user.userId ? { userId: user.userId } : {}),
+        ...(user.externalStaffId ? { externalStaffId: user.externalStaffId } : {}),
         email: user.email?.trim().toLowerCase(),
         fullName: user.fullName?.trim(),
-        username: user.username?.trim().toLowerCase(),
+        ...(user.username ? { username: user.username.trim().toLowerCase() } : {}),
         phone: user.phone?.trim() || '',
-        role: user.role || 'STAFF',
+        role: user.role || 'POS_BILLING',
         isActive: user.isActive !== false,
         ...(user.initialPassword ? { initialPassword: user.initialPassword } : {}),
       },
@@ -191,9 +236,9 @@ export class SmavOutletUserAdapter {
       'reset-password',
       'reset_password',
       {
-        userId: params.userId,
-        externalStaffId: params.externalStaffId,
-        email: params.email?.trim().toLowerCase(),
+        ...(params.userId ? { userId: params.userId } : {}),
+        ...(params.externalStaffId ? { externalStaffId: params.externalStaffId } : {}),
+        ...(params.email ? { email: params.email.trim().toLowerCase() } : {}),
         newPassword: params.newPassword,
       },
       idempotencyKey
@@ -208,6 +253,7 @@ export class SmavOutletUserAdapter {
       userId?: string;
       externalStaffId?: string;
       email?: string;
+      role?: string;
       isActive: boolean;
     },
     idempotencyKey?: string
@@ -216,9 +262,10 @@ export class SmavOutletUserAdapter {
       'set-status',
       'set_status',
       {
-        userId: params.userId,
-        externalStaffId: params.externalStaffId,
-        email: params.email?.trim().toLowerCase(),
+        ...(params.userId ? { userId: params.userId } : {}),
+        ...(params.externalStaffId ? { externalStaffId: params.externalStaffId } : {}),
+        ...(params.email ? { email: params.email.trim().toLowerCase() } : {}),
+        ...(params.role ? { role: params.role } : {}),
         isActive: params.isActive,
       },
       idempotencyKey

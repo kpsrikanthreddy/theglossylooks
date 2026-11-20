@@ -47,7 +47,10 @@ import type {
   WhatsAppMessage,
   WhatsAppInboxFilter,
   WhatsAppWebhookEvent,
-  WhatsAppInboxDiagnostics
+  WhatsAppInboxDiagnostics,
+  SmavUserSyncOutboxItem,
+  SmavUserSyncEventType,
+  SmavUserSyncAction
 } from '../../types/salon.ts';
 
 export interface ISalonRepository {
@@ -248,6 +251,131 @@ export interface ISalonRepository {
   // Webhook Events & Diagnostics
   createWhatsAppWebhookEvent(event: Omit<WhatsAppWebhookEvent, 'id' | 'received_at'>): Promise<WhatsAppWebhookEvent>;
   getWhatsAppWebhookDiagnostics(): Promise<WhatsAppInboxDiagnostics>;
+
+  // Durable SMAV User Sync Outbox (Atomic Transactional Writes, Safe Idempotency, Verified Linking & Claim-Time Retries)
+  createUserWithSmavOutbox(
+    userData: Omit<User, 'id' | 'created_at' | 'updated_at'>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+      credential_mode?: 'explicit' | 'generated';
+      verifyReplayPassword?: (storedPasswordHash: string) => boolean;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; idempotentReplay?: boolean; atomic: boolean }>;
+  updateUserWithSmavOutbox(
+    id: string,
+    updateData: Partial<User>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; idempotentReplay?: boolean; atomic: boolean } | null>;
+  linkVerifiedCentralAuthId(input: {
+    local_user_id: string;
+    verified_central_auth_id: string;
+    verification_source: 'smav_sync_response';
+    evidence_ref: string;
+    performed_by?: string;
+  }): Promise<User>;
+  enqueueSmavUserSyncEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    performed_by?: string;
+    max_attempts?: number;
+    request_fingerprint?: string | null;
+  }): Promise<{ item: SmavUserSyncOutboxItem; created: boolean }>;
+  recordSmavSyncAuditEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    request_fingerprint?: string | null;
+    status: 'SYNCED' | 'FAILED';
+    last_http_status?: number | null;
+    last_error?: string | null;
+    conflict?: boolean;
+    response_central_auth_id?: string | null;
+    performed_by?: string;
+  }): Promise<SmavUserSyncOutboxItem>;
+  claimSmavUserSyncEventById(id: string): Promise<SmavUserSyncOutboxItem | null>;
+  claimDueSmavUserSyncEvents(limit?: number, staleLockMinutes?: number): Promise<SmavUserSyncOutboxItem[]>;
+  getSmavUserSyncOutbox(filters?: { localUserId?: string; status?: string; limit?: number }): Promise<SmavUserSyncOutboxItem[]>;
+  getSmavUserSyncOutboxById(id: string): Promise<SmavUserSyncOutboxItem | null>;
+  getSmavUserSyncOutboxByIdempotencyKey(idempotencyKey: string): Promise<SmavUserSyncOutboxItem | null>;
+  updateSmavUserSyncEvent(id: string, data: Partial<SmavUserSyncOutboxItem>): Promise<SmavUserSyncOutboxItem | null>;
 }
+
+export class IdempotencyKeyConflictError extends Error {
+  public readonly statusCode = 409;
+  public readonly code = 'IDEMPOTENCY_KEY_CONFLICT';
+  public readonly idempotencyKey: string;
+
+  constructor(idempotencyKey: string, message?: string) {
+    super(
+      message ||
+        `Idempotency key conflict: "${idempotencyKey}" was already used with a different request payload.`
+    );
+    this.name = 'IdempotencyKeyConflictError';
+    this.idempotencyKey = idempotencyKey;
+  }
+}
+
+export function isIdempotencyKeyConflictError(err: unknown): err is IdempotencyKeyConflictError {
+  if (err instanceof IdempotencyKeyConflictError) return true;
+  const msg = typeof (err as any)?.message === 'string' ? (err as any).message : '';
+  return msg.includes('IDEMPOTENCY_KEY_CONFLICT');
+}
+
+export class Migration024RequiredError extends Error {
+  public readonly statusCode = 503;
+  public readonly code = 'MIGRATION_024_REQUIRED';
+  public readonly missingObject: string;
+
+  constructor(missingObject: string, detail?: string) {
+    super(
+      `MIGRATION_024_REQUIRED: Required Migration 024 database object (${missingObject}) is not installed in Supabase. Refusing non-atomic write to protect Glossy Looks <-> SMAV identity integrity. Apply database/migrations/024_smav_user_sync_outbox.sql and retry.${detail ? ` (${detail})` : ''}`
+    );
+    this.name = 'Migration024RequiredError';
+    this.missingObject = missingObject;
+  }
+}
+
+export function isMigration024RequiredError(err: unknown): err is Migration024RequiredError {
+  if (err instanceof Migration024RequiredError) return true;
+  const code = (err as any)?.code;
+  const msg = typeof (err as any)?.message === 'string' ? (err as any).message : '';
+  return code === 'MIGRATION_024_REQUIRED' || msg.includes('MIGRATION_024_REQUIRED');
+}
+
+export class CentralAuthLinkForbiddenError extends Error {
+  public readonly statusCode = 403;
+  public readonly code = 'CENTRAL_AUTH_LINK_FORBIDDEN';
+
+  constructor(message?: string) {
+    super(
+      message ||
+        'CENTRAL_AUTH_LINK_FORBIDDEN: Ordinary user or staff updates cannot assign or modify central_auth_id. Use verified Central SMAV linking or audited manual reconciliation.'
+    );
+    this.name = 'CentralAuthLinkForbiddenError';
+  }
+}
+
+export function isCentralAuthLinkForbiddenError(err: unknown): err is CentralAuthLinkForbiddenError {
+  if (err instanceof CentralAuthLinkForbiddenError) return true;
+  const code = (err as any)?.code;
+  const msg = typeof (err as any)?.message === 'string' ? (err as any).message : '';
+  return code === 'CENTRAL_AUTH_LINK_FORBIDDEN' || msg.includes('CENTRAL_AUTH_LINK_FORBIDDEN');
+}
+
 
 

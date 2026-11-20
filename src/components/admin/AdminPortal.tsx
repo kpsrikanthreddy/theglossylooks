@@ -89,7 +89,7 @@ import {
   SalonBranch,
   DailySalesReportLog
 } from '../../types/salon';
-import { api } from '../../lib/api';
+import { api, SmavSyncClientResult, SmavReconciliationReport } from '../../lib/api';
 import { useToast, getSafeErrorMessage } from '../common/ToastProvider';
 import { ActionButton } from '../common/ActionButton';
 import { useAsyncAction, useKeyedAsyncAction } from '../../hooks/useAsyncAction';
@@ -147,6 +147,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const adminUserSaveAction = useAsyncAction();
   const resetPasswordAction = useAsyncAction();
   const userStatusToggleAction = useAsyncAction();
+  const reconcileAuditAction = useAsyncAction();
+  const reconcileApplyAction = useAsyncAction();
   const orderEditAction = useAsyncAction();
   const confirmDialogAction = useAsyncAction();
   const rowAction = useKeyedAsyncAction();
@@ -357,6 +359,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [userModal, setUserModal] = useState<{ isOpen: boolean; data?: User | null }>({ isOpen: false });
   const [resetPasswordModal, setResetPasswordModal] = useState<{ isOpen: boolean; user?: User | null }>({ isOpen: false });
   const [deactivateConfirmModal, setDeactivateConfirmModal] = useState<{ isOpen: boolean; user?: User | null; action?: 'toggle' | 'delete' }>({ isOpen: false });
+  const [reconcileModal, setReconcileModal] = useState<{ isOpen: boolean; report?: SmavReconciliationReport | null }>({ isOpen: false, report: null });
 
   // Search & Filter filters
   const [customerSearch, setCustomerSearch] = useState('');
@@ -1171,7 +1174,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     toast.success('Sales report CSV exported');
   };
 
-  // Owner RBAC User Management Handlers (with SMAV sync feedback)
+  // Owner RBAC User Management Handlers (with accurate SMAV Central Auth sync status feedback)
+  const notifySmavSyncOutcome = (localActionLabel: string, smavSync?: SmavSyncClientResult | null) => {
+    if (!smavSync) {
+      toast.success(localActionLabel);
+      return;
+    }
+    const status = smavSync.syncStatus || (smavSync.synced ? 'SYNCED' : 'FAILED');
+    if (status === 'SYNCED' && smavSync.synced) {
+      toast.success(`${localActionLabel} and synced to SMAV Central Auth.`);
+    } else if (status === 'PENDING') {
+      toast.warning(
+        `${localActionLabel}. SMAV sync is PENDING automatic retry${smavSync.error ? ` (${smavSync.error})` : ''}.`
+      );
+    } else {
+      toast.error(
+        `${localActionLabel}, but SMAV sync FAILED: ${smavSync.error || 'Use Retry Sync after resolving the issue.'}`
+      );
+    }
+  };
+
   const handleSaveAdminUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!currentUser || currentUser.role !== 'owner') return;
@@ -1188,25 +1210,23 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     const isEditing = Boolean(userModal.data?.id);
     const editingId = userModal.data?.id;
 
-    if (!isEditing && (!password || password.length < 6)) {
-      toast.warning('Password must be at least 6 characters.');
+    if (!isEditing && (!password || password.length < 8)) {
+      toast.warning('Initial password must be at least 8 characters for SMAV Central Auth compatibility.');
       return;
     }
 
     await adminUserSaveAction.run(
       async () => {
-        if (isEditing && editingId) {
-          await api.updateAdminUser(
-            editingId,
-            { user_id, name, email, phone, role, is_active },
-            currentUser.name
-          );
-        } else {
-          await api.createAdminUser(
-            { user_id, name, email, phone, role, password, is_active: true } as any,
-            currentUser.name
-          );
-        }
+        const res = isEditing && editingId
+          ? await api.updateAdminUser(
+              editingId,
+              { user_id, name, email, phone, role, is_active },
+              currentUser.name
+            )
+          : await api.createAdminUser(
+              { user_id, name, email, phone, role, password, is_active: true } as any,
+              currentUser.name
+            );
         setUserModal({ isOpen: false });
         await loadAllData();
         if (currentUser && editingId === currentUser.id) {
@@ -1217,11 +1237,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ user: updatedMe }));
           }
         }
+        return res;
       },
       {
-        successMessage: isEditing
-          ? `Staff account for ${name} updated and synced`
-          : `Staff account for ${name} created and synced`,
+        onSuccess: (res) => {
+          notifySmavSyncOutcome(
+            isEditing ? `Staff account for ${name} updated` : `Staff account for ${name} created`,
+            res?.smavSync
+          );
+        },
         errorFallback: 'Failed to save staff user.'
       }
     );
@@ -1236,8 +1260,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     const confirmPassword = (formData.get('confirm_password') as string)?.trim();
     const targetUser = resetPasswordModal.user;
 
-    if (!newPassword || newPassword.length < 6) {
-      toast.warning('Password must be at least 6 characters.');
+    if (!newPassword || newPassword.length < 8) {
+      toast.warning('New password must be at least 8 characters for SMAV Central Auth compatibility.');
       return;
     }
     if (newPassword !== confirmPassword) {
@@ -1247,13 +1271,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
     await resetPasswordAction.run(
       async () => {
-        await api.resetAdminUserPassword(targetUser.id, newPassword, currentUser.name);
+        const res = await api.resetAdminUserPassword(targetUser.id, newPassword, currentUser.name);
         setResetPasswordModal({ isOpen: false });
-        const logsData = await api.getAuditLogs();
-        setAuditLogs(logsData);
+        await loadAllData();
+        return res;
       },
       {
-        successMessage: `Password for ${targetUser.name} updated and synced`,
+        onSuccess: (res) => {
+          notifySmavSyncOutcome(`Password for ${targetUser.name} updated`, res?.smavSync);
+        },
         errorFallback: 'Failed to reset staff password.'
       }
     );
@@ -1266,25 +1292,80 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
     await userStatusToggleAction.run(
       async () => {
-        if (actionType === 'delete') {
-          await api.deleteAdminUser(user.id, currentUser.name);
-        } else {
-          await api.updateAdminUser(
-            user.id,
-            { is_active: !user.is_active },
-            currentUser.name
-          );
-        }
+        const res = actionType === 'delete'
+          ? await api.deleteAdminUser(user.id, currentUser.name)
+          : await api.updateAdminUser(
+              user.id,
+              { is_active: !user.is_active },
+              currentUser.name
+            );
         setDeactivateConfirmModal({ isOpen: false });
         await loadAllData();
+        return res;
       },
       {
-        successMessage: actionType === 'delete'
-          ? `Staff user ${user.name} removed`
-          : user.is_active
-          ? `${user.name} deactivated and synced`
-          : `${user.name} reactivated and synced`,
+        onSuccess: (res) => {
+          const label = actionType === 'delete'
+            ? `Staff user ${user.name} deactivated`
+            : user.is_active
+              ? `${user.name} deactivated`
+              : `${user.name} reactivated`;
+          notifySmavSyncOutcome(label, res?.smavSync);
+        },
         errorFallback: 'Failed to update staff user status.'
+      }
+    );
+  };
+
+  const handleRetryUserSmavSync = async (user: User) => {
+    if (!currentUser || currentUser.role !== 'owner') return;
+    await rowAction.runForKey(
+      `retry-smav-${user.id}`,
+      async () => {
+        const res = await api.retryAdminUserSmavSync(user.id, currentUser.name);
+        const updatedUsers = await api.getAdminUsers();
+        setAdminUsers(updatedUsers);
+        return res;
+      },
+      {
+        onSuccess: (res) => {
+          notifySmavSyncOutcome(`SMAV sync retried for ${user.name}`, res?.smavSync);
+        },
+        errorFallback: `Failed to retry SMAV sync for ${user.name}.`
+      }
+    );
+  };
+
+  const handleRunSmavReconcile = async (dryRun: boolean) => {
+    if (!currentUser || currentUser.role !== 'owner') return;
+    const runner = dryRun ? reconcileAuditAction : reconcileApplyAction;
+    await runner.run(
+      async () => {
+        const report = await api.reconcileAdminUsersSmav({ dryRun }, currentUser.name);
+        setReconcileModal({ isOpen: true, report });
+        if (!dryRun) {
+          const updatedUsers = await api.getAdminUsers();
+          setAdminUsers(updatedUsers);
+        }
+        return report;
+      },
+      {
+        onSuccess: (report) => {
+          if (dryRun) {
+            toast.info(
+              `SMAV audit complete: ${report.summary.totalAdminUsers} users checked, ${report.summary.needsManualReview} need manual review.`
+            );
+          } else if (report.summary.failedNow > 0 || report.summary.skippedAmbiguous > 0) {
+            toast.warning(
+              `Synced ${report.summary.syncedNow}, pending ${report.summary.pendingNow}, failed ${report.summary.failedNow}, skipped ambiguous ${report.summary.skippedAmbiguous}.`
+            );
+          } else {
+            toast.success(
+              `Reconciliation complete: ${report.summary.syncedNow} synced${report.summary.pendingNow ? `, ${report.summary.pendingNow} pending retry` : ''}.`
+            );
+          }
+        },
+        errorFallback: dryRun ? 'Failed to run SMAV reconciliation audit.' : 'Failed to apply SMAV reconciliation.'
       }
     );
   };
@@ -5071,15 +5152,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       <div className="flex items-center gap-2 text-[#8C235A] mb-0.5">
                         <ShieldCheck className="w-4 h-4 text-[#D4AF37]" />
                         <span className="text-[10px] uppercase font-bold tracking-widest">
-                          Owner Security Controls
+                          Owner Security Controls · SMAV Authoritative Source
                         </span>
                       </div>
                       <h3 className="font-serif font-bold text-base text-slate-900">
                         Staff Accounts & Role-Based Access Control (RBAC)
                       </h3>
                       <p className="text-xs text-slate-500">
-                        Create staff User IDs, set/reset passwords, assign module permissions, and manage credentials.
+                        Create staff User IDs, set/reset passwords, assign RBAC roles, and monitor automatic SMAV Central Identity synchronization.
                       </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <ActionButton
+                        type="button"
+                        loading={reconcileAuditAction.isLoading}
+                        loadingText="Auditing..."
+                        onClick={() => handleRunSmavReconcile(true)}
+                        className="px-3 py-2 text-xs font-semibold text-[#5B132B] bg-[#FAF4F0] hover:bg-[#F3E6DE] border border-[#EBD9D0] rounded-xl transition-colors flex items-center gap-1.5"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Audit &amp; Reconcile SMAV</span>
+                      </ActionButton>
                     </div>
                   </div>
 
@@ -5091,92 +5184,155 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           <th className="py-2.5 px-3 font-semibold">Staff Name & Contact</th>
                           <th className="py-2.5 px-3 font-semibold">Assigned Role</th>
                           <th className="py-2.5 px-3 font-semibold">Status</th>
+                          <th className="py-2.5 px-3 font-semibold">SMAV Sync</th>
                           <th className="py-2.5 px-3 font-semibold">Last Login</th>
                           <th className="py-2.5 px-4 font-semibold text-right">Owner Actions</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {adminUsers.map(user => (
-                          <tr key={user.id} className="hover:bg-slate-50/70 transition-colors">
-                            <td className="py-3 px-4 font-mono font-bold text-[#5B132B]">
-                              <span className="bg-[#FAF4F0] px-2 py-1 rounded-md border border-[#EBD9D0]">
-                                {user.user_id || 'TGL-STF'}
-                              </span>
-                            </td>
-                            <td className="py-3 px-3">
-                              <div className="font-bold text-slate-900">{user.name}</div>
-                              <div className="text-[11px] text-slate-500">
-                                {user.email} · {user.phone || 'No phone'}
-                              </div>
-                            </td>
-                            <td className="py-3 px-3">
-                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                                user.role === 'owner' ? 'bg-amber-100 text-amber-900 border border-amber-300' :
-                                user.role === 'manager' ? 'bg-purple-100 text-purple-900 border border-purple-300' :
-                                user.role === 'receptionist' ? 'bg-blue-100 text-blue-900 border border-blue-300' :
-                                user.role === 'stylist' ? 'bg-emerald-100 text-emerald-900 border border-emerald-300' :
-                                'bg-orange-100 text-orange-900 border border-orange-300'
-                              }`}>
-                                {user.role.replace('_', ' ')}
-                              </span>
-                            </td>
-                            <td className="py-3 px-3">
-                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                user.is_active
-                                  ? 'bg-emerald-100 text-emerald-800'
-                                  : 'bg-rose-100 text-rose-800'
-                              }`}>
-                                <span className={`w-1.5 h-1.5 rounded-full ${user.is_active ? 'bg-emerald-600' : 'bg-rose-600'}`} />
-                                <span>{user.is_active ? 'Active' : 'Deactivated'}</span>
-                              </span>
-                            </td>
-                            <td className="py-3 px-3 text-[11px] text-slate-500">
-                              {user.last_login_at
-                                ? new Date(user.last_login_at).toLocaleDateString('en-IN', {
-                                    day: '2-digit',
-                                    month: 'short',
-                                    hour: '2-digit',
-                                    minute: '2-digit'
-                                  })
-                                : 'Never logged in'}
-                            </td>
-                            <td className="py-3 px-4 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                <button
-                                  onClick={() => setUserModal({ isOpen: true, data: user })}
-                                  className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-lg"
-                                  title="Edit Staff Profile & Role"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => setResetPasswordModal({ isOpen: true, user })}
-                                  className="p-1.5 text-amber-700 hover:text-amber-900 hover:bg-amber-50 rounded-lg flex items-center gap-1 font-semibold text-[11px]"
-                                  title="Reset Staff Password"
-                                >
-                                  <Key className="w-3.5 h-3.5" />
-                                  <span>Reset Pwd</span>
-                                </button>
-                                {user.role !== 'owner' && (
+                        {adminUsers.map(user => {
+                          const syncStatus = user.central_sync_status || (user.central_sync_error ? 'FAILED' : 'PENDING');
+                          const mappedSmavRole = user.smav_role || (user.role === 'owner' || user.role === 'manager' ? 'ADMIN' : 'POS_BILLING');
+                          const retryKey = `retry-smav-${user.id}`;
+                          const needsRetry = syncStatus !== 'SYNCED' || !user.central_auth_id;
+
+                          return (
+                            <tr key={user.id} className="hover:bg-slate-50/70 transition-colors">
+                              <td className="py-3 px-4 font-mono font-bold text-[#5B132B]">
+                                <span className="bg-[#FAF4F0] px-2 py-1 rounded-md border border-[#EBD9D0]">
+                                  {user.user_id || 'TGL-STF'}
+                                </span>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="font-bold text-slate-900">{user.name}</div>
+                                <div className="text-[11px] text-slate-500">
+                                  {user.email} · {user.phone || 'No phone'}
+                                </div>
+                              </td>
+                              <td className="py-3 px-3">
+                                <div className="flex flex-col items-start gap-1">
+                                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                                    user.role === 'owner' ? 'bg-amber-100 text-amber-900 border border-amber-300' :
+                                    user.role === 'manager' ? 'bg-purple-100 text-purple-900 border border-purple-300' :
+                                    user.role === 'receptionist' ? 'bg-blue-100 text-blue-900 border border-blue-300' :
+                                    user.role === 'stylist' ? 'bg-emerald-100 text-emerald-900 border border-emerald-300' :
+                                    'bg-orange-100 text-orange-900 border border-orange-300'
+                                  }`}>
+                                    {user.role.replace('_', ' ')}
+                                  </span>
+                                  <span className="text-[10px] font-mono text-slate-400">
+                                    SMAV: {mappedSmavRole}
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="py-3 px-3">
+                                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                  user.is_active
+                                    ? 'bg-emerald-100 text-emerald-800'
+                                    : 'bg-rose-100 text-rose-800'
+                                }`}>
+                                  <span className={`w-1.5 h-1.5 rounded-full ${user.is_active ? 'bg-emerald-600' : 'bg-rose-600'}`} />
+                                  <span>{user.is_active ? 'Active' : 'Deactivated'}</span>
+                                </span>
+                              </td>
+                              <td className="py-3 px-3 max-w-[210px]">
+                                <div className="flex flex-col items-start gap-1">
+                                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+                                    syncStatus === 'SYNCED'
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                      : syncStatus === 'PENDING'
+                                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                        : 'bg-rose-50 text-rose-800 border-rose-200'
+                                  }`}>
+                                    {syncStatus === 'SYNCED' ? (
+                                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                    ) : syncStatus === 'PENDING' ? (
+                                      <Clock className="w-3 h-3 text-amber-600" />
+                                    ) : (
+                                      <AlertCircle className="w-3 h-3 text-rose-600" />
+                                    )}
+                                    <span>{syncStatus}</span>
+                                  </span>
+                                  {user.central_auth_id ? (
+                                    <span className="text-[10px] font-mono text-slate-400" title={`Central Auth UUID: ${user.central_auth_id}`}>
+                                      UUID: {user.central_auth_id.slice(0, 8)}…
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] text-amber-700 font-medium">
+                                      Not linked to SMAV UUID
+                                    </span>
+                                  )}
+                                  {user.central_sync_error && syncStatus !== 'SYNCED' && (
+                                    <span
+                                      className="text-[10px] text-rose-700 leading-tight line-clamp-2"
+                                      title={user.central_sync_error}
+                                    >
+                                      {user.central_sync_error}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 text-[11px] text-slate-500">
+                                {user.last_login_at
+                                  ? new Date(user.last_login_at).toLocaleDateString('en-IN', {
+                                      day: '2-digit',
+                                      month: 'short',
+                                      hour: '2-digit',
+                                      minute: '2-digit'
+                                    })
+                                  : 'Never logged in'}
+                              </td>
+                              <td className="py-3 px-4 text-right">
+                                <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                                  {needsRetry && (
+                                    <ActionButton
+                                      type="button"
+                                      loading={rowAction.isPending(retryKey)}
+                                      loadingText="Syncing..."
+                                      onClick={() => handleRetryUserSmavSync(user)}
+                                      className="py-1 px-2 rounded-lg text-[11px] font-semibold text-[#5B132B] bg-[#FAF4F0] hover:bg-[#F3E6DE] border border-[#EBD9D0] flex items-center gap-1 transition-colors"
+                                      title="Retry SMAV Central Identity Sync"
+                                    >
+                                      <RefreshCw className="w-3 h-3" />
+                                      <span>Retry Sync</span>
+                                    </ActionButton>
+                                  )}
                                   <button
-                                    onClick={() => setDeactivateConfirmModal({
-                                      isOpen: true,
-                                      user,
-                                      action: user.is_active ? 'toggle' : 'toggle'
-                                    })}
-                                    className={`py-1 px-2 rounded-lg text-[11px] font-semibold transition-colors ${
-                                      user.is_active
-                                        ? 'text-rose-700 hover:bg-rose-50'
-                                        : 'text-emerald-700 hover:bg-emerald-50'
-                                    }`}
+                                    onClick={() => setUserModal({ isOpen: true, data: user })}
+                                    className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded-lg"
+                                    title="Edit Staff Profile & Role"
                                   >
-                                    {user.is_active ? 'Deactivate' : 'Activate'}
+                                    <Edit3 className="w-3.5 h-3.5" />
                                   </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                                  <button
+                                    onClick={() => setResetPasswordModal({ isOpen: true, user })}
+                                    className="p-1.5 text-amber-700 hover:text-amber-900 hover:bg-amber-50 rounded-lg flex items-center gap-1 font-semibold text-[11px]"
+                                    title="Reset Staff Password"
+                                  >
+                                    <Key className="w-3.5 h-3.5" />
+                                    <span>Reset Pwd</span>
+                                  </button>
+                                  {user.role !== 'owner' && (
+                                    <button
+                                      onClick={() => setDeactivateConfirmModal({
+                                        isOpen: true,
+                                        user,
+                                        action: 'toggle'
+                                      })}
+                                      className={`py-1 px-2 rounded-lg text-[11px] font-semibold transition-colors ${
+                                        user.is_active
+                                          ? 'text-rose-700 hover:bg-rose-50'
+                                          : 'text-emerald-700 hover:bg-emerald-50'
+                                      }`}
+                                    >
+                                      {user.is_active ? 'Deactivate' : 'Activate'}
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -5993,12 +6149,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   name="password"
                   type="password"
                   required
-                  minLength={6}
-                  placeholder="Minimum 6 characters"
+                  minLength={8}
+                  placeholder="Minimum 8 characters"
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white outline-none focus:border-[#5B132B]"
                 />
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Passwords are encrypted using secure hashing. Staff can change password via Owner reset.
+                  Minimum 8 characters (required by SMAV Central Auth). Passwords are never stored in sync outbox payloads.
                 </p>
               </div>
             ) : (
@@ -6079,8 +6235,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 name="new_password"
                 type="password"
                 required
-                minLength={6}
-                placeholder="Enter new password (min 6 chars)"
+                minLength={8}
+                placeholder="Enter new password (min 8 chars)"
                 className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white outline-none focus:border-[#5B132B]"
               />
             </div>
@@ -6091,7 +6247,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 name="confirm_password"
                 type="password"
                 required
-                minLength={6}
+                minLength={8}
                 placeholder="Re-type new password"
                 className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white outline-none focus:border-[#5B132B]"
               />
@@ -6168,6 +6324,151 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               >
                 Cancel
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: SAFE SMAV CENTRAL IDENTITY RECONCILIATION */}
+      {reconcileModal.isOpen && reconcileModal.report && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-2xl relative space-y-4 text-xs max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between border-b pb-3 shrink-0">
+              <div>
+                <h3 className="font-serif font-bold text-base text-slate-900 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#8C235A]" />
+                  <span>SMAV Central Identity Reconciliation</span>
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  {reconcileModal.report.dryRun
+                    ? 'Dry-run audit complete. Ambiguous accounts are flagged and will never be overwritten or deleted.'
+                    : 'Safe reconciliation applied. Ambiguous accounts were skipped for manual review.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={reconcileApplyAction.isLoading || reconcileAuditAction.isLoading}
+                onClick={() => setReconcileModal({ isOpen: false, report: null })}
+                className="text-slate-400 hover:text-slate-700 text-base disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 shrink-0">
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Admin Users</div>
+                <div className="text-lg font-bold text-slate-900">{reconcileModal.report.summary.totalAdminUsers}</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
+                <div className="text-[10px] uppercase tracking-wider text-emerald-700 font-semibold">Already Synced</div>
+                <div className="text-lg font-bold text-emerald-900">{reconcileModal.report.summary.alreadySynced}</div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-blue-50 border border-blue-200">
+                <div className="text-[10px] uppercase tracking-wider text-blue-700 font-semibold">Safe To Sync</div>
+                <div className="text-lg font-bold text-blue-900">
+                  {reconcileModal.report.summary.readyUpdateByUuid + reconcileModal.report.summary.readyLinkOrCreate}
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200">
+                <div className="text-[10px] uppercase tracking-wider text-rose-700 font-semibold">Manual Review</div>
+                <div className="text-lg font-bold text-rose-900">{reconcileModal.report.summary.needsManualReview}</div>
+              </div>
+            </div>
+
+            <div className="overflow-y-auto border border-slate-200 rounded-xl flex-1">
+              <table className="w-full text-left text-[11px]">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase text-[10px] sticky top-0">
+                  <tr>
+                    <th className="py-2 px-3 font-semibold">Staff Account</th>
+                    <th className="py-2 px-3 font-semibold">RBAC → SMAV</th>
+                    <th className="py-2 px-3 font-semibold">Classification</th>
+                    <th className="py-2 px-3 font-semibold">Findings / Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {reconcileModal.report.users.map(item => (
+                    <tr key={item.localUserId} className="align-top">
+                      <td className="py-2.5 px-3">
+                        <div className="font-bold text-slate-900">{item.name}</div>
+                        <div className="text-[10px] font-mono text-slate-500">{item.userCode} · {item.email}</div>
+                        <div className="text-[10px] text-slate-400">
+                          {item.isActive ? 'Active' : 'Deactivated'} · {item.centralAuthId ? `UUID ${item.centralAuthId.slice(0, 8)}…` : 'No UUID'}
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-3 font-mono">
+                        <div>{item.rbacRole}</div>
+                        <div className="text-[10px] text-[#8C235A] font-bold">→ {item.mappedSmavRole}</div>
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                          item.classification === 'ALREADY_SYNCED'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : item.classification === 'NEEDS_MANUAL_REVIEW'
+                              ? 'bg-rose-100 text-rose-800'
+                              : 'bg-blue-100 text-blue-800'
+                        }`}>
+                          {item.classification.replace(/_/g, ' ')}
+                        </span>
+                        {item.syncResult && (
+                          <div className={`mt-1 text-[10px] font-semibold ${
+                            item.syncResult.syncStatus === 'SYNCED'
+                              ? 'text-emerald-700'
+                              : item.syncResult.syncStatus === 'PENDING'
+                                ? 'text-amber-700'
+                                : 'text-rose-700'
+                          }`}>
+                            Result: {item.syncResult.syncStatus}
+                            {item.syncResult.error ? ` — ${item.syncResult.error}` : ''}
+                          </div>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-600">
+                        <div>{item.recommendedAction}</div>
+                        {item.anomalies.length > 0 && (
+                          <ul className="mt-1 space-y-0.5 text-[10px] text-rose-700 list-disc pl-3.5">
+                            {item.anomalies.map((anom, idx) => (
+                              <li key={idx}>{anom}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t shrink-0">
+              <span className="text-[10px] text-slate-500">
+                Ambiguous accounts ({reconcileModal.report.summary.needsManualReview}) are automatically skipped to prevent duplicate Central Auth users.
+              </span>
+              <div className="flex items-center gap-2">
+                <ActionButton
+                  type="button"
+                  loading={reconcileAuditAction.isLoading}
+                  loadingText="Re-auditing..."
+                  onClick={() => handleRunSmavReconcile(true)}
+                  className="py-2 px-3 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Re-run Dry Audit</span>
+                </ActionButton>
+                <ActionButton
+                  type="button"
+                  loading={reconcileApplyAction.isLoading}
+                  loadingText="Syncing Safe Accounts..."
+                  disabled={
+                    reconcileAuditAction.isLoading ||
+                    (reconcileModal.report.summary.readyUpdateByUuid + reconcileModal.report.summary.readyLinkOrCreate) === 0
+                  }
+                  onClick={() => handleRunSmavReconcile(false)}
+                  className="py-2 px-4 text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] rounded-xl shadow-xs flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>Sync Safe Accounts ({reconcileModal.report.summary.readyUpdateByUuid + reconcileModal.report.summary.readyLinkOrCreate})</span>
+                </ActionButton>
+              </div>
             </div>
           </div>
         </div>

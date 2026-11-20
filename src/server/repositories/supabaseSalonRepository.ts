@@ -61,17 +61,79 @@ import type {
   WhatsAppInboxFilter,
   CustomerServiceWindowInfo,
   WhatsAppWebhookEvent,
-  WhatsAppInboxDiagnostics
+  WhatsAppInboxDiagnostics,
+  SmavUserSyncOutboxItem,
+  SmavUserSyncEventType,
+  SmavUserSyncAction
 } from '../../types/salon.ts';
-import type { ISalonRepository } from './salonRepository.ts';
+import {
+  CentralAuthLinkForbiddenError,
+  IdempotencyKeyConflictError,
+  isCentralAuthLinkForbiddenError,
+  isIdempotencyKeyConflictError,
+  Migration024RequiredError,
+  type ISalonRepository,
+} from './salonRepository.ts';
+
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJson);
+  if (value && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const val = (value as Record<string, unknown>)[key];
+      if (val !== undefined) sorted[key] = canonicalizeJson(val);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+function computeRequestFingerprint(input: Record<string, unknown>): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(canonicalizeJson(input)))
+    .digest('hex');
+}
+
+function deriveDeterministicUserCode(role: string | undefined, idempotencyKey: string): string {
+  const prefix = (role || 'STF').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) || 'STF';
+  const hashHex = crypto.createHash('sha256').update(idempotencyKey).digest('hex');
+  const num = (parseInt(hashHex.slice(0, 8), 16) % 900) + 100;
+  return `TGL-${prefix}${num}`;
+}
+
+function isRpcIdempotencyConflict(err: any): boolean {
+  if (!err) return false;
+  if (isIdempotencyKeyConflictError(err)) return true;
+  const code = String(err.code || '');
+  const msg = String(err.message || '');
+  return /IDEMPOTENCY_KEY_CONFLICT/i.test(msg) || (code === '23505' && /idempotency/i.test(msg));
+}
+
+function isMissingMigration024Object(err: any): boolean {
+  if (!err) return false;
+  const code = String(err.code || '');
+  const msg = String(err.message || '');
+  return (
+    code === '42883' || // undefined_function
+    code === '42P01' || // undefined_table
+    code === '42703' || // undefined_column
+    code === 'PGRST202' || // PostgREST function not found in schema cache
+    code === 'PGRST204' || // PostgREST column not found in schema cache
+    code === 'PGRST205' || // PostgREST table not found in schema cache
+    /function .* does not exist|relation .* does not exist|column .* does not exist|could not find the (function|table|column)|schema cache/i.test(msg)
+  );
+}
 
 export class SupabaseSalonRepository implements ISalonRepository {
   private client: SupabaseClient;
 
-  constructor(supabaseUrl: string, supabaseKey: string) {
-    this.client = createClient(supabaseUrl, supabaseKey, {
-      auth: { persistSession: false }
-    });
+  constructor(supabaseUrl: string, supabaseKey: string, injectedClient?: SupabaseClient) {
+    this.client =
+      injectedClient ||
+      createClient(supabaseUrl, supabaseKey, {
+        auth: { persistSession: false }
+      });
   }
 
   // --- Multi-Branch Management ---
@@ -532,6 +594,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
       : `TGL-${(userData.role || 'STF').toUpperCase().slice(0, 3)}${Math.floor(10 + Math.random() * 90)}`;
 
     let newUser: any = null;
+    let firstErr: any = null;
     try {
       const { data: u1, error: err1 } = await this.client
         .from('users')
@@ -543,11 +606,40 @@ export class SupabaseSalonRepository implements ISalonRepository {
         .single();
       if (!err1 && u1) {
         newUser = u1;
+      } else {
+        firstErr = err1;
       }
-    } catch {}
+    } catch (err) {
+      firstErr = err;
+    }
+
+    if (!newUser && firstErr && /column .* does not exist|schema cache/i.test(firstErr.message || '')) {
+      const {
+        central_sync_status: _s1,
+        central_sync_error: _s2,
+        central_sync_last_attempt_at: _s3,
+        central_sync_outbox_id: _s4,
+        ...compatData
+      } = userData as any;
+      const { data: uCompat, error: errCompat } = await this.client
+        .from('users')
+        .insert({ ...compatData, user_id: autoUserId })
+        .select()
+        .single();
+      if (!errCompat && uCompat) {
+        newUser = uCompat;
+      }
+    }
 
     if (!newUser) {
-      const { user_id, ...dataWithoutUserId } = userData as any;
+      const {
+        user_id: _u,
+        central_sync_status: _s1,
+        central_sync_error: _s2,
+        central_sync_last_attempt_at: _s3,
+        central_sync_outbox_id: _s4,
+        ...dataWithoutUserId
+      } = userData as any;
       const { data: u2, error: err2 } = await this.client
         .from('users')
         .insert(dataWithoutUserId)
@@ -557,35 +649,8 @@ export class SupabaseSalonRepository implements ISalonRepository {
       newUser = { ...u2, user_id: autoUserId };
     }
 
-    // Immediately create 1:1 linked staff record
-    try {
-      await this.client
-        .from('staff')
-        .insert({
-          user_id: newUser.id,
-          admin_user_id: autoUserId,
-          name: newUser.name,
-          phone: newUser.phone,
-          email: newUser.email,
-          role: newUser.role === 'owner' ? 'Salon Director & Master Stylist' : 'Senior Bridal Stylist & Artist',
-          branch_id: newUser.branch_id || 'tgl-gachibowli-main',
-          joining_date: new Date().toISOString().split('T')[0],
-          salary_type: 'monthly',
-          base_salary: 35000,
-          commission_rate: 10,
-          skills: ['Salon Care', 'Styling'],
-          is_active: newUser.is_active,
-          ...(newUser.username !== undefined && { username: newUser.username }),
-          ...(newUser.central_auth_id !== undefined && { central_auth_id: newUser.central_auth_id }),
-          ...(newUser.central_auth_status !== undefined && { central_auth_status: newUser.central_auth_status }),
-          ...(newUser.central_auth_linked_at !== undefined && { central_auth_linked_at: newUser.central_auth_linked_at }),
-          ...(newUser.central_outlet_code !== undefined && { central_outlet_code: newUser.central_outlet_code }),
-          ...(newUser.central_sync_version !== undefined && { central_sync_version: newUser.central_sync_version }),
-          ...(newUser.central_last_synced_at !== undefined && { central_last_synced_at: newUser.central_last_synced_at }),
-          ...(newUser.central_sync_origin !== undefined && { central_sync_origin: newUser.central_sync_origin })
-        });
-    } catch {}
-
+    // Operational staff profiles (job title, salary, commission, skills) are NOT fabricated here;
+    // they are created explicitly via Staff Management when operational scheduling is configured.
     await this.logAudit('CREATE', 'User', newUser.id, performedBy, `Created admin user: ${newUser.name} (${autoUserId})`);
     return { ...newUser, user_id: autoUserId } as User;
   }
@@ -598,9 +663,25 @@ export class SupabaseSalonRepository implements ISalonRepository {
       .maybeSingle();
     if (!oldUser) return null;
 
-    const { data: updatedUser, error } = await this.client
+    // Strictly forbid ordinary updates from assigning, changing, or clearing central_auth_id (even when currently NULL).
+    // Verified Central SMAV linking must go through linkVerifiedCentralAuthId(...) or smav_admin_reconcile_central_auth_id(...).
+    const safeUpdateData: Record<string, any> = { ...updateData };
+    if (safeUpdateData.central_auth_id !== undefined) {
+      const existingCid = oldUser.central_auth_id ? String(oldUser.central_auth_id).trim().toLowerCase() : '';
+      const incomingCid = safeUpdateData.central_auth_id ? String(safeUpdateData.central_auth_id).trim().toLowerCase() : '';
+      if (!existingCid || incomingCid !== existingCid) {
+        throw new CentralAuthLinkForbiddenError(
+          `CENTRAL_AUTH_LINK_FORBIDDEN: Ordinary user update on ${id} cannot assign or modify central_auth_id (even when NULL). Use linkVerifiedCentralAuthId or audited manual reconciliation.`
+        );
+      }
+      // Identical no-op value: strip so UPDATE does not needlessly trigger central_auth_id protection
+      delete safeUpdateData.central_auth_id;
+    }
+
+    const updatePayload: Record<string, any> = { ...safeUpdateData, updated_at: new Date().toISOString() };
+    let { data: updatedUser, error } = await this.client
       .from('users')
-      .update({ ...updateData, updated_at: new Date().toISOString() })
+      .update(updatePayload)
       .eq('id', id)
       .select()
       .single();
@@ -610,26 +691,77 @@ export class SupabaseSalonRepository implements ISalonRepository {
     const newName = updatedUser.name;
     const oldName = oldUser.name;
 
-    // 1. Synchronize linked staff record
-    await this.client
+    // 1. Synchronize linked staff record ONLY if one already exists, updating ONLY changed identity/sync fields
+    //    WITHOUT touching operational job title (role), salary, commission, skills, working_hours, or central_auth_id.
+    //    NEVER silently ignore staff-mirror database failures.
+    const { data: existingStaff, error: existingStaffErr } = await this.client
       .from('staff')
-      .update({
-        name: updatedUser.name,
-        phone: updatedUser.phone,
-        email: updatedUser.email,
-        is_active: updatedUser.is_active,
-        admin_user_id: updatedUser.user_id,
-        ...(updatedUser.username !== undefined && { username: updatedUser.username }),
-        ...(updatedUser.central_auth_id !== undefined && { central_auth_id: updatedUser.central_auth_id }),
-        ...(updatedUser.central_auth_status !== undefined && { central_auth_status: updatedUser.central_auth_status }),
-        ...(updatedUser.central_auth_linked_at !== undefined && { central_auth_linked_at: updatedUser.central_auth_linked_at }),
-        ...(updatedUser.central_outlet_code !== undefined && { central_outlet_code: updatedUser.central_outlet_code }),
-        ...(updatedUser.central_sync_version !== undefined && { central_sync_version: updatedUser.central_sync_version }),
-        ...(updatedUser.central_last_synced_at !== undefined && { central_last_synced_at: updatedUser.central_last_synced_at }),
-        ...(updatedUser.central_sync_origin !== undefined && { central_sync_origin: updatedUser.central_sync_origin }),
-        ...(updateData.branch_id && { branch_id: updateData.branch_id })
-      })
-      .eq('user_id', id);
+      .select('id, central_auth_id')
+      .eq('user_id', id)
+      .maybeSingle();
+
+    if (existingStaffErr && !/relation .* does not exist|schema cache/i.test(existingStaffErr.message || '')) {
+      throw new Error(
+        `Updated public.users (${id}), but failed to read linked public.staff record for identity mirroring: ${existingStaffErr.message}`
+      );
+    }
+
+    if (existingStaff) {
+      const staffSyncPayload: Record<string, any> = {
+        ...(safeUpdateData.name !== undefined && { name: updatedUser.name }),
+        ...(safeUpdateData.phone !== undefined && { phone: updatedUser.phone }),
+        ...(safeUpdateData.email !== undefined && { email: updatedUser.email }),
+        ...(safeUpdateData.is_active !== undefined && { is_active: updatedUser.is_active }),
+        ...(safeUpdateData.user_id !== undefined && { admin_user_id: updatedUser.user_id }),
+        ...(safeUpdateData.username !== undefined && { username: updatedUser.username }),
+        ...(safeUpdateData.central_auth_status !== undefined && { central_auth_status: updatedUser.central_auth_status }),
+        ...(safeUpdateData.central_auth_linked_at !== undefined && { central_auth_linked_at: updatedUser.central_auth_linked_at }),
+        ...(safeUpdateData.central_outlet_code !== undefined && { central_outlet_code: updatedUser.central_outlet_code }),
+        ...(safeUpdateData.central_sync_version !== undefined && { central_sync_version: updatedUser.central_sync_version }),
+        ...(safeUpdateData.central_last_synced_at !== undefined && { central_last_synced_at: updatedUser.central_last_synced_at }),
+        ...(safeUpdateData.central_sync_origin !== undefined && { central_sync_origin: updatedUser.central_sync_origin }),
+        ...(safeUpdateData.central_sync_status !== undefined && { central_sync_status: updatedUser.central_sync_status }),
+        ...(safeUpdateData.central_sync_error !== undefined && { central_sync_error: updatedUser.central_sync_error }),
+        ...(safeUpdateData.central_sync_last_attempt_at !== undefined && { central_sync_last_attempt_at: updatedUser.central_sync_last_attempt_at }),
+        ...(safeUpdateData.branch_id !== undefined && { branch_id: updatedUser.branch_id }),
+      };
+
+      if (Object.keys(staffSyncPayload).length > 0) {
+        let { error: staffMirrorErr } = await this.client
+          .from('staff')
+          .update(staffSyncPayload)
+          .eq('user_id', id);
+
+        if (staffMirrorErr && /column .* does not exist|schema cache/i.test(staffMirrorErr.message || '')) {
+          const {
+            central_sync_status: _s1,
+            central_sync_error: _s2,
+            central_sync_last_attempt_at: _s3,
+            admin_user_id: _s4,
+            email: _s5,
+            branch_id: _s6,
+            username: _s7,
+            ...compatStaffPayload
+          } = staffSyncPayload;
+
+          if (Object.keys(compatStaffPayload).length > 0) {
+            const retryMirror = await this.client
+              .from('staff')
+              .update(compatStaffPayload)
+              .eq('user_id', id);
+            staffMirrorErr = retryMirror.error;
+          } else {
+            staffMirrorErr = null;
+          }
+        }
+
+        if (staffMirrorErr) {
+          throw new Error(
+            `Updated public.users (${id}), but failed to mirror identity/sync fields to linked public.staff (${existingStaff.id}): ${staffMirrorErr.message}. Run Retry Sync or inspect public.staff constraints to recover.`
+          );
+        }
+      }
+    }
 
     // 2. Cascade updated name to historical references if renamed
     if (newName !== oldName) {
@@ -771,9 +903,13 @@ export class SupabaseSalonRepository implements ISalonRepository {
           name: staffData.name.trim(),
           email,
           phone,
-          // The profile form creates a stylist account. Owners can reset its
-          // temporary password from Admin Users before giving staff access.
-          password_hash: 'admin123',
+          // The profile form creates a stylist account with a non-guessable hashed
+          // random password. Owners can set an explicit password via Admin Users -> Reset Pwd.
+          password_hash: (() => {
+            const salt = crypto.randomBytes(16).toString('hex');
+            const secret = crypto.randomBytes(24).toString('base64url');
+            return `scrypt$${salt}$${crypto.scryptSync(secret, salt, 64).toString('hex')}`;
+          })(),
           role: 'stylist',
           branch_id: staffData.branch_id || 'tgl-gachibowli-main',
           is_active: staffData.is_active !== false
@@ -829,35 +965,65 @@ export class SupabaseSalonRepository implements ISalonRepository {
   }
 
   public async updateStaff(id: string, data: Partial<Staff>, performedBy: string): Promise<Staff | null> {
+    const { data: existingStaff, error: readErr } = await this.client
+      .from('staff')
+      .select('id, central_auth_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (readErr) throw readErr;
+    if (!existingStaff) return null;
+
+    // Ordinary staff updates CANNOT assign, modify, or clear central_auth_id (even when currently NULL)
+    const safeStaffData: Record<string, any> = { ...data };
+    if (safeStaffData.central_auth_id !== undefined) {
+      const existingCid = existingStaff.central_auth_id ? String(existingStaff.central_auth_id).trim().toLowerCase() : '';
+      const incomingCid = safeStaffData.central_auth_id ? String(safeStaffData.central_auth_id).trim().toLowerCase() : '';
+      if (!existingCid || incomingCid !== existingCid) {
+        throw new CentralAuthLinkForbiddenError(
+          `CENTRAL_AUTH_LINK_FORBIDDEN: Ordinary staff update on ${id} cannot assign or modify central_auth_id. Use verified Central SMAV linking or audited manual reconciliation.`
+        );
+      }
+      delete safeStaffData.central_auth_id;
+    }
+    delete safeStaffData.central_auth_linked_at;
+    delete safeStaffData.central_sync_status;
+    delete safeStaffData.central_sync_error;
+    delete safeStaffData.central_sync_version;
+    delete safeStaffData.central_last_synced_at;
+    delete safeStaffData.central_sync_origin;
+
     const { data: updatedStaff, error } = await this.client
       .from('staff')
-      .update(data)
+      .update(safeStaffData)
       .eq('id', id)
       .select()
       .single();
     if (error) throw error;
 
-    // Synchronize linked user
+    // Synchronize safe non-UUID identity fields to linked user (never touches central_auth_id or RBAC role)
     if (updatedStaff && updatedStaff.user_id) {
-      await this.client
-        .from('users')
-        .update({
-          ...(data.name !== undefined && { name: data.name }),
-          ...(data.phone !== undefined && { phone: data.phone }),
-          ...(data.email !== undefined && { email: data.email }),
-          ...(data.is_active !== undefined && { is_active: data.is_active }),
-          ...(data.branch_id !== undefined && { branch_id: data.branch_id }),
-          ...(data.username !== undefined && { username: data.username }),
-          ...(data.central_auth_id !== undefined && { central_auth_id: data.central_auth_id }),
-          ...(data.central_auth_status !== undefined && { central_auth_status: data.central_auth_status }),
-          ...(data.central_auth_linked_at !== undefined && { central_auth_linked_at: data.central_auth_linked_at }),
-          ...(data.central_outlet_code !== undefined && { central_outlet_code: data.central_outlet_code }),
-          ...(data.central_sync_version !== undefined && { central_sync_version: data.central_sync_version }),
-          ...(data.central_last_synced_at !== undefined && { central_last_synced_at: data.central_last_synced_at }),
-          ...(data.central_sync_origin !== undefined && { central_sync_origin: data.central_sync_origin }),
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', updatedStaff.user_id);
+      const userMirrorPayload: Record<string, any> = {
+        ...(safeStaffData.name !== undefined && { name: safeStaffData.name }),
+        ...(safeStaffData.phone !== undefined && { phone: safeStaffData.phone }),
+        ...(safeStaffData.email !== undefined && { email: safeStaffData.email }),
+        ...(safeStaffData.is_active !== undefined && { is_active: safeStaffData.is_active }),
+        ...(safeStaffData.branch_id !== undefined && { branch_id: safeStaffData.branch_id }),
+        ...(safeStaffData.username !== undefined && { username: safeStaffData.username }),
+      };
+      if (Object.keys(userMirrorPayload).length > 0) {
+        const { error: userMirrorErr } = await this.client
+          .from('users')
+          .update({
+            ...userMirrorPayload,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', updatedStaff.user_id);
+        if (userMirrorErr) {
+          throw new Error(
+            `Updated public.staff (${id}), but failed to mirror identity fields to linked public.users (${updatedStaff.user_id}): ${userMirrorErr.message}`
+          );
+        }
+      }
     }
 
     await this.logAudit('UPDATE', 'Staff', id, performedBy, `Updated staff: ${updatedStaff.name}`);
@@ -3715,6 +3881,454 @@ export class SupabaseSalonRepository implements ISalonRepository {
       last_message_saved_at: lastMessageSavedAt,
       latest_database_error: latestDatabaseError
     };
+  }
+
+  // --- Durable SMAV User Sync Outbox (Strict Migration 024 Fail-Closed RPC Callers) ---
+
+  public async createUserWithSmavOutbox(
+    userData: Omit<User, 'id' | 'created_at' | 'updated_at'>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+      credential_mode?: 'explicit' | 'generated';
+      verifyReplayPassword?: (storedPasswordHash: string) => boolean;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; atomic: boolean; idempotentReplay?: boolean }> {
+    if ((userData as any).central_auth_id !== undefined) {
+      throw new CentralAuthLinkForbiddenError(
+        'CENTRAL_AUTH_LINK_FORBIDDEN: New admin users cannot specify an arbitrary central_auth_id. Link via verified Central SMAV sync response.'
+      );
+    }
+
+    // Deterministic user_code when omitted so identical replays under the same idempotency_key produce identical fingerprints
+    const autoUserId =
+      userData.user_id && userData.user_id.trim() !== ''
+        ? userData.user_id.trim().toUpperCase()
+        : deriveDeterministicUserCode(userData.role, outbox.idempotency_key);
+    const normalizedUsername = (userData.username || autoUserId).trim().toLowerCase();
+    const normalizedBranch = userData.branch_id || 'tgl-gachibowli-main';
+    const credentialMode: 'explicit' | 'generated' = outbox.credential_mode === 'explicit' ? 'explicit' : 'generated';
+
+    const { data, error } = await this.client.rpc('smav_create_user_and_enqueue_sync', {
+      p_user_code: autoUserId,
+      p_name: userData.name,
+      p_email: userData.email,
+      p_phone: userData.phone || '',
+      p_role: userData.role,
+      p_password_hash: userData.password_hash,
+      p_username: normalizedUsername,
+      p_branch_id: normalizedBranch,
+      p_is_active: userData.is_active !== false,
+      p_idempotency_key: outbox.idempotency_key,
+      p_event_type: outbox.event_type,
+      p_action: outbox.action,
+      p_performed_by: performedBy || 'Owner',
+      p_max_attempts: Math.min(20, Math.max(1, outbox.max_attempts ?? 6)),
+      p_credential_mode: credentialMode,
+    });
+
+    if (error) {
+      if (isRpcIdempotencyConflict(error)) {
+        throw new IdempotencyKeyConflictError(outbox.idempotency_key, error.message);
+      }
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_create_user_and_enqueue_sync', error.message);
+      }
+      throw error;
+    }
+
+    if (!data || !data.user || !data.outbox) {
+      throw new Migration024RequiredError(
+        'public.smav_create_user_and_enqueue_sync',
+        'RPC returned an unexpected empty payload.'
+      );
+    }
+
+    const createdUser = data.user as User;
+    const wasCreated = Boolean(data.created);
+    const isReplay = Boolean(data.idempotent_replay) || !wasCreated;
+
+    // On an idempotent replay with an explicit password, verify password equivalence against the existing
+    // user's stored password_hash in constant time (never persisting plaintext password or hash in outbox)
+    if (isReplay && outbox.verifyReplayPassword) {
+      if (!outbox.verifyReplayPassword(createdUser.password_hash || '')) {
+        throw new IdempotencyKeyConflictError(
+          outbox.idempotency_key,
+          `IDEMPOTENCY_KEY_CONFLICT: idempotency_key "${outbox.idempotency_key}" was already used with a different initial password.`
+        );
+      }
+    }
+
+    if (wasCreated) {
+      await this.logAudit('CREATE', 'User', createdUser.id, performedBy, `Created admin user: ${createdUser.name} (${autoUserId})`);
+    }
+
+    return {
+      user: createdUser,
+      outboxItem: data.outbox as SmavUserSyncOutboxItem,
+      created: wasCreated,
+      atomic: true,
+      idempotentReplay: isReplay,
+    };
+  }
+
+  public async updateUserWithSmavOutbox(
+    id: string,
+    updateData: Partial<User>,
+    outbox: {
+      idempotency_key: string;
+      event_type: SmavUserSyncEventType;
+      action: Exclude<SmavUserSyncAction, 'reset_password'>;
+      max_attempts?: number;
+    },
+    performedBy: string
+  ): Promise<{ user: User; outboxItem: SmavUserSyncOutboxItem; created: boolean; atomic: boolean; idempotentReplay?: boolean } | null> {
+    if (updateData.central_auth_id !== undefined) {
+      throw new CentralAuthLinkForbiddenError(
+        'CENTRAL_AUTH_LINK_FORBIDDEN: Ordinary user updates cannot assign or modify central_auth_id (even when NULL). Use linkVerifiedCentralAuthId or audited manual reconciliation.'
+      );
+    }
+
+    const rpcUpdates: Record<string, any> = {};
+    if (updateData.name !== undefined) rpcUpdates.name = updateData.name;
+    if (updateData.email !== undefined) rpcUpdates.email = updateData.email;
+    if (updateData.phone !== undefined) rpcUpdates.phone = updateData.phone;
+    if (updateData.role !== undefined) rpcUpdates.role = updateData.role;
+    if (updateData.user_id !== undefined) rpcUpdates.user_id = updateData.user_id;
+    if (updateData.username !== undefined) rpcUpdates.username = updateData.username;
+    if (updateData.is_active !== undefined) rpcUpdates.is_active = updateData.is_active;
+    if (updateData.branch_id !== undefined) rpcUpdates.branch_id = updateData.branch_id;
+
+    const { data, error } = await this.client.rpc('smav_update_user_and_enqueue_sync', {
+      p_local_user_id: id,
+      p_updates: rpcUpdates,
+      p_idempotency_key: outbox.idempotency_key,
+      p_event_type: outbox.event_type,
+      p_action: outbox.action,
+      p_performed_by: performedBy || 'Owner',
+      p_max_attempts: Math.min(20, Math.max(1, outbox.max_attempts ?? 6)),
+    });
+
+    if (error) {
+      if (isRpcIdempotencyConflict(error)) {
+        throw new IdempotencyKeyConflictError(outbox.idempotency_key, error.message);
+      }
+      if (isCentralAuthLinkForbiddenError(error)) {
+        throw new CentralAuthLinkForbiddenError(error.message);
+      }
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_update_user_and_enqueue_sync', error.message);
+      }
+      throw error;
+    }
+
+    if (!data || !data.user || !data.outbox) return null;
+    const updatedUser = data.user as User;
+    const wasCreated = Boolean(data.created);
+    const previousName = typeof data.previous_name === 'string' ? data.previous_name : undefined;
+
+    if (wasCreated && previousName && updatedUser.name && previousName !== updatedUser.name) {
+      await Promise.allSettled([
+        this.client.from('appointments').update({ assigned_staff_name: updatedUser.name }).eq('assigned_staff_name', previousName),
+        this.client.from('orders').update({ cashier_name: updatedUser.name }).eq('cashier_name', previousName),
+        this.client.from('order_items').update({ staff_name: updatedUser.name }).eq('staff_name', previousName),
+        this.client.from('gallery_items').update({ artist_name: updatedUser.name }).eq('artist_name', previousName),
+      ]);
+    }
+
+    if (wasCreated) {
+      await this.logAudit('UPDATE', 'User', id, performedBy, `Updated user: ${updatedUser.name} (${updatedUser.user_id})`);
+    }
+    return {
+      user: updatedUser,
+      outboxItem: data.outbox as SmavUserSyncOutboxItem,
+      created: wasCreated,
+      atomic: true,
+      idempotentReplay: Boolean(data.idempotent_replay) || !wasCreated,
+    };
+  }
+
+  public async linkVerifiedCentralAuthId(input: {
+    local_user_id: string;
+    verified_central_auth_id: string;
+    verification_source: 'smav_sync_response';
+    evidence_ref: string;
+    performed_by?: string;
+  }): Promise<User> {
+    const { data, error } = await this.client.rpc('smav_link_verified_central_auth_id', {
+      p_local_user_id: input.local_user_id,
+      p_verified_central_auth_id: input.verified_central_auth_id,
+      p_verification_source: input.verification_source,
+      p_evidence_ref: input.evidence_ref,
+      p_performed_by: input.performed_by || 'SMAV Sync',
+    });
+
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_link_verified_central_auth_id', error.message);
+      }
+      throw error;
+    }
+
+    if (!data) {
+      throw new Error(`Failed to link verified Central Auth UUID for user ${input.local_user_id}.`);
+    }
+    return data as User;
+  }
+
+  public async enqueueSmavUserSyncEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    performed_by?: string;
+    max_attempts?: number;
+    request_fingerprint?: string | null;
+  }): Promise<{ item: SmavUserSyncOutboxItem; created: boolean }> {
+    const maxAttempts = Math.min(20, Math.max(1, input.max_attempts ?? 6));
+
+    const { data, error } = await this.client.rpc('smav_enqueue_user_sync_event', {
+      p_idempotency_key: input.idempotency_key,
+      p_local_user_id: input.local_user_id,
+      p_event_type: input.event_type,
+      p_action: input.action,
+      p_payload: input.payload || {},
+      p_performed_by: input.performed_by || 'System',
+      p_max_attempts: maxAttempts,
+    });
+
+    if (error) {
+      if (isRpcIdempotencyConflict(error)) {
+        throw new IdempotencyKeyConflictError(input.idempotency_key, error.message);
+      }
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_enqueue_user_sync_event', error.message);
+      }
+      throw error;
+    }
+
+    if (!data || !data.outbox) {
+      throw new Migration024RequiredError(
+        'public.smav_enqueue_user_sync_event',
+        'RPC did not return expected { outbox, created, idempotent_replay } JSONB envelope.'
+      );
+    }
+
+    return {
+      item: data.outbox as SmavUserSyncOutboxItem,
+      created: Boolean(data.created),
+    };
+  }
+
+  public async recordSmavSyncAuditEvent(input: {
+    idempotency_key: string;
+    local_user_id: string;
+    event_type: SmavUserSyncEventType;
+    action: SmavUserSyncAction;
+    payload: Record<string, any>;
+    status: 'SYNCED' | 'FAILED';
+    last_http_status?: number | null;
+    last_error?: string | null;
+    conflict?: boolean;
+    response_central_auth_id?: string | null;
+    performed_by?: string;
+    request_fingerprint?: string | null;
+  }): Promise<SmavUserSyncOutboxItem> {
+    const now = new Date().toISOString();
+    const fingerprint =
+      input.request_fingerprint ||
+      computeRequestFingerprint({
+        op: 'audit',
+        local_user_id: String(input.local_user_id),
+        event_type: input.event_type,
+        action: input.action,
+      });
+
+    const existing = await this.getSmavUserSyncOutboxByIdempotencyKey(input.idempotency_key);
+    if (existing) {
+      const mismatch =
+        String(existing.local_user_id || existing.audit_local_user_id || '') !== String(input.local_user_id) ||
+        existing.event_type !== input.event_type ||
+        existing.action !== input.action ||
+        (existing.request_fingerprint && existing.request_fingerprint !== fingerprint);
+      if (mismatch) {
+        throw new IdempotencyKeyConflictError(
+          input.idempotency_key,
+          `IDEMPOTENCY_KEY_CONFLICT: idempotency_key "${input.idempotency_key}" was already used for another user or operation.`
+        );
+      }
+      return existing;
+    }
+
+    const { data: inserted, error } = await this.client
+      .from('smav_user_sync_outbox')
+      .insert({
+        idempotency_key: input.idempotency_key,
+        request_fingerprint: fingerprint,
+        local_user_id: input.local_user_id,
+        audit_local_user_id: input.local_user_id,
+        event_type: input.event_type,
+        action: input.action,
+        payload: input.payload || {},
+        status: input.status,
+        attempts: 1,
+        max_attempts: 1,
+        next_retry_at: now,
+        locked_at: null,
+        last_http_status: input.last_http_status ?? null,
+        last_error: input.last_error ?? null,
+        conflict: Boolean(input.conflict),
+        response_central_auth_id: input.response_central_auth_id ?? null,
+        performed_by: input.performed_by || 'Owner',
+        created_at: now,
+        updated_at: now,
+        synced_at: input.status === 'SYNCED' ? now : null
+      })
+      .select()
+      .single();
+
+    if (!error && inserted) {
+      return inserted as SmavUserSyncOutboxItem;
+    }
+
+    if (error && /duplicate key|unique constraint/i.test(error.message || '')) {
+      const raced = await this.getSmavUserSyncOutboxByIdempotencyKey(input.idempotency_key);
+      if (raced) {
+        if (
+          String(raced.local_user_id || raced.audit_local_user_id || '') !== String(input.local_user_id) ||
+          raced.action !== input.action ||
+          raced.event_type !== input.event_type ||
+          (raced.request_fingerprint && raced.request_fingerprint !== fingerprint)
+        ) {
+          throw new IdempotencyKeyConflictError(
+            input.idempotency_key,
+            `IDEMPOTENCY_KEY_CONFLICT: idempotency_key "${input.idempotency_key}" was already used for another user or operation.`
+          );
+        }
+        return raced;
+      }
+    }
+
+    if (isMissingMigration024Object(error)) {
+      throw new Migration024RequiredError('public.smav_user_sync_outbox', error?.message);
+    }
+
+    throw error || new Error('Failed to record SMAV sync audit event.');
+  }
+
+  public async claimSmavUserSyncEventById(id: string): Promise<SmavUserSyncOutboxItem | null> {
+    const { data, error } = await this.client.rpc('smav_claim_single_user_sync_event', {
+      p_outbox_id: id,
+    });
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_claim_single_user_sync_event', error.message);
+      }
+      throw error;
+    }
+    if (Array.isArray(data)) {
+      return data.length > 0 ? (data[0] as SmavUserSyncOutboxItem) : null;
+    }
+    return data ? (data as SmavUserSyncOutboxItem) : null;
+  }
+
+  public async claimDueSmavUserSyncEvents(limit = 20, staleLockMinutes = 5): Promise<SmavUserSyncOutboxItem[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const safeStaleMins = Math.max(1, Math.min(staleLockMinutes, 60));
+
+    const { data, error } = await this.client.rpc('smav_claim_due_user_sync_events', {
+      p_limit: safeLimit,
+      p_stale_lock_minutes: safeStaleMins,
+    });
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_claim_due_user_sync_events', error.message);
+      }
+      throw error;
+    }
+    return Array.isArray(data) ? (data as SmavUserSyncOutboxItem[]) : [];
+  }
+
+  public async getSmavUserSyncOutbox(filters?: {
+    localUserId?: string;
+    status?: string;
+    limit?: number;
+  }): Promise<SmavUserSyncOutboxItem[]> {
+    const max = filters?.limit ? Math.max(1, Math.min(filters.limit, 200)) : 50;
+    let query = this.client
+      .from('smav_user_sync_outbox')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(max);
+    if (filters?.localUserId) {
+      query = query.or(`local_user_id.eq.${filters.localUserId},audit_local_user_id.eq.${filters.localUserId}`);
+    }
+    if (filters?.status) query = query.eq('status', filters.status);
+    const { data, error } = await query;
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_user_sync_outbox', error.message);
+      }
+      throw error;
+    }
+    return Array.isArray(data) ? (data as SmavUserSyncOutboxItem[]) : [];
+  }
+
+  public async getSmavUserSyncOutboxById(id: string): Promise<SmavUserSyncOutboxItem | null> {
+    const { data, error } = await this.client
+      .from('smav_user_sync_outbox')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_user_sync_outbox', error.message);
+      }
+      throw error;
+    }
+    return data ? (data as SmavUserSyncOutboxItem) : null;
+  }
+
+  public async getSmavUserSyncOutboxByIdempotencyKey(idempotencyKey: string): Promise<SmavUserSyncOutboxItem | null> {
+    const cleanKey = String(idempotencyKey || '').trim();
+    if (!cleanKey) return null;
+    const { data, error } = await this.client
+      .from('smav_user_sync_outbox')
+      .select('*')
+      .eq('idempotency_key', cleanKey)
+      .maybeSingle();
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_user_sync_outbox', error.message);
+      }
+      throw error;
+    }
+    return data ? (data as SmavUserSyncOutboxItem) : null;
+  }
+
+  public async updateSmavUserSyncEvent(
+    id: string,
+    data: Partial<SmavUserSyncOutboxItem>
+  ): Promise<SmavUserSyncOutboxItem | null> {
+    const nowIso = new Date().toISOString();
+    const { audit_local_user_id: _immutableAuditUserId, ...safeData } = data;
+    const { data: updated, error } = await this.client
+      .from('smav_user_sync_outbox')
+      .update({ ...safeData, updated_at: nowIso })
+      .eq('id', id)
+      .select()
+      .maybeSingle();
+    if (error) {
+      if (isMissingMigration024Object(error)) {
+        throw new Migration024RequiredError('public.smav_user_sync_outbox', error.message);
+      }
+      throw error;
+    }
+    return updated ? (updated as SmavUserSyncOutboxItem) : null;
   }
 }
 

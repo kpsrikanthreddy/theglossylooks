@@ -8,6 +8,46 @@
 
 export type AdminRole = 'owner' | 'manager' | 'receptionist' | 'stylist' | 'inventory_staff';
 
+export type SmavSyncStatus = 'SYNCED' | 'PENDING' | 'FAILED';
+
+export type SmavOutletRole = 'ADMIN' | 'POS_BILLING';
+
+export type SmavUserSyncEventType =
+  | 'USER_CREATED'
+  | 'USER_UPDATED'
+  | 'EMAIL_CHANGED'
+  | 'ROLE_CHANGED'
+  | 'USER_ACTIVATED'
+  | 'USER_DEACTIVATED'
+  | 'PASSWORD_RESET'
+  | 'RECONCILE_USER';
+
+export type SmavUserSyncAction = 'upsert_user' | 'update_user' | 'set_status' | 'reset_password';
+
+export interface SmavUserSyncOutboxItem {
+  id: string;
+  idempotency_key: string;
+  request_fingerprint?: string | null;
+  local_user_id: string | null;
+  audit_local_user_id?: string;
+  event_type: SmavUserSyncEventType;
+  action: SmavUserSyncAction;
+  payload: Record<string, any>;
+  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED';
+  attempts: number;
+  max_attempts: number;
+  next_retry_at: string;
+  locked_at?: string | null;
+  last_http_status?: number | null;
+  last_error?: string | null;
+  conflict?: boolean;
+  response_central_auth_id?: string | null;
+  performed_by?: string | null;
+  created_at: string;
+  updated_at: string;
+  synced_at?: string | null;
+}
+
 export interface User {
   id: string;
   user_id: string; // Alphanumeric staff ID e.g. TGL-OWN01, TGL-MGR01
@@ -26,6 +66,11 @@ export interface User {
   central_sync_version?: number;
   central_last_synced_at?: string;
   central_sync_origin?: string;
+  central_sync_status?: SmavSyncStatus;
+  central_sync_error?: string | null;
+  central_sync_last_attempt_at?: string | null;
+  central_sync_outbox_id?: string | null;
+  smav_role?: SmavOutletRole;
   last_login_at?: string;
   created_at: string;
   updated_at: string;
@@ -171,6 +216,9 @@ export interface Staff {
   central_sync_version?: number;
   central_last_synced_at?: string;
   central_sync_origin?: string;
+  central_sync_status?: SmavSyncStatus;
+  central_sync_error?: string | null;
+  central_sync_last_attempt_at?: string | null;
   created_at: string;
 }
 
