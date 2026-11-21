@@ -3900,9 +3900,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               branches.find(b => b.id === staffAssignedBranchId)?.name ||
               'Assigned Branch';
 
-            // Build dynamic historical + active + future SMAV branch filter options (never drops disabled or new branches)
+            // Payment filtering must offer only active branches. Historical / legacy
+            // branch rows are retained in Supabase to preserve old bill and audit
+            // references, but must not remain selectable for new ledger filtering.
             const ledgerBranchMap = new Map<string, { id: string; name: string; code?: string; is_active?: boolean }>();
             for (const b of allHistoricalBranches) {
+              if (b.is_active === false) continue;
               ledgerBranchMap.set(b.id, {
                 id: b.id,
                 name: b.name,
@@ -3922,7 +3925,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             }
             for (const p of sourcePayments) {
               const bid = String(p.branch_id || '').trim();
-              if (bid && !ledgerBranchMap.has(bid)) {
+              const knownInactiveBranch = allHistoricalBranches.some(
+                b => b.id === bid && b.is_active === false
+              );
+              if (bid && !knownInactiveBranch && !ledgerBranchMap.has(bid)) {
                 const mo = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
                 ledgerBranchMap.set(bid, {
                   id: bid,
