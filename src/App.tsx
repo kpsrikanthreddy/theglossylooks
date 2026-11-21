@@ -75,8 +75,8 @@ export default function App() {
   const [settings, setSettings] = useState<SalonSettings>({
     brand_name: 'The Glossy Looks',
     salon_type: 'Professional Women Salon & Bridal Studio',
-    address: '31, Vinayak Nagar, Gachibowli',
-    city: 'Hyderabad, Telangana - 500032',
+    address: 'Hyderabad',
+    city: 'Telangana, India',
     phone: '9848012345',
     whatsapp: '9848012345',
     opening_hours: '10:00 AM to 10:00 PM (Monday to Sunday)',
@@ -242,7 +242,7 @@ export default function App() {
                   Bridal & Festive Season Consultations
                 </h4>
                 <p className="text-xs text-slate-500">
-                  Complimentary pre-wedding skin and hair consultations in Gachibowli.
+                  Complimentary pre-wedding skin and hair consultations across our Hyderabad studios.
                 </p>
               </div>
             </div>
@@ -322,7 +322,7 @@ export default function App() {
             />
             <div>
               <span className="font-serif font-bold text-sm text-white">The Glossy Looks</span>
-              <p className="text-[11px] text-white/50">Professional Women Salon · 31, Vinayak Nagar, Gachibowli, Hyderabad</p>
+              <p className="text-[11px] text-white/50">Professional Women Salon · {settings.address}{settings.city ? `, ${settings.city}` : ''}</p>
             </div>
           </div>
 

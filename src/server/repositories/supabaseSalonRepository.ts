@@ -64,7 +64,9 @@ import type {
   WhatsAppInboxDiagnostics,
   SmavUserSyncOutboxItem,
   SmavUserSyncEventType,
-  SmavUserSyncAction
+  SmavUserSyncAction,
+  SmavFinalizedBillUpsertInput,
+  SmavFinalizedBillUpsertResult
 } from '../../types/salon.ts';
 import {
   CentralAuthLinkForbiddenError,
@@ -143,49 +145,21 @@ export class SupabaseSalonRepository implements ISalonRepository {
         .from('salon_branches')
         .select('*')
         .order('created_at', { ascending: true });
-      if (!error && data && data.length > 0) {
+      if (!error && Array.isArray(data)) {
         return data as SalonBranch[];
       }
     } catch {
       // Table may not exist yet
     }
-    const defaultBranches: SalonBranch[] = [
-      {
-        id: 'tgl-gachibowli-main',
-        name: 'Gachibowli Main Flagship',
-        code: 'GCB-01',
-        address: '31, Vinayak Nagar, Gachibowli',
-        city: 'Hyderabad, Telangana - 500032',
-        phone: '8985799459',
-        whatsapp_number: '8985799459',
-        manager_id: '00000000-0000-0000-0000-000000000001',
-        manager_name: 'Madu Mounika',
-        is_active: true,
-        created_at: '2026-01-01T10:00:00Z',
-        updated_at: '2026-10-31T09:09:41.008Z'
-      },
-      {
-        id: 'brn-1793346038689',
-        name: 'Kondapur Branch',
-        code: 'KND-02',
-        address: 'Road No 2, Kondapur',
-        city: 'Hyderabad, Telangana - 500084',
-        phone: '9491914422',
-        whatsapp_number: '9491914422',
-        manager_id: '00000000-0000-0000-0000-000000000001',
-        manager_name: 'Madu Mounika',
-        is_active: true,
-        created_at: '2026-10-30T07:40:38.689Z',
-        updated_at: '2026-10-30T07:40:38.689Z'
-      }
-    ];
+    return [];
+  }
 
-    const fallbackBranches = getFallbackStore().branches;
-    if (fallbackBranches && fallbackBranches.length > 0) {
-      const hasKondapur = fallbackBranches.some((b: SalonBranch) => b.id === 'brn-1793346038689' || b.name.toLowerCase().includes('kondapur'));
-      return hasKondapur ? fallbackBranches : [...fallbackBranches, defaultBranches[1]];
-    }
-    return defaultBranches;
+  private async resolveFallbackBranchId(): Promise<string> {
+    const envDefault = (process.env.SMAV_SALON_DEFAULT_BRANCH_ID || '').trim();
+    if (envDefault) return envDefault;
+    const branches = await this.getBranches();
+    const firstActive = branches.find(b => b.is_active !== false) || branches[0];
+    return firstActive?.id || '';
   }
 
   public async getBranchById(id: string): Promise<SalonBranch | null> {
@@ -263,9 +237,10 @@ export class SupabaseSalonRepository implements ISalonRepository {
     const branch = await this.getBranchById(branchId);
     const num = branch?.whatsapp_number || '8985799459';
     const last4 = num.slice(-4);
+    const resolvedBranchId = branchId || (await this.resolveFallbackBranchId());
     return {
-      id: `bwa-${branchId || 'gcb-01'}`,
-      branch_id: branchId || 'tgl-gachibowli-main',
+      id: `bwa-${resolvedBranchId || 'primary'}`,
+      branch_id: resolvedBranchId,
       configured_business_number: num,
       waba_id: '1608729824244675',
       phone_number_id: '1379025201957313',
@@ -332,8 +307,8 @@ export class SupabaseSalonRepository implements ISalonRepository {
     const defaultSettings: SalonSettings = {
       brand_name: 'The Glossy Looks',
       salon_type: 'Professional Women Salon & Bridal Studio',
-      address: '31, Vinayak Nagar, Gachibowli',
-      city: 'Hyderabad, Telangana - 500032',
+      address: 'Hyderabad',
+      city: 'Hyderabad, Telangana',
       phone: '8985799459',
       whatsapp: '8985799459',
       opening_hours: '10:00 AM to 10:00 PM (Monday to Sunday)',
@@ -365,9 +340,10 @@ export class SupabaseSalonRepository implements ISalonRepository {
       .limit(1)
       .maybeSingle();
     if (data) return data as WhatsAppIntegration;
+    const fallbackSalonId = await this.resolveFallbackBranchId();
     const def: WhatsAppIntegration = {
       id: 'wa-int-01',
-      salon_id: 'tgl-gachibowli-main',
+      salon_id: fallbackSalonId || 'glossylooks',
       status: 'not_connected',
       updated_at: new Date().toISOString()
     };
@@ -405,9 +381,10 @@ export class SupabaseSalonRepository implements ISalonRepository {
     const settings = await this.getSettings();
     const num = settings.whatsapp || settings.phone || '8985799459';
     const last4 = num.slice(-4);
+    const fallbackSalonId = await this.resolveFallbackBranchId();
     return {
       id: 'wa-set-01',
-      salon_id: 'tgl-gachibowli-main',
+      salon_id: fallbackSalonId || 'glossylooks',
       business_number: num,
       country_code: '+91',
       display_name: settings.brand_name || 'The Glossy Looks',
@@ -449,7 +426,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
         role: 'owner',
         name: 'Madu Mounika',
         phone: '8985799459',
-        branch_id: 'tgl-gachibowli-main',
+        branch_id: (await this.resolveFallbackBranchId()) || undefined,
         is_active: true,
         created_at: '2026-01-01T10:00:00Z',
         updated_at: '2026-10-31T09:09:41.007Z'
@@ -480,7 +457,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
         role: 'owner',
         name: 'Madu Mounika',
         phone: '8985799459',
-        branch_id: 'tgl-gachibowli-main',
+        branch_id: (await this.resolveFallbackBranchId()) || undefined,
         is_active: true,
         created_at: '2026-01-01T10:00:00Z',
         updated_at: '2026-10-31T09:09:41.007Z'
@@ -515,7 +492,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
         role: 'owner',
         name: 'Madu Mounika',
         phone: '8985799459',
-        branch_id: 'tgl-gachibowli-main',
+        branch_id: (await this.resolveFallbackBranchId()) || undefined,
         is_active: true,
         created_at: '2026-01-01T10:00:00Z',
         updated_at: '2026-10-31T09:09:41.007Z'
@@ -844,7 +821,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
         phone: '8985799459',
         email: 'owner@theglossylooks.com',
         role: 'Salon Director & Master Stylist',
-        branch_id: 'tgl-gachibowli-main',
+        branch_id: (await this.resolveFallbackBranchId()) || undefined,
         joining_date: '2024-01-01',
         salary_type: 'monthly',
         base_salary: 85000,
@@ -911,7 +888,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
             return `scrypt$${salt}$${crypto.scryptSync(secret, salt, 64).toString('hex')}`;
           })(),
           role: 'stylist',
-          branch_id: staffData.branch_id || 'tgl-gachibowli-main',
+          branch_id: staffData.branch_id || (await this.resolveFallbackBranchId()) || null,
           is_active: staffData.is_active !== false
         })
         .select()
@@ -937,7 +914,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
       name: staffData.name.trim(),
       phone,
       email,
-      branch_id: staffData.branch_id || linkedUser.branch_id || 'tgl-gachibowli-main',
+      branch_id: staffData.branch_id || linkedUser.branch_id || (await this.resolveFallbackBranchId()) || undefined,
       joining_date: staffData.joining_date || new Date().toISOString().split('T')[0],
       salary_type: staffData.salary_type || 'commission',
       base_salary: staffData.base_salary ?? 0,
@@ -1473,9 +1450,6 @@ export class SupabaseSalonRepository implements ISalonRepository {
             const match = apt.notes.match(/\[Branch:\s*([^\]]+)\]/);
             if (match) apt.branch_id = match[1];
           }
-          if (!apt.branch_id) {
-            apt.branch_id = 'tgl-gachibowli-main';
-          }
         }
       }
     } catch {
@@ -1505,9 +1479,6 @@ export class SupabaseSalonRepository implements ISalonRepository {
     if (!apt.branch_id && apt.notes) {
       const match = apt.notes.match(/\[Branch:\s*([^\]]+)\]/);
       if (match) apt.branch_id = match[1];
-    }
-    if (!apt.branch_id) {
-      apt.branch_id = 'tgl-gachibowli-main';
     }
     return apt;
   }
@@ -1567,7 +1538,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
 
     return {
       ...insertedApt,
-      branch_id: branch_id || insertedApt.branch_id || 'tgl-gachibowli-main',
+      branch_id: branch_id || insertedApt.branch_id || undefined,
       services: services || []
     } as Appointment;
   }
@@ -1615,7 +1586,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
     await this.logAudit('UPDATE', 'Appointment', id, performedBy, `Updated appointment: ${id}`);
     return {
       ...updated,
-      branch_id: branch_id || updated.branch_id || 'tgl-gachibowli-main',
+      branch_id: branch_id || updated.branch_id || undefined,
       services: services || updated.services || []
     } as Appointment;
   }
@@ -1791,9 +1762,6 @@ export class SupabaseSalonRepository implements ISalonRepository {
         const match = ord.notes.match(/\[Branch:\s*([^\]]+)\]/);
         if (match) ord.branch_id = match[1];
       }
-      if (!ord.branch_id) {
-        ord.branch_id = 'tgl-gachibowli-main';
-      }
     }
 
     if (deletedMode === 'active') {
@@ -1803,7 +1771,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
     }
 
     if (filters?.branchId) {
-      ordersList = ordersList.filter(o => (o.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+      ordersList = ordersList.filter(o => o.branch_id === filters.branchId);
     }
 
     try {
@@ -1830,12 +1798,10 @@ export class SupabaseSalonRepository implements ISalonRepository {
     return ordersList;
   }
 
-  public async getOrderById(id: string): Promise<Order | null> {
-    const { data } = await this.client.from('orders').select('*').eq('id', id).maybeSingle();
-    if (!data) return null;
-    const ord = data as Order;
+  private async hydrateOrderItemsAndBranch(row: any): Promise<Order> {
+    const ord = row as Order;
     try {
-      const { data: items } = await this.client.from('order_items').select('*').eq('order_id', id);
+      const { data: items } = await this.client.from('order_items').select('*').eq('order_id', ord.id);
       ord.items = (items || []) as OrderItem[];
     } catch {
       ord.items = [];
@@ -1845,6 +1811,67 @@ export class SupabaseSalonRepository implements ISalonRepository {
       if (match) ord.branch_id = match[1];
     }
     return ord;
+  }
+
+  public async getOrderById(id: string): Promise<Order | null> {
+    const clean = String(id || '').trim();
+    if (!clean) return null;
+    const { data, error } = await this.client.from('orders').select('*').eq('id', clean).maybeSingle();
+    if (error) {
+      // Gracefully return null if caller passed a non-UUID identifier against a UUID orders.id column
+      if (error.code === '22P02' || /invalid input syntax for type uuid/i.test(error.message || '')) {
+        return null;
+      }
+      throw error;
+    }
+    if (!data) return null;
+    return this.hydrateOrderItemsAndBranch(data);
+  }
+
+  public async getOrderByBillNumber(billNumber: string): Promise<Order | null> {
+    const clean = String(billNumber || '').trim();
+    if (!clean) return null;
+    const { data, error } = await this.client
+      .from('orders')
+      .select('*')
+      .eq('bill_number', clean)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return null;
+    return this.hydrateOrderItemsAndBranch(data);
+  }
+
+  public async getOrderBySmavCentralBillId(smavCentralBillId: string): Promise<Order | null> {
+    const clean = String(smavCentralBillId || '').trim();
+    if (!clean) return null;
+    let { data, error } = await this.client
+      .from('orders')
+      .select('*')
+      .eq('smav_central_bill_id', clean)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error && (error.code === 'PGRST204' || error.code === '42703' || /smav_central_bill_id/i.test(error.message || ''))) {
+      const fallback = await this.client
+        .from('orders')
+        .select('*')
+        .eq('smav_sale_id', clean)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      data = fallback.data;
+      error = fallback.error;
+    }
+
+    if (error) {
+      if (error.code === 'PGRST204' || error.code === '42703') return null;
+      throw error;
+    }
+    if (!data) return null;
+    return this.hydrateOrderItemsAndBranch(data);
   }
 
   public async getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null> {
@@ -1857,11 +1884,57 @@ export class SupabaseSalonRepository implements ISalonRepository {
         .eq('idempotency_key', clean)
         .maybeSingle();
       if (!existing) return null;
-      const fullOrder = await this.getOrderById(existing.id);
-      return fullOrder || (existing as Order);
+      return this.hydrateOrderItemsAndBranch(existing);
     } catch {
       return null;
     }
+  }
+
+  private async insertPaymentWithSchemaFallback(paymentRowInput: Record<string, any>): Promise<PaymentRecord> {
+    const paymentRow: Record<string, any> = { ...paymentRowInput };
+    let { data, error } = await this.client.from('payments').insert(paymentRow).select().single();
+    while (error && (error.code === 'PGRST204' || (error.message && error.message.includes('schema cache')))) {
+      const match = error.message.match(/Could not find the '([^']+)' column/);
+      if (
+        match &&
+        match[1] &&
+        !['order_id', 'bill_number', 'amount'].includes(match[1]) &&
+        paymentRow[match[1]] !== undefined
+      ) {
+        delete paymentRow[match[1]];
+        const retry = await this.client.from('payments').insert(paymentRow).select().single();
+        data = retry.data;
+        error = retry.error;
+      } else {
+        break;
+      }
+    }
+    if (error || !data) {
+      throw new Error(`PAYMENT_LEDGER_COMMIT_FAILED: ${error?.message || 'Unable to insert local payment ledger record'}`);
+    }
+    return data as PaymentRecord;
+  }
+
+  private async findExistingPaymentForOrder(orderId: string, billNumber: string): Promise<PaymentRecord | null> {
+    const { data: byOrder } = await this.client
+      .from('payments')
+      .select('*')
+      .eq('order_id', orderId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (byOrder) return byOrder as PaymentRecord;
+
+    const cleanBill = String(billNumber || '').trim();
+    if (!cleanBill) return null;
+    const { data: byBill } = await this.client
+      .from('payments')
+      .select('*')
+      .eq('bill_number', cleanBill)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return (byBill as PaymentRecord) || null;
   }
 
   public async createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order> {
@@ -1944,32 +2017,24 @@ export class SupabaseSalonRepository implements ISalonRepository {
       console.warn('⚠️ Could not upsert customer from order:', cErr);
     }
 
-    // Persist payment transaction in public.payments table
-    const paymentRow: any = {
-      order_id: insertedOrder.id,
-      bill_number: insertedOrder.bill_number,
-      customer_name: insertedOrder.customer_name,
-      customer_phone: insertedOrder.customer_phone,
-      amount: Number(insertedOrder.paid_amount !== undefined ? insertedOrder.paid_amount : insertedOrder.grand_total) || 0,
-      payment_mode: insertedOrder.primary_payment_mode || 'UPI',
-      status: 'Success',
-      recorded_by: insertedOrder.cashier_name || performedBy,
-      branch_id: insertedOrder.branch_id || null,
-      branch_code: orderData.branch_code || insertedOrder.branch_code || null,
-      created_at: insertedOrder.created_at || new Date().toISOString()
-    };
-    let { error: pErr } = await this.client.from('payments').insert(paymentRow);
-    while (pErr && (pErr.code === 'PGRST204' || (pErr.message && pErr.message.includes('schema cache')))) {
-      const match = pErr.message.match(/Could not find the '([^']+)' column/);
-      if (match && match[1] && match[1] !== 'bill_number' && paymentRow[match[1]] !== undefined) {
-        delete paymentRow[match[1]];
-        pErr = (await this.client.from('payments').insert(paymentRow)).error;
-      } else {
-        break;
-      }
-    }
-    if (pErr) {
-      console.warn('⚠️ Could not insert payment record into Supabase:', pErr);
+    // Persist payment transaction in public.payments table (idempotent check to avoid duplicates)
+    const existingPayment = await this.findExistingPaymentForOrder(insertedOrder.id, insertedOrder.bill_number);
+    if (!existingPayment) {
+      await this.insertPaymentWithSchemaFallback({
+        order_id: insertedOrder.id,
+        bill_number: insertedOrder.bill_number,
+        smav_central_bill_id: orderData.smav_central_bill_id || insertedOrder.smav_central_bill_id || null,
+        customer_name: insertedOrder.customer_name,
+        customer_phone: insertedOrder.customer_phone,
+        amount: Number(insertedOrder.paid_amount !== undefined ? insertedOrder.paid_amount : insertedOrder.grand_total) || 0,
+        payment_mode: insertedOrder.primary_payment_mode || 'UPI',
+        status: 'Success',
+        recorded_by: insertedOrder.cashier_name || performedBy,
+        branch_id: insertedOrder.branch_id || null,
+        branch_code: orderData.branch_code || insertedOrder.branch_code || null,
+        branch_name: orderData.branch_name || insertedOrder.branch_name || null,
+        created_at: insertedOrder.created_at || new Date().toISOString()
+      });
     }
 
     await this.logAudit('CREATE_BILL', 'Order', insertedOrder.id, performedBy, `Generated bill ${insertedOrder.bill_number} (Branch: ${orderData.branch_name || insertedOrder.branch_id || 'N/A'}) for ${insertedOrder.customer_name}`);
@@ -1979,11 +2044,375 @@ export class SupabaseSalonRepository implements ISalonRepository {
       branch_id: branch_id || insertedOrder.branch_id,
       branch_code: orderData.branch_code || insertedOrder.branch_code,
       branch_name: orderData.branch_name || insertedOrder.branch_name,
+      smav_central_bill_id: orderData.smav_central_bill_id || insertedOrder.smav_central_bill_id,
       smav_reservation_id: orderData.smav_reservation_id || insertedOrder.smav_reservation_id,
       smav_bill_status: orderData.smav_bill_status || insertedOrder.smav_bill_status,
       is_legacy_bill: insertedOrder.is_legacy_bill ?? false,
       items: items || []
     } as Order;
+  }
+
+  public async upsertSmavFinalizedBill(input: SmavFinalizedBillUpsertInput): Promise<SmavFinalizedBillUpsertResult> {
+    const centralBillNum = String(input.central_bill_number || '').trim();
+    if (!centralBillNum) {
+      throw new Error('CENTRAL_BILL_NUMBER_REQUIRED: central_bill_number is required.');
+    }
+
+    const nowIso = new Date().toISOString();
+    const billDateIso = input.billed_at || input.finalized_at || nowIso;
+    const finalizedAtIso = input.finalized_at || nowIso;
+    const paymentLedgerStatus: PaymentRecord['status'] =
+      input.payment_status === 'Refunded'
+        ? 'Refunded'
+        : input.payment_status === 'Cancelled'
+        ? 'Void'
+        : 'Success';
+
+    const findExisting = async (): Promise<Order | null> => {
+      let found = await this.getOrderByBillNumber(centralBillNum);
+      if (!found && input.idempotency_key) {
+        found = await this.getOrderByIdempotencyKey(input.idempotency_key);
+      }
+      if (!found && input.smav_central_bill_id) {
+        found = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
+      }
+      if (!found && input.local_order_id && input.local_order_id !== centralBillNum) {
+        found = await this.getOrderById(input.local_order_id);
+      }
+      return found;
+    };
+
+    let existingOrder = await findExisting();
+
+    // Immutable bill number check
+    if (existingOrder && existingOrder.bill_number && existingOrder.bill_number !== centralBillNum) {
+      throw new Error(
+        `IMMUTABLE_BILL_NUMBER_CONFLICT: Local order ${existingOrder.id} is already assigned bill_number ${existingOrder.bill_number}; refusing to replace with ${centralBillNum}.`
+      );
+    }
+
+    const applyReplay = async (target: Order): Promise<SmavFinalizedBillUpsertResult> => {
+      const orderUpdates: Partial<Order> = {
+        branch_id: target.branch_id || input.branch_id,
+        branch_code: input.branch_code,
+        branch_name: input.branch_name,
+        ...(input.smav_central_bill_id ? { smav_central_bill_id: input.smav_central_bill_id } : {}),
+        ...(input.smav_sale_id || input.smav_central_bill_id
+          ? { smav_sale_id: String(input.smav_sale_id || input.smav_central_bill_id) }
+          : {}),
+        ...(input.smav_reservation_id ? { smav_reservation_id: input.smav_reservation_id } : {}),
+        ...(!target.idempotency_key && input.idempotency_key ? { idempotency_key: input.idempotency_key } : {}),
+        smav_bill_status: input.payment_status === 'Cancelled' ? 'voided' : 'finalized',
+        smav_finalized_at: finalizedAtIso,
+        smav_finalize_error: null,
+        smav_last_event_id: input.event_id,
+        smav_last_event_at: nowIso,
+        customer_name: input.customer_name || target.customer_name,
+        customer_phone: input.customer_phone || target.customer_phone,
+        subtotal: input.subtotal,
+        discount: input.discount,
+        tax_percent: input.tax_percent,
+        tax_amount: input.tax_amount,
+        tip_amount: input.tip_amount,
+        grand_total: input.grand_total,
+        paid_amount: input.paid_amount,
+        due_amount: input.due_amount,
+        payment_status: input.payment_status,
+        primary_payment_mode: input.primary_payment_mode,
+        cashier_name: input.cashier_name || target.cashier_name,
+      };
+
+      const updatedOrder = (await this.updateOrder(target.id, orderUpdates)) || { ...target, ...orderUpdates };
+
+      // Insert order_items ONLY if existing order has zero items (never duplicate items on replay)
+      const { data: existingItems } = await this.client
+        .from('order_items')
+        .select('*')
+        .eq('order_id', target.id);
+      let finalItems: OrderItem[] = (existingItems || []) as OrderItem[];
+      if (finalItems.length === 0 && input.items.length > 0) {
+        const itemRows = input.items.map(item => ({
+          order_id: target.id,
+          service_id: item.service_id || null,
+          product_id: item.product_id || null,
+          item_name: item.item_name,
+          item_type: item.item_type || 'service',
+          quantity: item.quantity || 1,
+          unit_price: item.unit_price,
+          total_price: item.total_price,
+          staff_id: item.staff_id || null,
+          staff_name: item.staff_name || null,
+          commission_amount: item.commission_amount || 0,
+        }));
+        const { data: insertedItems, error: itemErr } = await this.client
+          .from('order_items')
+          .insert(itemRows)
+          .select();
+        if (itemErr) {
+          throw new Error(`ORDER_ITEMS_COMMIT_FAILED: ${itemErr.message}`);
+        }
+        finalItems = (insertedItems || input.items) as OrderItem[];
+      }
+
+      // Replay-safe CRM update: isVisit=false & spend=0 so visit_count / total_spend are NEVER double-counted
+      const cleanPhone = String(input.customer_phone || '').replace(/\D/g, '').slice(-10);
+      if (cleanPhone) {
+        try {
+          await this.upsertCustomerFromOrderOrAppointment({
+            name: input.customer_name,
+            phone: cleanPhone,
+            email: input.customer_email,
+            branchId: input.branch_id,
+            spend: 0,
+            billNumber: centralBillNum,
+            isVisit: false,
+          });
+        } catch (cErr) {
+          console.warn('⚠️ Non-fatal CRM replay sync warning:', cErr);
+        }
+      }
+
+      // Payment ledger replay safety: update existing row or commit ONE missing row; NEVER duplicate
+      const existingPayment = await this.findExistingPaymentForOrder(target.id, centralBillNum);
+      let committedPayment: PaymentRecord;
+      if (existingPayment) {
+        const payPatch: Record<string, any> = {
+          amount: input.paid_amount,
+          payment_mode: input.primary_payment_mode,
+          status: paymentLedgerStatus,
+          customer_name: input.customer_name || existingPayment.customer_name,
+          customer_phone: input.customer_phone || existingPayment.customer_phone,
+          branch_id: input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          ...(input.smav_central_bill_id ? { smav_central_bill_id: input.smav_central_bill_id } : {}),
+          ...(input.transaction_ref ? { transaction_ref: input.transaction_ref } : {}),
+          recorded_by: input.cashier_name || existingPayment.recorded_by,
+        };
+        let { data: updatedPay, error: upPayErr } = await this.client
+          .from('payments')
+          .update(payPatch)
+          .eq('id', existingPayment.id)
+          .select()
+          .maybeSingle();
+
+        while (upPayErr && (upPayErr.code === 'PGRST204' || (upPayErr.message && upPayErr.message.includes('schema cache')))) {
+          const match = upPayErr.message.match(/Could not find the '([^']+)' column/);
+          if (match && match[1] && payPatch[match[1]] !== undefined) {
+            delete payPatch[match[1]];
+            const retry = await this.client
+              .from('payments')
+              .update(payPatch)
+              .eq('id', existingPayment.id)
+              .select()
+              .maybeSingle();
+            updatedPay = retry.data;
+            upPayErr = retry.error;
+          } else {
+            break;
+          }
+        }
+        if (upPayErr) {
+          throw new Error(`PAYMENT_LEDGER_UPDATE_FAILED: ${upPayErr.message}`);
+        }
+        committedPayment = (updatedPay as PaymentRecord) || { ...existingPayment, ...payPatch };
+      } else {
+        committedPayment = await this.insertPaymentWithSchemaFallback({
+          order_id: target.id,
+          bill_number: centralBillNum,
+          smav_central_bill_id: input.smav_central_bill_id || null,
+          customer_name: input.customer_name,
+          customer_phone: input.customer_phone,
+          amount: input.paid_amount,
+          payment_mode: input.primary_payment_mode,
+          transaction_ref: input.transaction_ref || null,
+          status: paymentLedgerStatus,
+          notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+          recorded_by: input.cashier_name,
+          branch_id: input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          created_at: billDateIso,
+        });
+      }
+
+      return {
+        order: {
+          ...updatedOrder,
+          branch_id: updatedOrder.branch_id || input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          items: finalItems,
+        },
+        payment: {
+          ...committedPayment,
+          branch_id: committedPayment.branch_id || input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          items: finalItems,
+        },
+        created: false,
+        duplicate: true,
+      };
+    };
+
+    if (existingOrder) {
+      return applyReplay(existingOrder);
+    }
+
+    // Create CRM customer first so we can link customer_id on the new order
+    let customerId: string | undefined;
+    const cleanPhone = String(input.customer_phone || '').replace(/\D/g, '').slice(-10);
+    if (cleanPhone) {
+      const cust = await this.upsertCustomerFromOrderOrAppointment({
+        name: input.customer_name,
+        phone: cleanPhone,
+        email: input.customer_email,
+        branchId: input.branch_id,
+        spend: Number(input.paid_amount || input.grand_total || 0),
+        billNumber: centralBillNum,
+        isVisit: true,
+      });
+      if (cust?.id) customerId = cust.id;
+    }
+
+    // Insert new order with exact central bill number unchanged
+    const orderRow: Record<string, any> = {
+      bill_number: centralBillNum,
+      branch_id: input.branch_id,
+      branch_code: input.branch_code,
+      branch_name: input.branch_name,
+      smav_central_bill_id: input.smav_central_bill_id || null,
+      smav_reservation_id: input.smav_reservation_id || null,
+      smav_sale_id: input.smav_sale_id || input.smav_central_bill_id || null,
+      smav_bill_status: input.payment_status === 'Cancelled' ? 'voided' : 'finalized',
+      smav_finalized_at: finalizedAtIso,
+      smav_finalize_error: null,
+      smav_last_event_id: input.event_id,
+      smav_last_event_at: nowIso,
+      is_legacy_bill: false,
+      idempotency_key: input.idempotency_key,
+      ...(customerId ? { customer_id: customerId } : {}),
+      customer_name: input.customer_name,
+      customer_phone: input.customer_phone,
+      subtotal: input.subtotal,
+      discount: input.discount,
+      tax_percent: input.tax_percent,
+      tax_amount: input.tax_amount,
+      tip_amount: input.tip_amount,
+      grand_total: input.grand_total,
+      paid_amount: input.paid_amount,
+      due_amount: input.due_amount,
+      payment_status: input.payment_status,
+      primary_payment_mode: input.primary_payment_mode,
+      cashier_name: input.cashier_name,
+      notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+      whatsapp_status: 'queued',
+      receipt_whatsapp_status: 'queued',
+      created_at: billDateIso,
+    };
+
+    let { data: insertedOrder, error: insertErr } = await this.client.from('orders').insert(orderRow).select().single();
+    while (insertErr && (insertErr.code === 'PGRST204' || (insertErr.message && insertErr.message.includes('schema cache')))) {
+      const match = insertErr.message.match(/Could not find the '([^']+)' column/);
+      if (match && match[1] && match[1] !== 'bill_number' && orderRow[match[1]] !== undefined) {
+        const colName = match[1];
+        if (colName === 'branch_id' && input.branch_id) {
+          orderRow.notes = orderRow.notes ? `${orderRow.notes} [Branch: ${input.branch_id}]` : `[Branch: ${input.branch_id}]`;
+        }
+        delete orderRow[colName];
+        const retry = await this.client.from('orders').insert(orderRow).select().single();
+        insertedOrder = retry.data;
+        insertErr = retry.error;
+      } else {
+        break;
+      }
+    }
+
+    // Handle concurrent replay race condition gracefully (Postgres unique violation 23505)
+    if (insertErr && insertErr.code === '23505') {
+      const racedOrder = await findExisting();
+      if (racedOrder) {
+        return applyReplay(racedOrder);
+      }
+    }
+    if (insertErr || !insertedOrder) {
+      throw new Error(`ORDER_COMMIT_FAILED: ${insertErr?.message || 'Unable to insert SMAV finalized order'}`);
+    }
+
+    // Insert stylist/service line items
+    let persistedItems: OrderItem[] = [];
+    if (input.items.length > 0) {
+      const itemRows = input.items.map(item => ({
+        order_id: insertedOrder.id,
+        service_id: item.service_id || null,
+        product_id: item.product_id || null,
+        item_name: item.item_name,
+        item_type: item.item_type || 'service',
+        quantity: item.quantity || 1,
+        unit_price: item.unit_price,
+        total_price: item.total_price,
+        staff_id: item.staff_id || null,
+        staff_name: item.staff_name || null,
+        commission_amount: item.commission_amount || 0,
+      }));
+      const { data: insertedItems, error: itemErr } = await this.client
+        .from('order_items')
+        .insert(itemRows)
+        .select();
+      if (itemErr) {
+        throw new Error(`ORDER_ITEMS_COMMIT_FAILED: ${itemErr.message}`);
+      }
+      persistedItems = (insertedItems || input.items) as OrderItem[];
+    }
+
+    // Commit local payment ledger record (MUST succeed before acknowledgement!)
+    const committedPayment = await this.insertPaymentWithSchemaFallback({
+      order_id: insertedOrder.id,
+      bill_number: centralBillNum,
+      smav_central_bill_id: input.smav_central_bill_id || null,
+      customer_name: input.customer_name,
+      customer_phone: input.customer_phone,
+      amount: input.paid_amount,
+      payment_mode: input.primary_payment_mode,
+      transaction_ref: input.transaction_ref || null,
+      status: paymentLedgerStatus,
+      notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+      recorded_by: input.cashier_name,
+      branch_id: input.branch_id,
+      branch_code: input.branch_code,
+      branch_name: input.branch_name,
+      created_at: billDateIso,
+    });
+
+    await this.logAudit(
+      'SMAV_CENTRAL_BILL_FINALIZED',
+      'Order',
+      insertedOrder.id,
+      'SMAV Central',
+      `Committed SMAV finalized bill ${centralBillNum} (Branch: ${input.branch_name}/${input.branch_code}, Payment ID: ${committedPayment.id})`
+    );
+
+    return {
+      order: {
+        ...(insertedOrder as Order),
+        bill_number: centralBillNum,
+        branch_id: input.branch_id,
+        branch_code: input.branch_code,
+        branch_name: input.branch_name,
+        smav_central_bill_id: input.smav_central_bill_id || insertedOrder.smav_central_bill_id,
+        items: persistedItems,
+      },
+      payment: {
+        ...committedPayment,
+        branch_id: input.branch_id,
+        branch_code: input.branch_code,
+        branch_name: input.branch_name,
+        items: persistedItems,
+      },
+      created: true,
+      duplicate: false,
+    };
   }
 
   public async updateOrder(id: string, data: Partial<Order>): Promise<Order | null> {
@@ -2338,12 +2767,34 @@ export class SupabaseSalonRepository implements ISalonRepository {
       list = (refetch.data || []) as PaymentRecord[];
     }
 
+    const salonBranches = await this.getBranches();
+    const branchesById: Record<string, SalonBranch> = {};
+    for (const b of salonBranches) {
+      if (b.id) branchesById[b.id] = b;
+    }
+
     let enriched = list.map(p => {
       const match = ordersById[p.order_id] || ordersByBill[p.bill_number];
       const effectiveDeletedAt = p.deleted_at || match?.deleted_at || null;
+      const effectiveBranchId = p.branch_id || match?.branch_id || '';
+      const matchedBranch = effectiveBranchId ? branchesById[effectiveBranchId] : undefined;
+      const effectiveBranchCode =
+        p.branch_code ||
+        match?.branch_code ||
+        matchedBranch?.smav_branch_code ||
+        matchedBranch?.code ||
+        '';
+      const effectiveBranchName =
+        p.branch_name ||
+        match?.branch_name ||
+        matchedBranch?.name ||
+        '';
       return {
         ...p,
-        branch_id: p.branch_id || match?.branch_id || 'tgl-gachibowli-main',
+        branch_id: effectiveBranchId || undefined,
+        branch_code: effectiveBranchCode || undefined,
+        branch_name: effectiveBranchName || undefined,
+        smav_central_bill_id: p.smav_central_bill_id || match?.smav_central_bill_id || null,
         subtotal: match?.subtotal !== undefined ? match.subtotal : p.amount,
         discount: match?.discount !== undefined ? match.discount : 0,
         tax_amount: match?.tax_amount !== undefined ? match.tax_amount : 0,
@@ -2367,7 +2818,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
     }
 
     if (filters?.branchId) {
-      enriched = enriched.filter(p => (p.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+      enriched = enriched.filter(p => p.branch_id === filters.branchId);
     }
 
     return enriched;
@@ -3461,8 +3912,9 @@ export class SupabaseSalonRepository implements ISalonRepository {
     sourceChannel?: 'WHATSAPP' | 'WEBSITE_ENQUIRY' | 'MIXED';
     source_channel?: 'WHATSAPP' | 'WEBSITE_ENQUIRY' | 'MIXED';
   }): Promise<WhatsAppConversation> {
-    const salonId = data.salonId || data.salon_id || 'tgl-gachibowli-main';
-    const branchId = data.branchId || data.branch_id || 'tgl-gachibowli-main';
+    const defaultBranchId = await this.resolveFallbackBranchId();
+    const salonId = data.salonId || data.salon_id || defaultBranchId || 'glossylooks';
+    const branchId = data.branchId || data.branch_id || defaultBranchId || '';
     const rawPhone = data.customerPhone || data.customer_phone || '';
     const cleanPhone = rawPhone.replace(/\D/g, '').slice(-10);
     const formattedPhone = cleanPhone.length === 10 ? `+91${cleanPhone}` : rawPhone;
@@ -3561,7 +4013,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
     try {
       const insertPayload: Record<string, any> = {
         id: newUuid,
-        business_id: 'tgl-gachibowli-main',
+        business_id: salonId,
         salon_id: salonId,
         branch_id: branchId,
         customer_phone: formattedPhone,
@@ -3701,15 +4153,15 @@ export class SupabaseSalonRepository implements ISalonRepository {
   }
 
   public async getWhatsAppInboxUnreadCount(salonId?: string, branchId?: string): Promise<number> {
-    const targetSalonId = salonId || 'tgl-gachibowli-main';
+    const targetSalonId = salonId || '';
     try {
       let query = this.client
         .from('whatsapp_conversations')
         .select('unread_count')
-        .eq('salon_id', targetSalonId)
         .eq('status', 'OPEN')
         .gt('unread_count', 0);
 
+      if (targetSalonId) query = query.eq('salon_id', targetSalonId);
       if (branchId) query = query.eq('branch_id', branchId);
       const { data, error } = await query;
       if (!error && Array.isArray(data)) {
@@ -3718,7 +4170,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
     } catch {}
 
     return this.inMemoryConversations
-      .filter(c => c.salon_id === targetSalonId && c.status === 'OPEN' && (!branchId || c.branch_id === branchId))
+      .filter(c => (!targetSalonId || c.salon_id === targetSalonId) && c.status === 'OPEN' && (!branchId || c.branch_id === branchId))
       .reduce((acc, curr) => acc + (curr.unread_count || 0), 0);
   }
 
@@ -3974,11 +4426,12 @@ export class SupabaseSalonRepository implements ISalonRepository {
     }
 
     const msgUuid = crypto.randomUUID();
+    const defaultBranchId = await this.resolveFallbackBranchId();
     const newMsg: WhatsAppMessage = {
       ...message,
       id: msgUuid,
-      salon_id: message.salon_id || 'tgl-gachibowli-main',
-      branch_id: message.branch_id || 'tgl-gachibowli-main',
+      salon_id: message.salon_id || defaultBranchId || 'glossylooks',
+      branch_id: message.branch_id || defaultBranchId || undefined,
       conversation_id: targetConversationId,
       direction,
       message_type: messageType,
@@ -4424,7 +4877,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
         ? userData.user_id.trim().toUpperCase()
         : deriveDeterministicUserCode(userData.role, outbox.idempotency_key);
     const normalizedUsername = (userData.username || autoUserId).trim().toLowerCase();
-    const normalizedBranch = userData.branch_id || 'tgl-gachibowli-main';
+    const normalizedBranch = userData.branch_id || (await this.resolveFallbackBranchId()) || null;
     const credentialMode: 'explicit' | 'generated' = outbox.credential_mode === 'explicit' ? 'explicit' : 'generated';
 
     const { data, error } = await this.client.rpc('smav_create_user_and_enqueue_sync', {

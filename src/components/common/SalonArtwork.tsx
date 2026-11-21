@@ -40,7 +40,7 @@ export const SalonArtwork: React.FC<ArtworkProps> = ({ type, className = '', tit
                   Luxury Women Salon & Bridal Studio
                 </span>
                 <span className="text-white/40">·</span>
-                <span className="text-xs text-white/80 font-medium">Gachibowli, Hyderabad</span>
+                <span className="text-xs text-white/80 font-medium">Hyderabad, India</span>
               </div>
               <h1 className="text-3xl sm:text-4xl md:text-5xl font-serif font-bold text-white tracking-tight leading-tight mb-4">
                 Redefining Glamour & Elegance for Every Woman

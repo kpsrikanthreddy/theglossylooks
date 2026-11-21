@@ -32,33 +32,6 @@ interface BookingDrawerProps {
   whatsappNumber?: string;
 }
 
-const defaultBranchesFallback: SalonBranch[] = [
-  {
-    id: 'tgl-gachibowli-main',
-    name: 'Gachibowli Main Flagship',
-    code: 'GCB-01',
-    address: '31, Vinayak Nagar, Gachibowli',
-    city: 'Hyderabad, Telangana - 500032',
-    phone: '8985799459',
-    whatsapp_number: '8985799459',
-    is_active: true,
-    created_at: '2026-01-01T10:00:00Z',
-    updated_at: '2026-10-31T09:09:41.008Z'
-  },
-  {
-    id: 'brn-1793346038689',
-    name: 'Kondapur Branch',
-    code: 'KND-02',
-    address: 'Road No 2, Kondapur',
-    city: 'Hyderabad, Telangana - 500084',
-    phone: '9491914422',
-    whatsapp_number: '9491914422',
-    is_active: true,
-    created_at: '2026-10-30T07:40:38.689Z',
-    updated_at: '2026-10-30T07:40:38.689Z'
-  }
-];
-
 const TIME_SLOTS = [
   '10:00 AM', '10:30 AM', '11:00 AM', '11:30 AM',
   '12:00 PM', '12:30 PM', '01:00 PM', '01:30 PM',
@@ -77,8 +50,8 @@ export const BookingDrawer: React.FC<BookingDrawerProps> = ({
   onBookingSuccess,
   whatsappNumber
 }) => {
-  const [branches, setBranches] = useState<SalonBranch[]>(defaultBranchesFallback);
-  const [selectedBranchId, setSelectedBranchId] = useState<string>('tgl-gachibowli-main');
+  const [branches, setBranches] = useState<SalonBranch[]>([]);
+  const [selectedBranchId, setSelectedBranchId] = useState<string>('');
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [staffList, setStaffList] = useState<Staff[]>([]);
@@ -98,13 +71,16 @@ export const BookingDrawer: React.FC<BookingDrawerProps> = ({
       api.getBranches()
         .then(data => {
           const active = (data || []).filter(b => b.is_active !== false);
-          const hasKondapur = active.some(b => b.id === 'brn-1793346038689' || b.name.toLowerCase().includes('kondapur'));
-          const finalBranches = active.length > 0
-            ? (hasKondapur ? active : [...active, defaultBranchesFallback[1]])
-            : defaultBranchesFallback;
-          setBranches(finalBranches);
+          setBranches(active);
+          setSelectedBranchId(prev => {
+            if (prev && active.some(b => b.id === prev)) return prev;
+            return active.length === 1 ? active[0].id : '';
+          });
         })
-        .catch(err => console.warn('Could not load branches for booking:', err));
+        .catch(err => {
+          console.warn('Could not load branches for booking:', err);
+          setBranches([]);
+        });
 
       api.getStaff()
         .then(data => setStaffList(data.filter(s => s.is_active)))
@@ -245,7 +221,7 @@ Please confirm my appointment slot. Thank you!`;
               <div className="flex justify-between border-b pb-2">
                 <span className="text-slate-500">Salon Branch:</span>
                 <span className="font-semibold text-slate-800">
-                  {branches.find(b => b.id === confirmedAppointment.branch_id)?.name || selectedBranch?.name || 'Gachibowli Main Flagship'}
+                  {branches.find(b => b.id === confirmedAppointment.branch_id)?.name || selectedBranch?.name || confirmedAppointment.branch_id || 'Salon Branch'}
                 </span>
               </div>
               <div className="flex justify-between">

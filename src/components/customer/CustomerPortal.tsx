@@ -393,7 +393,7 @@ export const CustomerPortal: React.FC<CustomerPortalProps> = ({
                 <div>
                   <span className="font-bold text-slate-900 text-xs">Primary Address</span>
                   <p className="text-slate-600 mt-1 leading-relaxed">
-                    {customer.address || '31, Vinayak Nagar, Gachibowli, Hyderabad - 500032'}
+                    {customer.address || 'Not provided'}
                   </p>
                 </div>
                 <span className="text-[10px] bg-slate-200 text-slate-800 px-2 py-0.5 rounded-full font-bold">

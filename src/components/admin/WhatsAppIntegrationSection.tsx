@@ -1613,7 +1613,7 @@ export const WhatsAppIntegrationSection: React.FC<WhatsAppIntegrationSectionProp
                 required
                 value={newBranchName}
                 onChange={e => setNewBranchName(e.target.value)}
-                placeholder="e.g. Kondapur Main Branch"
+                placeholder="e.g. City Center Branch"
                 className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs outline-none focus:border-[#5B132B]"
               />
             </div>

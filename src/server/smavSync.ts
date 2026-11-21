@@ -2104,6 +2104,7 @@ export async function handleIncomingSmavWebhook(params: {
     const nextActive = isActive !== undefined ? isActive : true;
     const generatedUserId = generateLocalUserCode(mappedRole, username);
 
+    const payloadBranchId = String(body.branchId || body.branch_id || '').trim() || undefined;
     const createdUser = await repo.createUser(
       {
         user_id: generatedUserId,
@@ -2111,7 +2112,7 @@ export async function handleIncomingSmavWebhook(params: {
         name: fullName,
         phone: phone || '',
         role: mappedRole,
-        branch_id: 'tgl-gachibowli-main',
+        branch_id: payloadBranchId,
         password_hash: hashPassword(transientNewPassword || crypto.randomBytes(24).toString('base64url')),
         is_active: nextActive,
         username: username || generatedUserId.toLowerCase(),

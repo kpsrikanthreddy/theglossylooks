@@ -2,10 +2,12 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  *
- * SMAV Central Bill Numbering & Sale Event Integration Client
+ * SMAV Central Bill Numbering & Dynamic Branch Integration Client
  *
- * Implements the GlossyLooks <-> SMAV central bill numbering flow:
- * 1. Loads permitted branches from SMAV (Gachibowli = GACHI, Kondapur = KONDA).
+ * Implements the GlossyLooks <-> SMAV dynamic branch & central bill numbering flow:
+ * 1. Loads authorized active branches dynamically from SMAV (source of truth for
+ *    branch_id, branch_name, branch_code, is_active, and user permissions).
+ *    Never returns hard-coded fallback branch arrays.
  * 2. Reserves an immutable central bill number BEFORE local bill creation:
  *    POST /api/integrations/glossylooks/bill-numbers/reserve
  * 3. Finalizes the reserved central bill number ONLY AFTER local bill commit:
@@ -22,15 +24,16 @@ import { mapLocalRoleToSmavRole } from './smavSync.ts';
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export interface SmavPermittedBranch {
-  id: string; // Local GlossyLooks branch_id (e.g. 'tgl-gachibowli-main')
+  id: string; // Canonical SMAV & GlossyLooks branch_id
   local_branch_id: string;
   smav_branch_id?: string;
-  code: string; // Canonical SMAV branch code ('GACHI' | 'KONDA' | ...)
+  code: string; // Dynamic SMAV branch code
   smav_branch_code: string;
-  name: string; // Clean receipt display name ('Gachibowli' | 'Kondapur' | ...)
+  name: string; // Clean receipt display name (no street address / city / PIN / GSTIN)
   full_name: string;
   is_active: boolean;
-  source: 'smav' | 'local';
+  is_authorized?: boolean;
+  source: 'smav';
 }
 
 export interface SmavBillReserveRequest {
@@ -88,25 +91,16 @@ export interface SmavInboundVerificationResult {
   error?: string;
 }
 
+export interface FetchSmavBranchesResult {
+  branches: SmavPermittedBranch[]; // Active + authorized branches for new POS billing
+  allBranches: SmavPermittedBranch[]; // All branches returned by SMAV (including disabled for historical records)
+  source: 'smav' | 'smav_error';
+  warning?: string;
+  error?: string;
+}
+
 const DEFAULT_TIMEOUT_MS = 15000;
 const TIMESTAMP_TOLERANCE_SECONDS = 300;
-
-export const CANONICAL_BRANCH_DIRECTORY = [
-  {
-    localBranchId: 'tgl-gachibowli-main',
-    smavBranchCode: 'GACHI',
-    displayName: 'Gachibowli',
-    fullName: 'Gachibowli',
-    legacyCodes: ['GACHI', 'GCB-01', 'GCB', 'GACHIBOWLI', 'TGL-01'],
-  },
-  {
-    localBranchId: 'brn-1793346038689',
-    smavBranchCode: 'KONDA',
-    displayName: 'Kondapur',
-    fullName: 'Kondapur',
-    legacyCodes: ['KONDA', 'KND-02', 'KND', 'KONDAPUR', 'TGL-02'],
-  },
-] as const;
 
 function parseBranchMapEnv(): Record<string, string> {
   const raw = (process.env.SMAV_SALON_BRANCH_MAP_JSON || '').trim();
@@ -123,68 +117,85 @@ function parseBranchMapEnv(): Record<string, string> {
       return normalized;
     }
   } catch {
-    // Ignore malformed JSON map and fall back to canonical directory
+    // Ignore malformed JSON map
   }
   return {};
 }
 
+/**
+ * Strips any street/city/PIN suffixes or trailing flagship/branch descriptors
+ * so receipts and compact labels display only the clean branch name.
+ */
+export function sanitizeBranchDisplayName(rawName?: string | null, branchCode?: string | null): string {
+  const trimmed = String(rawName || '').trim();
+  if (trimmed) {
+    const cleaned = trimmed
+      .split(',')[0]
+      .replace(/\s*(Main\s+Flagship|Flagship|Branch)\s*$/i, '')
+      .trim();
+    if (cleaned) return cleaned;
+  }
+  return String(branchCode || '').trim().toUpperCase();
+}
+
+/**
+ * Formats a dynamic branch label for UI dropdowns, ledgers, and receipts:
+ * e.g. "Branch Name (CODE)" when both are available.
+ */
+export function formatDynamicBranchLabel(branchName?: string | null, branchCode?: string | null): string {
+  const cleanName = sanitizeBranchDisplayName(branchName, '');
+  const cleanCode = String(branchCode || '').trim().toUpperCase();
+  if (cleanName && cleanCode) {
+    if (cleanName.toUpperCase() === cleanCode || cleanName.toUpperCase().endsWith(`(${cleanCode})`)) {
+      return cleanName;
+    }
+    return `${cleanName} (${cleanCode})`;
+  }
+  return cleanName || cleanCode || '';
+}
+
+/**
+ * Resolves a branch code dynamically from request input, local public.salon_branches
+ * record, or optional SMAV_SALON_BRANCH_MAP_JSON override. Never uses hard-coded branch lists.
+ */
 export function resolveCanonicalBranchCode(input: {
   branchId?: string | null;
   branchCode?: string | null;
   branchName?: string | null;
   localBranch?: Partial<SalonBranch> | null;
 }): string | null {
-  const candidates = [
-    input.branchCode,
-    input.localBranch?.smav_branch_code,
-    input.localBranch?.code,
-    input.branchId,
-    input.localBranch?.id,
-    input.branchName,
-    input.localBranch?.name,
-  ]
-    .map(v => String(v || '').trim())
-    .filter(Boolean);
-
-  if (candidates.length === 0) return null;
-
-  // Check reverse env map first (code -> localBranchId)
-  const envMap = parseBranchMapEnv();
-  for (const [code, mappedBranchId] of Object.entries(envMap)) {
-    if (
-      (input.branchId && input.branchId.trim() === mappedBranchId) ||
-      (input.localBranch?.id && input.localBranch.id.trim() === mappedBranchId) ||
-      (input.branchCode && input.branchCode.trim().toUpperCase() === code)
-    ) {
-      return code;
-    }
+  const explicitCode = String(input.branchCode || '').trim().toUpperCase();
+  if (explicitCode && /^[A-Z0-9_-]{2,24}$/.test(explicitCode)) {
+    return explicitCode;
   }
 
-  for (const raw of candidates) {
-    const upper = raw.toUpperCase();
-    for (const entry of CANONICAL_BRANCH_DIRECTORY) {
-      if (
-        raw === entry.localBranchId ||
-        upper === entry.smavBranchCode ||
-        (entry.legacyCodes as readonly string[]).includes(upper) ||
-        upper.includes(entry.displayName.toUpperCase())
-      ) {
-        return entry.smavBranchCode;
+  const localSmavCode = String(input.localBranch?.smav_branch_code || '').trim().toUpperCase();
+  if (localSmavCode && /^[A-Z0-9_-]{2,24}$/.test(localSmavCode)) {
+    return localSmavCode;
+  }
+
+  const localCode = String(input.localBranch?.code || '').trim().toUpperCase();
+  if (localCode && /^[A-Z0-9_-]{2,24}$/.test(localCode)) {
+    return localCode;
+  }
+
+  const envMap = parseBranchMapEnv();
+  const candidateBranchId = String(input.branchId || input.localBranch?.id || '').trim();
+  if (candidateBranchId) {
+    for (const [code, mappedBranchId] of Object.entries(envMap)) {
+      if (mappedBranchId === candidateBranchId) {
+        return code;
       }
     }
-  }
-
-  // If SMAV passed an explicit custom uppercase alphanumeric branch code (e.g. MADHA)
-  if (input.branchCode && /^[A-Z0-9_-]{2,20}$/i.test(input.branchCode.trim())) {
-    return input.branchCode.trim().toUpperCase();
-  }
-  if (input.localBranch?.smav_branch_code && /^[A-Z0-9_-]{2,20}$/i.test(input.localBranch.smav_branch_code.trim())) {
-    return input.localBranch.smav_branch_code.trim().toUpperCase();
   }
 
   return null;
 }
 
+/**
+ * Resolves a local public.salon_branches ID dynamically from a SMAV branch code
+ * using optional SMAV_SALON_BRANCH_MAP_JSON or loaded localBranches.
+ */
 export function resolveLocalBranchIdForCode(branchCode?: string | null, localBranches?: SalonBranch[]): string | null {
   const cleanCode = String(branchCode || '').trim().toUpperCase();
   if (!cleanCode) return null;
@@ -194,29 +205,12 @@ export function resolveLocalBranchIdForCode(branchCode?: string | null, localBra
     return envMap[cleanCode];
   }
 
-  const canonical = CANONICAL_BRANCH_DIRECTORY.find(
-    e => e.smavBranchCode === cleanCode || (e.legacyCodes as readonly string[]).includes(cleanCode)
-  );
-  if (canonical) {
-    if (localBranches && localBranches.length > 0) {
-      const matched = localBranches.find(
-        b =>
-          b.id === canonical.localBranchId ||
-          String(b.smav_branch_code || '').toUpperCase() === canonical.smavBranchCode ||
-          String(b.code || '').toUpperCase() === canonical.smavBranchCode ||
-          b.name.toLowerCase().includes(canonical.displayName.toLowerCase())
-      );
-      if (matched) return matched.id;
-    }
-    return canonical.localBranchId;
-  }
-
   if (localBranches && localBranches.length > 0) {
     const matched = localBranches.find(
       b =>
-        String(b.smav_branch_code || '').toUpperCase() === cleanCode ||
-        String(b.code || '').toUpperCase() === cleanCode ||
-        b.id.toUpperCase() === cleanCode
+        String(b.smav_branch_code || '').trim().toUpperCase() === cleanCode ||
+        String(b.code || '').trim().toUpperCase() === cleanCode ||
+        String(b.id || '').trim().toUpperCase() === cleanCode
     );
     if (matched) return matched.id;
   }
@@ -225,8 +219,8 @@ export function resolveLocalBranchIdForCode(branchCode?: string | null, localBra
 }
 
 /**
- * Returns a clean thermal-receipt-safe branch name (e.g. "Gachibowli" or "Kondapur")
- * with zero street address, city, PIN code, or GSTIN.
+ * Returns a clean thermal-receipt-safe branch name with zero street address,
+ * city, PIN code, or GSTIN. Purely dynamic — no hard-coded branch names.
  */
 export function getCleanReceiptBranchName(input: {
   branchId?: string | null;
@@ -234,25 +228,16 @@ export function getCleanReceiptBranchName(input: {
   branchName?: string | null;
   localBranch?: Partial<SalonBranch> | null;
 }): string {
+  const cleanedName = sanitizeBranchDisplayName(
+    input.branchName || input.localBranch?.name || '',
+    ''
+  );
+  if (cleanedName) return cleanedName;
+
   const code = resolveCanonicalBranchCode(input);
-  if (code) {
-    const canonical = CANONICAL_BRANCH_DIRECTORY.find(e => e.smavBranchCode === code);
-    if (canonical) return canonical.displayName;
-  }
+  if (code) return code;
 
-  const rawName = String(input.branchName || input.localBranch?.name || '').trim();
-  if (rawName) {
-    if (/gachibowli/i.test(rawName)) return 'Gachibowli';
-    if (/kondapur/i.test(rawName)) return 'Kondapur';
-    // Strip any trailing "Main Flagship", "Branch", or street/city suffixes after comma/dash
-    const cleaned = rawName
-      .split(',')[0]
-      .replace(/\s*(Main\s+Flagship|Flagship|Branch)\s*$/i, '')
-      .trim();
-    if (cleaned) return cleaned;
-  }
-
-  return code || 'Gachibowli';
+  return String(input.branchId || input.localBranch?.id || '').trim();
 }
 
 export function getSmavGatewayBaseUrl(): string {
@@ -266,13 +251,12 @@ export function getSmavIntegrationKey(): string {
   return (process.env.GLOSSYLOOKS_INTEGRATION_KEY || '').trim();
 }
 
+export function getSmavDispatchSecret(): string {
+  return (process.env.SMAV_DISPATCH_SECRET || '').trim();
+}
+
 export function getSmavHmacSecret(): string {
-  return (
-    process.env.SMAV_DISPATCH_SECRET ||
-    process.env.GLOSSYLOOKS_HMAC_SECRET ||
-    process.env.SMAV_HMAC_SECRET ||
-    ''
-  ).trim();
+  return getSmavDispatchSecret();
 }
 
 export function signSmavPayload(rawBody: string, secret: string, timestampSec?: number): {
@@ -286,7 +270,7 @@ export function signSmavPayload(rawBody: string, secret: string, timestampSec?: 
 
 function buildSmavOutboundHeaders(rawBody: string, idempotencyKey?: string): Record<string, string> {
   const integrationKey = getSmavIntegrationKey();
-  const hmacSecret = getSmavHmacSecret();
+  const hmacSecret = getSmavDispatchSecret();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Business-Source': 'glossylooks',
@@ -311,9 +295,9 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 
 /**
  * Dual authentication for inbound POST /api/integrations/smav/sale-event:
- * 1. Validates X-Integration-Key against GLOSSYLOOKS_INTEGRATION_KEY (timing-safe).
+ * 1. Validates X-Integration-Key strictly against GLOSSYLOOKS_INTEGRATION_KEY (timing-safe).
  * 2. Validates HMAC-SHA256 signature (X-SMAV-Timestamp + X-SMAV-Signature) over `${timestamp}.${rawBody}`
- *    using SMAV_DISPATCH_SECRET (or GLOSSYLOOKS_HMAC_SECRET), with ±300s replay protection.
+ *    strictly using SMAV_DISPATCH_SECRET, with ±300s replay protection.
  */
 export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVerificationResult {
   const expectedKey = getSmavIntegrationKey();
@@ -335,7 +319,7 @@ export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVer
     };
   }
 
-  const secret = getSmavHmacSecret();
+  const secret = getSmavDispatchSecret();
   if (secret.length < 32) {
     return {
       ok: false,
@@ -352,7 +336,9 @@ export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVer
     ? rawSigStr.slice(7).trim()
     : rawSigStr;
 
-  if (!/^\d{10}$/.test(ts) || !/^[a-f0-9]{64}$/i.test(suppliedHex)) {
+  const isEpochSeconds = /^\d{10}$/.test(ts);
+  const isEpochMs = /^\d{13}$/.test(ts);
+  if ((!isEpochSeconds && !isEpochMs) || !/^[a-f0-9]{64}$/i.test(suppliedHex)) {
     return {
       ok: false,
       status: 401,
@@ -360,7 +346,8 @@ export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVer
     };
   }
 
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > TIMESTAMP_TOLERANCE_SECONDS) {
+  const tsSeconds = isEpochMs ? Number(ts) / 1000 : Number(ts);
+  if (Math.abs(Date.now() / 1000 - tsSeconds) > TIMESTAMP_TOLERANCE_SECONDS) {
     return {
       ok: false,
       status: 401,
@@ -378,19 +365,13 @@ export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVer
     rawText = req.body.toString('utf8');
   } else if (typeof req.body === 'string') {
     rawText = req.body;
-  } else if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-    try {
-      rawText = JSON.stringify(req.body);
-    } catch {
-      rawText = null;
-    }
   }
 
   if (!rawText) {
     return {
       ok: false,
       status: 401,
-      error: 'Empty or unreadable request body for HMAC verification',
+      error: 'Missing raw request body for SMAV HMAC verification',
     };
   }
 
@@ -409,73 +390,127 @@ export function verifySmavSaleEventRequest(req: express.Request): SmavInboundVer
 }
 
 /**
- * Loads permitted branches from SMAV for POS billing, normalized against local GlossyLooks branches
- * so Gachibowli = GACHI and Kondapur = KONDA.
+ * Dynamically normalizes and deduplicates branches returned by the SMAV branches API.
+ * - `allBranches` preserves inactive/disabled branches for historical Payment Ledger & Reports.
+ * - `branches` contains strictly active + authorized branches for new POS billing.
+ */
+export function normalizeDynamicSmavBranches(
+  rawList: any[],
+  localBranches: SalonBranch[] = []
+): { branches: SmavPermittedBranch[]; allBranches: SmavPermittedBranch[] } {
+  const allBranches: SmavPermittedBranch[] = [];
+  const seenIds = new Set<string>();
+  const seenCodes = new Set<string>();
+
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+
+    const rawCode = String(
+      item.branch_code ?? item.branchCode ?? item.smav_branch_code ?? item.code ?? item.short_code ?? item.shortCode ?? ''
+    )
+      .trim()
+      .toUpperCase();
+
+    const rawFullName = String(
+      item.branch_name ?? item.branchName ?? item.name ?? item.label ?? ''
+    ).trim();
+
+    const explicitBranchId = String(
+      item.branch_id ??
+      item.branchId ??
+      item.external_branch_id ??
+      item.externalBranchId ??
+      item.local_branch_id ??
+      item.localBranchId ??
+      item.id ??
+      ''
+    ).trim();
+
+    const matchedLocal = localBranches.find(
+      b =>
+        (explicitBranchId && b.id === explicitBranchId) ||
+        (rawCode && String(b.smav_branch_code || '').trim().toUpperCase() === rawCode) ||
+        (rawCode && String(b.code || '').trim().toUpperCase() === rawCode)
+    );
+
+    const resolvedId = explicitBranchId || matchedLocal?.id || '';
+    const resolvedCode = rawCode || String(matchedLocal?.smav_branch_code || matchedLocal?.code || '').trim().toUpperCase();
+    const cleanName = sanitizeBranchDisplayName(rawFullName || matchedLocal?.name || '', resolvedCode);
+
+    // Require at least a canonical branch ID and branch code
+    if (!resolvedId || !resolvedCode) continue;
+
+    const idKey = resolvedId.toLowerCase();
+    const codeKey = resolvedCode.toUpperCase();
+    if (seenIds.has(idKey) || seenCodes.has(codeKey)) continue;
+    seenIds.add(idKey);
+    seenCodes.add(codeKey);
+
+    const statusLower = String(item.status || '').trim().toLowerCase();
+    const isActive = !(
+      item.is_active === false ||
+      item.isActive === false ||
+      item.active === false ||
+      statusLower === 'inactive' ||
+      statusLower === 'disabled' ||
+      statusLower === 'archived'
+    );
+
+    const isAuthorized = !(
+      item.is_authorized === false ||
+      item.isAuthorized === false ||
+      item.authorized === false ||
+      item.permitted === false ||
+      item.is_permitted === false
+    );
+
+    allBranches.push({
+      id: resolvedId,
+      local_branch_id: matchedLocal?.id || resolvedId,
+      smav_branch_id: String(item.smav_branch_id ?? item.smavBranchId ?? item.id ?? resolvedId).trim(),
+      code: codeKey,
+      smav_branch_code: codeKey,
+      name: cleanName || codeKey,
+      full_name: rawFullName || cleanName || codeKey,
+      is_active: isActive,
+      is_authorized: isAuthorized,
+      source: 'smav',
+    });
+  }
+
+  allBranches.sort((a, b) => a.name.localeCompare(b.name));
+  const activeAuthorized = allBranches.filter(b => b.is_active && b.is_authorized !== false);
+
+  return { branches: activeAuthorized, allBranches };
+}
+
+/**
+ * Loads permitted branches dynamically from SMAV for POS billing.
+ * SMAV is the single source of truth for branch_id, branch_name, branch_code,
+ * is_active, and user permissions. Fails closed without hard-coded fallbacks.
  */
 export async function fetchSmavPermittedBranches(params: {
   admin?: Partial<User | AdminUser> | null;
   localBranches: SalonBranch[];
   fetchImpl?: FetchLike;
   timeoutMs?: number;
-}): Promise<{
-  branches: SmavPermittedBranch[];
-  source: 'smav' | 'local_fallback';
-  warning?: string;
-}> {
+}): Promise<FetchSmavBranchesResult> {
   const fetchImpl = params.fetchImpl || fetch;
   const timeoutMs = params.timeoutMs || DEFAULT_TIMEOUT_MS;
   const baseUrl = getSmavGatewayBaseUrl();
   const integrationKey = getSmavIntegrationKey();
   const explicitBranchesUrl = (process.env.SMAV_BRANCHES_URL || '').trim();
 
-  const buildLocalFallback = (warning?: string): {
-    branches: SmavPermittedBranch[];
-    source: 'local_fallback';
-    warning?: string;
-  } => {
-    const activeLocal = (params.localBranches || []).filter(b => b.is_active !== false);
-    const mapped: SmavPermittedBranch[] = [];
-    const seenCodes = new Set<string>();
-
-    for (const local of activeLocal) {
-      const code = resolveCanonicalBranchCode({ localBranch: local });
-      if (!code || seenCodes.has(code)) continue;
-      seenCodes.add(code);
-      mapped.push({
-        id: local.id,
-        local_branch_id: local.id,
-        code,
-        smav_branch_code: code,
-        name: getCleanReceiptBranchName({ localBranch: local, branchCode: code }),
-        full_name: local.name,
-        is_active: true,
-        source: 'local',
-      });
-    }
-
-    // Ensure canonical GACHI & KONDA exist if local branches were minimal
-    for (const entry of CANONICAL_BRANCH_DIRECTORY) {
-      if (!seenCodes.has(entry.smavBranchCode)) {
-        mapped.push({
-          id: entry.localBranchId,
-          local_branch_id: entry.localBranchId,
-          code: entry.smavBranchCode,
-          smav_branch_code: entry.smavBranchCode,
-          name: entry.displayName,
-          full_name: entry.fullName,
-          is_active: true,
-          source: 'local',
-        });
-      }
-    }
-
-    return { branches: mapped, source: 'local_fallback', warning };
-  };
-
   if ((!baseUrl && !explicitBranchesUrl) || !integrationKey) {
-    return buildLocalFallback(
-      'SMAV_GATEWAY_URL or GLOSSYLOOKS_INTEGRATION_KEY is not configured; displaying canonical GlossyLooks branches.'
-    );
+    const errMsg =
+      'SMAV branches integration is not configured (SMAV_BRANCHES_URL / SMAV_GATEWAY_URL and GLOSSYLOOKS_INTEGRATION_KEY are required).';
+    return {
+      branches: [],
+      allBranches: [],
+      source: 'smav_error',
+      error: errMsg,
+      warning: errMsg,
+    };
   }
 
   const targetBase = explicitBranchesUrl || `${baseUrl}/api/integrations/glossylooks/branches`;
@@ -507,9 +542,14 @@ export async function fetchSmavPermittedBranches(params: {
 
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      return buildLocalFallback(
-        `SMAV branches API returned HTTP ${res.status}: ${data?.error || data?.message || 'Unable to load permitted branches'}`
-      );
+      const errMsg = `SMAV branches API returned HTTP ${res.status}: ${data?.error || data?.message || 'Unable to load authorized branches'}`;
+      return {
+        branches: [],
+        allBranches: [],
+        source: 'smav_error',
+        error: errMsg,
+        warning: errMsg,
+      };
     }
 
     const rawList: any[] = Array.isArray(data)
@@ -522,73 +562,30 @@ export async function fetchSmavPermittedBranches(params: {
       ? data.data
       : [];
 
-    const normalized: SmavPermittedBranch[] = [];
-    const seenCodes = new Set<string>();
+    const { branches, allBranches } = normalizeDynamicSmavBranches(rawList, params.localBranches);
 
-    for (const item of rawList) {
-      if (item?.isActive === false || item?.is_active === false || item?.active === false) continue;
-
-      const rawCode = String(
-        item?.branchCode || item?.branch_code || item?.code || item?.shortCode || item?.short_code || ''
-      ).trim();
-      const rawName = String(
-        item?.branchName || item?.branch_name || item?.name || item?.label || ''
-      ).trim();
-      const smavBranchId = item?.id || item?.branchId || item?.branch_id || undefined;
-
-      const canonicalCode = resolveCanonicalBranchCode({
-        branchCode: rawCode,
-        branchName: rawName,
-        branchId: item?.externalBranchId || item?.external_branch_id || item?.localBranchId || item?.local_branch_id,
-      });
-
-      if (!canonicalCode || seenCodes.has(canonicalCode)) continue;
-      seenCodes.add(canonicalCode);
-
-      const localBranchId =
-        item?.externalBranchId ||
-        item?.external_branch_id ||
-        item?.localBranchId ||
-        item?.local_branch_id ||
-        resolveLocalBranchIdForCode(canonicalCode, params.localBranches) ||
-        `branch-${canonicalCode.toLowerCase()}`;
-
-      const localBranch = (params.localBranches || []).find(b => b.id === localBranchId);
-      const cleanName = getCleanReceiptBranchName({
-        branchCode: canonicalCode,
-        branchName: rawName,
-        localBranch,
-      });
-
-      normalized.push({
-        id: localBranchId,
-        local_branch_id: localBranchId,
-        smav_branch_id: smavBranchId ? String(smavBranchId) : undefined,
-        code: canonicalCode,
-        smav_branch_code: canonicalCode,
-        name: cleanName,
-        full_name: rawName || localBranch?.name || cleanName,
-        is_active: true,
-        source: 'smav',
-      });
-    }
-
-    if (normalized.length === 0) {
+    if (branches.length === 0) {
       return {
         branches: [],
+        allBranches,
         source: 'smav',
-        warning: 'No permitted branches were returned by SMAV for your account.',
+        warning: 'No active authorized branches were returned by SMAV for your account.',
       };
     }
 
-    return { branches: normalized, source: 'smav' };
+    return { branches, allBranches, source: 'smav' };
   } catch (err: any) {
     const isAbort = err?.name === 'AbortError';
-    return buildLocalFallback(
-      isAbort
-        ? `SMAV permitted branches request timed out after ${Math.round(timeoutMs / 1000)}s`
-        : `SMAV permitted branches request failed: ${err?.message || 'Network error'}`
-    );
+    const errMsg = isAbort
+      ? `SMAV branches request timed out after ${Math.round(timeoutMs / 1000)}s`
+      : `SMAV branches request failed: ${err?.message || 'Network error'}`;
+    return {
+      branches: [],
+      allBranches: [],
+      source: 'smav_error',
+      error: errMsg,
+      warning: errMsg,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -629,7 +626,7 @@ export async function reserveSmavCentralBillNumber(
     return {
       ok: false,
       status: 400,
-      error: 'A valid SMAV branch code (GACHI or KONDA) is required before reserving a bill number.',
+      error: 'A valid authorized SMAV branch code is required before reserving a bill number.',
     };
   }
 

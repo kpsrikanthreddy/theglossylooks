@@ -72,7 +72,7 @@ export const EnquiryModal: React.FC<EnquiryModalProps> = ({
               Enquiry Received!
             </h3>
             <p className="text-xs text-slate-600 mb-4 max-w-xs mx-auto">
-              Our salon manager in Gachibowli will reach out on WhatsApp/Call shortly to assist with your requirements.
+              Our salon manager will reach out on WhatsApp/Call shortly to assist with your requirements.
             </p>
             <div className="flex gap-2">
               <a

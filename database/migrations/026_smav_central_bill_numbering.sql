@@ -14,11 +14,11 @@
 
 BEGIN;
 
--- 1. Canonical SMAV branch code column on public.branches
-ALTER TABLE public.branches
+-- 1. Canonical SMAV branch code column on public.salon_branches
+ALTER TABLE public.salon_branches
   ADD COLUMN IF NOT EXISTS smav_branch_code text;
 
-UPDATE public.branches
+UPDATE public.salon_branches
 SET smav_branch_code = 'GACHI'
 WHERE smav_branch_code IS NULL
   AND (
@@ -27,7 +27,7 @@ WHERE smav_branch_code IS NULL
     OR LOWER(COALESCE(name, '')) LIKE '%gachibowli%'
   );
 
-UPDATE public.branches
+UPDATE public.salon_branches
 SET smav_branch_code = 'KONDA'
 WHERE smav_branch_code IS NULL
   AND (

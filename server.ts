@@ -141,9 +141,37 @@ app.use((req, _res, next) => {
 });
 
 
+function normalizeSmavPaymentMode(raw: unknown): Order['primary_payment_mode'] {
+  const val = String(raw || '').trim().toLowerCase();
+  if (val === 'cash') return 'Cash';
+  if (val === 'card' || val === 'credit_card' || val === 'debit_card' || val === 'credit card' || val === 'debit card') return 'Card';
+  if (val === 'bank transfer' || val === 'bank_transfer' || val === 'neft' || val === 'imps' || val === 'rtgs') return 'Bank Transfer';
+  if (val === 'split' || val === 'split payment' || val === 'split_payment') return 'Split Payment';
+  if (val === 'pay later' || val === 'pay_later' || val === 'credit' || val === 'due') return 'Pay Later';
+  return 'UPI';
+}
+
+function normalizeSmavPaymentStatus(raw: unknown, dueAmount: number): Order['payment_status'] {
+  const val = String(raw || '').trim().toLowerCase();
+  if (val === 'paid' || val === 'completed' || val === 'settled' || val === 'finalized') return 'Paid';
+  if (val === 'partial' || val === 'partially_paid') return 'Partial';
+  if (val === 'pending' || val === 'unpaid') return 'Pending';
+  if (val === 'refunded') return 'Refunded';
+  if (val === 'cancelled' || val === 'canceled' || val === 'void' || val === 'voided') return 'Cancelled';
+  return dueAmount > 0 ? 'Partial' : 'Paid';
+}
+
+function normalizeIsoTimestamp(raw: unknown, fallbackIso: string): string {
+  const str = String(raw || '').trim();
+  if (!str) return fallbackIso;
+  const parsed = Date.parse(str);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallbackIso;
+}
+
 // SMAV authenticated server-to-server sale-event receiver.
-// Validates BOTH X-Integration-Key AND HMAC-SHA256 signature (X-SMAV-Timestamp + X-SMAV-Signature)
-// before reading or updating any local bill. Never expose signing secrets to the browser.
+// Validates BOTH X-Integration-Key (GLOSSYLOOKS_INTEGRATION_KEY) AND HMAC-SHA256 signature
+// (X-SMAV-Timestamp + X-SMAV-Signature over `${timestamp}.${rawBody}` using SMAV_DISPATCH_SECRET)
+// before reading, creating, or updating any local bill. Never expose signing secrets to the browser.
 app.post('/api/integrations/smav/sale-event', async (req, res) => {
   const auth = verifySmavSaleEventRequest(req);
   if (!auth.ok) {
@@ -157,10 +185,11 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     try { e = JSON.parse(e.toString('utf8')); } catch { e = {}; }
   }
 
-  const eventId = String(e.event_id || e.eventId || '').trim();
+  const p = e.payload || e.data || e.bill || e.sale || e;
   const sourceType = String(e.source_type || e.sourceType || 'salon').trim().toLowerCase();
   const eventType = String(e.event_type || e.eventType || '').trim().toLowerCase();
   const supportedEvents = [
+    'central_bill_finalized',
     'receipt',
     'feedback',
     'sale_recorded',
@@ -173,51 +202,294 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     'refund',
   ];
 
-  if (!eventId || eventId.length > 128 || !['salon', 'glossylooks'].includes(sourceType) || !supportedEvents.includes(eventType)) {
+  if (!['salon', 'glossylooks'].includes(sourceType) || !supportedEvents.includes(eventType)) {
     return res.status(400).json({ error: 'Invalid SMAV sale event envelope' });
   }
 
+  // Strictly validate outlet_code === 'glossylooks'
   const configuredOutlet = (process.env.SMAV_SALON_OUTLET_ID || '').trim();
-  const suppliedOutletId = String(e.outlet_id || e.outletId || '').trim();
-  const suppliedOutletCode = String(e.outlet_code || e.outletCode || req.headers['x-business-source'] || '').trim().toLowerCase();
+  const suppliedOutletId = String(e.outlet_id || e.outletId || p.outlet_id || p.outletId || '').trim();
+  const suppliedOutletCode = String(
+    e.outlet_code ||
+    e.outletCode ||
+    p.outlet_code ||
+    p.outletCode ||
+    req.headers['x-business-source'] ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+
+  if (suppliedOutletCode !== 'glossylooks') {
+    return res.status(403).json({ error: 'Invalid or unauthorized outlet_code; expected glossylooks' });
+  }
   if (configuredOutlet && suppliedOutletId && suppliedOutletId !== configuredOutlet) {
     return res.status(403).json({ error: 'Outlet not allowed' });
   }
-  if (!configuredOutlet && suppliedOutletCode && suppliedOutletCode !== 'glossylooks') {
-    return res.status(403).json({ error: 'Outlet not allowed' });
-  }
-  if (configuredOutlet && !suppliedOutletId && suppliedOutletCode !== 'glossylooks') {
-    return res.status(403).json({ error: 'Outlet not allowed' });
+
+  const centralBillNumber = String(
+    p.central_bill_number ||
+    p.centralBillNumber ||
+    p.bill_number ||
+    p.billNumber ||
+    e.central_bill_number ||
+    e.centralBillNumber ||
+    e.bill_number ||
+    e.billNumber ||
+    ''
+  ).trim();
+
+  if (!centralBillNumber || centralBillNumber.length > 128) {
+    return res.status(400).json({ error: 'Missing central_bill_number / bill_number reference' });
   }
 
-  const p = e.payload || e.data || e;
-  const centralBillNumber = String(p.bill_number || p.billNumber || '').trim();
-  const localOrderRef = String(p.local_order_id || p.localOrderId || p.native_order_id || p.nativeOrderId || p.external_order_id || p.externalOrderId || '').trim();
-  const key = String(e.source_key || e.sourceKey || p.idempotency_key || p.idempotencyKey || centralBillNumber || '').trim();
+  const smavCentralBillId = String(
+    p.smav_central_bill_id ||
+    p.smavCentralBillId ||
+    p.central_bill_id ||
+    p.centralBillId ||
+    p.bill_id ||
+    p.billId ||
+    p.sale_id ||
+    p.saleId ||
+    p.smav_sale_id ||
+    e.central_bill_id ||
+    e.centralBillId ||
+    ''
+  ).trim() || null;
 
-  if (!key || key.length > 200 || !centralBillNumber) {
-    return res.status(400).json({ error: 'Missing central bill_number reference' });
+  const localOrderRef = String(
+    p.local_order_id ||
+    p.localOrderId ||
+    p.native_order_id ||
+    p.nativeOrderId ||
+    p.external_order_id ||
+    p.externalOrderId ||
+    ''
+  ).trim();
+
+  const headerIdemKey = Array.isArray(req.headers['x-idempotency-key'])
+    ? req.headers['x-idempotency-key'][0]
+    : req.headers['x-idempotency-key'];
+
+  const key = String(
+    p.idempotency_key ||
+    p.idempotencyKey ||
+    e.idempotency_key ||
+    e.idempotencyKey ||
+    e.source_key ||
+    e.sourceKey ||
+    headerIdemKey ||
+    `${eventType}:${centralBillNumber}`
+  ).trim();
+
+  const eventId = String(e.event_id || e.eventId || p.event_id || p.eventId || key).trim();
+  if (!eventId || eventId.length > 128 || !key || key.length > 200) {
+    return res.status(400).json({ error: 'Invalid event_id or idempotency_key' });
   }
 
   const localBranches = await salonRepository.getBranches().catch(() => []);
-  const resolvedBranchCode = resolveCanonicalBranchCode({
-    branchCode: p.branch_code || p.branchCode,
-    branchId: p.branch_id || p.branchId,
-    branchName: p.branch_name || p.branchName,
-  });
-  const resolvedBranchId =
-    (p.branch_id && localBranches.some(b => b.id === p.branch_id) ? String(p.branch_id) : null) ||
-    resolveLocalBranchIdForCode(resolvedBranchCode, localBranches) ||
-    (process.env.SMAV_SALON_DEFAULT_BRANCH_ID || '').trim() ||
-    null;
+  const suppliedBranchId = String(
+    p.branch_id || p.branchId || p.local_branch_id || p.localBranchId || e.branch_id || e.branchId || ''
+  ).trim();
+  const suppliedBranchName = String(
+    p.branch_name || p.branchName || e.branch_name || e.branchName || ''
+  ).trim();
+  const matchedLocalBranch =
+    (suppliedBranchId ? localBranches.find(b => b.id === suppliedBranchId) : undefined) || null;
 
-  // 1. Check whether this sale-event refers to an existing GlossyLooks local bill (by local_order_id or central bill_number)
-  let existingLocalOrder: Order | null = null;
-  if (localOrderRef) {
-    existingLocalOrder = await salonRepository.getOrderById(localOrderRef);
+  const resolvedBranchCode =
+    resolveCanonicalBranchCode({
+      branchCode: p.branch_code || p.branchCode || e.branch_code || e.branchCode,
+      branchId: suppliedBranchId,
+      branchName: suppliedBranchName,
+      localBranch: matchedLocalBranch,
+    }) || '';
+
+  const resolvedBranchId =
+    suppliedBranchId ||
+    (resolvedBranchCode ? resolveLocalBranchIdForCode(resolvedBranchCode, localBranches) : null) ||
+    '';
+
+  const cleanBranchName = getCleanReceiptBranchName({
+    branchId: resolvedBranchId || undefined,
+    branchCode: resolvedBranchCode || undefined,
+    branchName: suppliedBranchName || undefined,
+    localBranch: matchedLocalBranch,
+  });
+
+  // 1. Primary path: `central_bill_finalized` (idempotent create/replay of orders, order_items, payments, CRM)
+  if (eventType === 'central_bill_finalized') {
+    if (!resolvedBranchId || !resolvedBranchCode || !cleanBranchName) {
+      return res.status(400).json({
+        error: 'Missing required dynamic branch metadata (branch_id, branch_name, branch_code) for central_bill_finalized event.',
+      });
+    }
+    if (!smavCentralBillId) {
+      return res.status(400).json({
+        error: 'Missing central_bill_id for central_bill_finalized event.',
+      });
+    }
+    const customerObj = p.customer && typeof p.customer === 'object' ? p.customer : {};
+    const customerName = String(
+      p.customer_name || p.customerName || customerObj.name || 'Walk-in Customer'
+    ).trim();
+    const customerPhone = String(
+      p.customer_phone ||
+      p.customerPhone ||
+      p.customer_mobile ||
+      p.customerMobile ||
+      customerObj.phone ||
+      customerObj.mobile ||
+      ''
+    ).trim();
+    const customerEmail = String(p.customer_email || p.customerEmail || customerObj.email || '').trim() || undefined;
+
+    const rawItems: any[] = Array.isArray(p.items)
+      ? p.items
+      : Array.isArray(p.line_items)
+      ? p.line_items
+      : Array.isArray(p.lineItems)
+      ? p.lineItems
+      : Array.isArray(p.services)
+      ? p.services
+      : [];
+
+    const mappedItems = rawItems.map((i: any) => {
+      const qty = Math.max(1, Number(i.quantity ?? i.qty ?? 1) || 1);
+      const unitPrice = Number(i.unit_price ?? i.unitPrice ?? i.price ?? i.rate ?? 0) || 0;
+      const totalPrice = Number(i.total_price ?? i.totalPrice ?? i.amount ?? qty * unitPrice) || 0;
+      return {
+        service_id: i.service_id || i.serviceId || undefined,
+        product_id: i.product_id || i.productId || undefined,
+        item_name: String(i.item_name || i.itemName || i.service_name || i.serviceName || i.name || 'Salon Service').trim(),
+        item_type: (String(i.item_type || i.itemType || 'service').toLowerCase() === 'product' ? 'product' : 'service') as 'service' | 'product',
+        quantity: qty,
+        unit_price: unitPrice,
+        total_price: totalPrice,
+        staff_id: i.staff_id || i.staffId || i.stylist_id || i.stylistId || undefined,
+        staff_name: String(i.staff_name || i.staffName || i.stylist_name || i.stylistName || i.stylist || '').trim() || undefined,
+        commission_amount: Number(i.commission_amount ?? i.commissionAmount ?? 0) || 0,
+      };
+    });
+
+    if (mappedItems.length === 0 && (p.service_name || p.serviceName || p.stylist_name || p.stylistName)) {
+      const fallbackAmount = Number(p.grand_total ?? p.grandTotal ?? p.total_amount ?? p.totalAmount ?? p.amount ?? 0) || 0;
+      mappedItems.push({
+        service_id: undefined,
+        product_id: undefined,
+        item_name: String(p.service_name || p.serviceName || 'Salon Service').trim(),
+        item_type: 'service',
+        quantity: 1,
+        unit_price: fallbackAmount,
+        total_price: fallbackAmount,
+        staff_id: p.stylist_id || p.stylistId || undefined,
+        staff_name: String(p.stylist_name || p.stylistName || '').trim() || undefined,
+        commission_amount: 0,
+      });
+    }
+
+    const itemsSum = mappedItems.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+    const grandTotalRaw = p.grand_total ?? p.grandTotal ?? p.total_amount ?? p.totalAmount ?? p.net_amount ?? p.netAmount ?? p.amount;
+    const subtotalRaw = p.subtotal ?? p.sub_total ?? p.subTotal;
+    const discount = Math.max(0, Number(p.discount ?? p.discount_amount ?? p.discountAmount ?? 0) || 0);
+    const taxPercent = Math.max(0, Number(p.tax_percent ?? p.taxPercent ?? 0) || 0);
+    const taxAmount = Math.max(0, Number(p.tax_amount ?? p.taxAmount ?? p.gst_amount ?? p.gstAmount ?? 0) || 0);
+    const tipAmount = Math.max(0, Number(p.tip_amount ?? p.tipAmount ?? 0) || 0);
+    const subtotal = subtotalRaw !== undefined ? Math.max(0, Number(subtotalRaw) || 0) : Math.max(0, itemsSum || Number(grandTotalRaw || 0));
+    const grandTotal = grandTotalRaw !== undefined
+      ? Math.max(0, Number(grandTotalRaw) || 0)
+      : Math.max(0, subtotal - discount + taxAmount + tipAmount);
+    const paidRaw = p.paid_amount ?? p.paidAmount ?? p.amount_paid ?? p.amountPaid;
+    const paidAmount = paidRaw !== undefined ? Math.max(0, Number(paidRaw) || 0) : grandTotal;
+    const dueRaw = p.due_amount ?? p.dueAmount;
+    const dueAmount = dueRaw !== undefined ? Math.max(0, Number(dueRaw) || 0) : Math.max(0, grandTotal - paidAmount);
+    const paymentStatus = normalizeSmavPaymentStatus(p.payment_status ?? p.paymentStatus, dueAmount);
+    const primaryPaymentMode = normalizeSmavPaymentMode(
+      p.primary_payment_mode ?? p.primaryPaymentMode ?? p.payment_mode ?? p.paymentMode
+    );
+
+    const nowIso = new Date().toISOString();
+    const billedAt = normalizeIsoTimestamp(
+      p.billed_at || p.billedAt || p.bill_date || p.billDate || p.finalized_at || p.finalizedAt || p.created_at || p.createdAt,
+      nowIso
+    );
+    const finalizedAt = normalizeIsoTimestamp(p.finalized_at || p.finalizedAt || e.finalized_at || e.finalizedAt, nowIso);
+
+    try {
+      const result = await salonRepository.upsertSmavFinalizedBill({
+        event_id: eventId,
+        central_bill_number: centralBillNumber,
+        smav_central_bill_id: smavCentralBillId,
+        smav_reservation_id: String(p.reservation_id || p.reservationId || '').trim() || null,
+        smav_sale_id: String(p.sale_id || p.saleId || p.smav_sale_id || smavCentralBillId || '').trim() || null,
+        local_order_id: localOrderRef && localOrderRef !== centralBillNumber ? localOrderRef : null,
+        idempotency_key: key,
+        branch_id: resolvedBranchId,
+        branch_code: resolvedBranchCode,
+        branch_name: cleanBranchName,
+        customer_name: customerName,
+        customer_phone: customerPhone,
+        customer_email: customerEmail,
+        items: mappedItems,
+        subtotal,
+        discount,
+        tax_percent: taxPercent,
+        tax_amount: taxAmount,
+        tip_amount: tipAmount,
+        grand_total: grandTotal,
+        paid_amount: paidAmount,
+        due_amount: dueAmount,
+        payment_status: paymentStatus,
+        primary_payment_mode: primaryPaymentMode,
+        transaction_ref: String(p.transaction_ref || p.transactionRef || p.payment_reference || p.paymentReference || '').trim() || undefined,
+        cashier_name: String(p.cashier_name || p.cashierName || p.finalized_by || p.finalizedBy || 'SMAV Central').trim(),
+        notes: String(p.notes || '').trim() || `SMAV finalized bill ${centralBillNumber}`,
+        billed_at: billedAt,
+        finalized_at: finalizedAt,
+      });
+
+      // Only acknowledge after the local payment ledger record is durably committed
+      if (!result?.payment?.id) {
+        return res.status(503).json({ error: 'Local payment ledger record was not committed' });
+      }
+
+      return res.status(result.created ? 201 : 200).json({
+        accepted: true,
+        created: result.created,
+        duplicate: result.duplicate,
+        order_id: result.order.id,
+        native_order_id: result.order.id,
+        payment_id: result.payment.id,
+        payment_committed: true,
+        bill_number: result.order.bill_number,
+        branch_id: result.order.branch_id || resolvedBranchId,
+        branch_code: result.order.branch_code || resolvedBranchCode,
+        branch_name: result.order.branch_name || cleanBranchName,
+        smav_central_bill_id: result.order.smav_central_bill_id || smavCentralBillId,
+        idempotency_key: result.order.idempotency_key || key,
+      });
+    } catch (err: any) {
+      const msg = String(err?.message || err || 'Failed to commit SMAV finalized bill');
+      if (msg.includes('IMMUTABLE_BILL_NUMBER_CONFLICT')) {
+        return res.status(409).json({ error: msg });
+      }
+      console.error('❌ [SMAV central_bill_finalized] Local commit failed:', msg);
+      return res.status(503).json({ error: 'Failed to commit finalized bill to local payment ledger' });
+    }
   }
-  if (!existingLocalOrder) {
-    existingLocalOrder = await salonRepository.getOrderById(centralBillNumber);
+
+  // 2. Look up existing GlossyLooks local bill strictly by bill_number / idempotency / central bill ID
+  //    (NEVER pass bill_number into getOrderById as an order UUID!)
+  let existingLocalOrder: Order | null = await salonRepository.getOrderByBillNumber(centralBillNumber);
+  if (!existingLocalOrder && key) {
+    existingLocalOrder = await salonRepository.getOrderByIdempotencyKey(key);
+  }
+  if (!existingLocalOrder && smavCentralBillId) {
+    existingLocalOrder = await salonRepository.getOrderBySmavCentralBillId(smavCentralBillId);
+  }
+  if (!existingLocalOrder && localOrderRef && localOrderRef !== centralBillNumber) {
+    existingLocalOrder = await salonRepository.getOrderById(localOrderRef);
   }
 
   // Immutable bill number guard: never overwrite an existing order's bill_number
@@ -227,7 +499,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     });
   }
 
-  // 2. If updating an existing local bill (finalized/updated/voided/payment sync)
+  // 3. If updating an existing local bill (finalized/updated/voided/payment sync)
   if (existingLocalOrder && !['receipt', 'feedback'].includes(eventType)) {
     if (existingLocalOrder.smav_last_event_id === eventId) {
       return res.json({
@@ -242,8 +514,11 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     const updates: Partial<Order> = {
       smav_last_event_id: eventId,
       smav_last_event_at: nowIso,
+      ...(smavCentralBillId ? { smav_central_bill_id: smavCentralBillId } : {}),
       ...(p.reservation_id || p.reservationId ? { smav_reservation_id: String(p.reservation_id || p.reservationId) } : {}),
-      ...(p.sale_id || p.saleId || p.smav_sale_id ? { smav_sale_id: String(p.sale_id || p.saleId || p.smav_sale_id) } : {}),
+      ...(p.sale_id || p.saleId || p.smav_sale_id || smavCentralBillId
+        ? { smav_sale_id: String(p.sale_id || p.saleId || p.smav_sale_id || smavCentralBillId) }
+        : {}),
       ...(resolvedBranchCode && !existingLocalOrder.branch_code ? { branch_code: resolvedBranchCode } : {}),
     };
 
@@ -272,7 +547,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
         }
       }
       if (p.payment_mode || p.paymentMode) {
-        updates.primary_payment_mode = String(p.payment_mode || p.paymentMode) as Order['primary_payment_mode'];
+        updates.primary_payment_mode = normalizeSmavPaymentMode(p.payment_mode || p.paymentMode);
       }
     }
 
@@ -326,7 +601,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
       existingLocalOrder = await salonRepository.createOrder({
         bill_number: centralBillNumber,
         branch_id: resolvedBranchId,
-        branch_code: resolvedBranchCode || 'GACHI',
+        branch_code: resolvedBranchCode || undefined,
         branch_name: cleanBranchName,
         smav_reservation_id: p.reservation_id || p.reservationId || undefined,
         smav_sale_id: p.sale_id || p.saleId || undefined,
@@ -419,7 +694,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
         const native = await salonRepository.createOrder({
           bill_number: centralBillNumber,
           branch_id: branchId,
-          branch_code: resolvedBranchCode || 'GACHI',
+          branch_code: resolvedBranchCode || undefined,
           branch_name: cleanBranchName,
           smav_reservation_id: p.reservation_id || p.reservationId || undefined,
           smav_sale_id: p.sale_id || p.saleId || undefined,
@@ -486,8 +761,8 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
   try {
     const native = await salonRepository.getOrderById(targetOrderId);
     if (!native) throw new Error('Native order not found');
-    const branchIdForWa = record?.branch_id || native.branch_id || resolvedBranchId || 'tgl-gachibowli-main';
-    const branch = await salonRepository.getBranchById(branchIdForWa);
+    const branchIdForWa = record?.branch_id || native.branch_id || resolvedBranchId || (await getDefaultBranchIdFromRepo());
+    const branch = branchIdForWa ? await salonRepository.getBranchById(branchIdForWa) : null;
     const cleanBranchName = getCleanReceiptBranchName({
       branchId: branchIdForWa,
       branchCode: native.branch_code || resolvedBranchCode,
@@ -2068,8 +2343,9 @@ app.post('/api/admin/whatsapp/connect', async (req, res) => {
       const maskedPhone = maskPhoneNumber(resolvedPhone);
       const diagnosticDetail = `${submittedCode ? 'OAuth code received / ' : ''}WABA ID received / Phone Number ID received / Graph verification passed.`;
 
+      const defaultSalonId = await getDefaultBranchIdFromRepo();
       const saved = await salonRepository.updateWhatsAppIntegration({
-        salon_id: 'tgl-gachibowli-main',
+        salon_id: defaultSalonId,
         waba_id: cleanWabaId,
         phone_number_id: cleanPhoneId,
         display_name: resolvedDisplayName,
@@ -2092,8 +2368,9 @@ app.post('/api/admin/whatsapp/connect', async (req, res) => {
     } else {
       // Verification failed: store received IDs, but keep status disconnected with error explanation
       const diagnosticDetail = `${submittedCode ? 'OAuth code received / ' : ''}WABA ID received / Phone Number ID received / Graph verification failed: ${verification.error || 'Ownership mismatch'}`;
+      const defaultSalonId = await getDefaultBranchIdFromRepo();
       const saved = await salonRepository.updateWhatsAppIntegration({
-        salon_id: 'tgl-gachibowli-main',
+        salon_id: defaultSalonId,
         waba_id: cleanWabaId,
         phone_number_id: cleanPhoneId,
         display_name: resolvedDisplayName,
@@ -2334,7 +2611,10 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
   } = options;
   let integration = await salonRepository.getBranchWhatsAppIntegration(branchId);
   if (!integration || integration.status !== 'connected' || !integration.phone_number_id) {
-    const fallback = await salonRepository.getBranchWhatsAppIntegration('tgl-gachibowli-main');
+    const defaultBranchId = await getDefaultBranchIdFromRepo();
+    const fallback = defaultBranchId && defaultBranchId !== branchId
+      ? await salonRepository.getBranchWhatsAppIntegration(defaultBranchId)
+      : null;
     if (fallback && fallback.status === 'connected' && fallback.phone_number_id) {
       integration = fallback;
     }
@@ -2422,7 +2702,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
             { type: 'text', parameter_name: 'appointment_date', text: customData?.appointmentDate || new Date().toISOString().split('T')[0] },
             { type: 'text', parameter_name: 'appointment_time', text: customData?.appointmentTime || 'Scheduled Slot' },
             { type: 'text', parameter_name: 'booking_id', text: customData?.bookingId || 'GL-BKG' },
-            { type: 'text', parameter_name: 'branch_address', text: customData?.branchAddress || '31, Vinayak Nagar, Gachibowli' }
+            { type: 'text', parameter_name: 'branch_address', text: customData?.branchAddress || 'Hyderabad' }
           ]
         }
       ];
@@ -2654,9 +2934,10 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
           wa_phone_number_id: integration.phone_number_id
         });
         const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
+        const resolvedSalonId = branchId || (await getDefaultBranchIdFromRepo());
         inboxMsg = await salonRepository.createWhatsAppMessage({
-          salon_id: 'tgl-gachibowli-main',
-          branch_id: branchId || 'tgl-gachibowli-main',
+          salon_id: resolvedSalonId,
+          branch_id: resolvedSalonId,
           conversation_id: inboxConv.id,
           appointment_id: appointmentId,
           order_id: orderId,
@@ -2767,9 +3048,10 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
           wa_phone_number_id: integration.phone_number_id
         });
         const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
+        const resolvedSalonId = branchId || (await getDefaultBranchIdFromRepo());
         failedInboxMsg = await salonRepository.createWhatsAppMessage({
-          salon_id: 'tgl-gachibowli-main',
-          branch_id: branchId || 'tgl-gachibowli-main',
+          salon_id: resolvedSalonId,
+          branch_id: resolvedSalonId,
           conversation_id: inboxConv.id,
           appointment_id: appointmentId,
           order_id: orderId,
@@ -2874,7 +3156,10 @@ async function sendWhatsAppFreeformReply(
   if (!phoneNumberId) {
     let integration: any = await salonRepository.getBranchWhatsAppIntegration(branchId);
     if (!integration || !integration.phone_number_id) {
-      integration = await salonRepository.getBranchWhatsAppIntegration('tgl-gachibowli-main');
+      const defaultBranchId = await getDefaultBranchIdFromRepo();
+      if (defaultBranchId && defaultBranchId !== branchId) {
+        integration = await salonRepository.getBranchWhatsAppIntegration(defaultBranchId);
+      }
     }
     if (!integration || !integration.phone_number_id) {
       integration = await salonRepository.getWhatsAppIntegration();
@@ -2979,7 +3264,7 @@ async function checkAndRunScheduledFeedbackJobs() {
           }
 
           const result = await sendBranchWhatsAppTemplate({
-            branchId: job.branch_id || 'tgl-gachibowli-main',
+            branchId: job.branch_id || (await getDefaultBranchIdFromRepo()),
             recipientPhone: job.customer_phone,
             templateName: 'glossylooks_customer_feedback',
             appointmentId: job.appointment_id,
@@ -3056,7 +3341,7 @@ async function checkAndRunWhatsAppRetries() {
     for (const log of dueRetries) {
       const nextRetryCount = (log.retry_count || 0) + 1;
       const result = await sendBranchWhatsAppTemplate({
-        branchId: log.branch_id || 'tgl-gachibowli-main',
+        branchId: log.branch_id || (await getDefaultBranchIdFromRepo()),
         recipientPhone: log.recipient_number,
         templateName: log.template_name || 'glossylooks_customer_feedback',
         orderId: log.order_id,
@@ -3379,9 +3664,10 @@ async function generateAndSendDailySalesReports(dateStr?: string, force: boolean
       continue;
     }
 
+    const reportBranchId = (st as any).branchId || (await getDefaultBranchIdFromRepo());
     console.log(`[Daily Sales Report] Sending gl_stylist_daily_sales_report to ${st.stylistName} (${recipientE164})...`);
     const sendResult = await sendBranchWhatsAppTemplate({
-      branchId: 'tgl-gachibowli-main',
+      branchId: reportBranchId,
       recipientPhone: recipientE164,
       templateName: 'gl_stylist_daily_sales_report',
       jobType: 'stylist_sales_report',
@@ -3407,7 +3693,7 @@ async function generateAndSendDailySalesReports(dateStr?: string, force: boolean
       recipient_name: st.stylistName,
       stylist_id: st.stylistId,
       stylist_name: st.stylistName,
-      branch_id: 'tgl-gachibowli-main',
+      branch_id: reportBranchId,
       bills_count: billsCount,
       services_count: servicesCount,
       total_sales: totalSales,
@@ -3478,9 +3764,10 @@ async function generateAndSendDailySalesReports(dateStr?: string, force: boolean
           message: 'Already sent today (use force to resend)'
         });
       } else {
+        const ownerReportBranchId = await getDefaultBranchIdFromRepo();
         console.log(`[Daily Sales Report] Sending gl_owner_daily_sales_summary to owner ${summary.owner.name} (${ownerE164})...`);
         const ownerSendResult = await sendBranchWhatsAppTemplate({
-          branchId: 'tgl-gachibowli-main',
+          branchId: ownerReportBranchId,
           recipientPhone: ownerE164,
           templateName: 'gl_owner_daily_sales_summary',
           jobType: 'owner_sales_summary',
@@ -3505,7 +3792,7 @@ async function generateAndSendDailySalesReports(dateStr?: string, force: boolean
           recipient_type: 'owner' as const,
           recipient_phone: ownerE164,
           recipient_name: summary.owner.name,
-          branch_id: 'tgl-gachibowli-main',
+          branch_id: ownerReportBranchId,
           bills_count: summary.totalBills,
           services_count: summary.totalServices,
           total_sales: summary.totalSales,
@@ -3896,7 +4183,7 @@ async function handleMetaWebhookEvent(req: express.Request, res: express.Respons
               } catch {}
 
               inboxConversation = await salonRepository.getOrCreateWhatsAppConversation({
-                branch_id: matchedOrderForBranch?.branch_id || 'tgl-gachibowli-main',
+                branch_id: matchedOrderForBranch?.branch_id || (await getDefaultBranchIdFromRepo()),
                 customer_id: matchedCustomer?.id,
                 customer_phone: `+91${fromPhone}`,
                 customer_name: matchedCustomer?.name || matchedOrderForBranch?.customer_name || 'WhatsApp Customer',
@@ -4112,7 +4399,7 @@ async function handleMetaWebhookEvent(req: express.Request, res: express.Respons
 
             const targetOrderId = pendingOrder?.id || pendingFeedbackLog?.order_id;
             const targetAptId = pendingOrder?.appointment_id || pendingFeedbackLog?.appointment_id;
-            const branchId = pendingOrder?.branch_id || pendingFeedbackLog?.branch_id || 'tgl-gachibowli-main';
+            const branchId = pendingOrder?.branch_id || pendingFeedbackLog?.branch_id || (await getDefaultBranchIdFromRepo());
             const customerName = pendingOrder?.customer_name || pendingFeedbackLog?.customer_name || 'Valued Customer';
 
             // Idempotency: verify this specific message ID has not already been replied to
@@ -4283,7 +4570,19 @@ async function resolveStaffAssignedBranchId(admin: { id: string; user_id?: strin
   } catch {
     // Fallback to flagship branch
   }
-  return 'tgl-gachibowli-main';
+  return getDefaultBranchIdFromRepo();
+}
+
+async function getDefaultBranchIdFromRepo(): Promise<string> {
+  const envBranch = (process.env.SMAV_SALON_DEFAULT_BRANCH_ID || '').trim();
+  if (envBranch) return envBranch;
+  try {
+    const branches = await salonRepository.getBranches();
+    const active = branches.find(b => b.is_active !== false) || branches[0];
+    return active?.id || '';
+  } catch {
+    return '';
+  }
 }
 
 async function fetchApprovedWabaTemplates(branchId?: string): Promise<{
@@ -4299,10 +4598,13 @@ async function fetchApprovedWabaTemplates(branchId?: string): Promise<{
 }> {
   try {
     const integration = await salonRepository.getWhatsAppIntegration();
-    const effectiveBranchId = branchId || 'tgl-gachibowli-main';
-    const branchIntegration = await salonRepository.getBranchWhatsAppIntegration(effectiveBranchId);
-    const fallbackBranchIntegration = effectiveBranchId !== 'tgl-gachibowli-main'
-      ? await salonRepository.getBranchWhatsAppIntegration('tgl-gachibowli-main')
+    const defaultBranchId = await getDefaultBranchIdFromRepo();
+    const effectiveBranchId = branchId || defaultBranchId;
+    const branchIntegration = effectiveBranchId
+      ? await salonRepository.getBranchWhatsAppIntegration(effectiveBranchId)
+      : null;
+    const fallbackBranchIntegration = defaultBranchId && effectiveBranchId !== defaultBranchId
+      ? await salonRepository.getBranchWhatsAppIntegration(defaultBranchId)
       : null;
     const wabaId =
       branchIntegration?.waba_id ||
@@ -4355,7 +4657,7 @@ function buildRecordTemplateVariables(
   branch: any
 ): Record<string, string> {
   const branchName = branch?.name || 'The Glossy Looks Salon';
-  const branchAddress = branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad';
+  const branchAddress = branch?.address || 'Hyderabad';
 
   if (recordType === 'appointment') {
     const serviceNames = Array.isArray(record.services) && record.services.length > 0
@@ -4486,7 +4788,7 @@ app.get('/api/admin/whatsapp/message-logs', async (req, res) => {
         !order ||
         order.deleted_at ||
         !isWithinKolkataToday(order.created_at) ||
-        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+        (order.branch_id || '') !== staffBranch
       ) {
         return res.status(403).json({ error: 'Access denied: Staff may only view WhatsApp logs for today\'s bills in their assigned branch.' });
       }
@@ -4585,7 +4887,7 @@ app.get('/api/admin/whatsapp/record-context', async (req, res) => {
     const staffBranch = await resolveStaffAssignedBranchId(admin);
 
     let record: any = null;
-    let branchId = 'tgl-gachibowli-main';
+    let branchId = await getDefaultBranchIdFromRepo();
     let customerName = '';
     let customerPhone = '';
     let appointmentId: string | undefined;
@@ -4597,7 +4899,7 @@ app.get('/api/admin/whatsapp/record-context', async (req, res) => {
       if (record.deleted_at && !canDeleteOrRestoreRecords(admin.role)) {
         return res.status(403).json({ error: 'Access denied: Cannot access soft-deleted appointment.' });
       }
-      branchId = record.branch_id || 'tgl-gachibowli-main';
+      branchId = record.branch_id || branchId;
       if (!fullAccess && admin.branch_id && branchId !== staffBranch) {
         return res.status(403).json({ error: 'Access denied: Appointment belongs to another branch.' });
       }
@@ -4615,7 +4917,7 @@ app.get('/api/admin/whatsapp/record-context', async (req, res) => {
         }
       }
       if (!record) return res.status(404).json({ error: 'Bill / order not found.' });
-      branchId = record.branch_id || 'tgl-gachibowli-main';
+      branchId = record.branch_id || branchId;
 
       if (!fullAccess) {
         if (record.deleted_at) {
@@ -4633,14 +4935,14 @@ app.get('/api/admin/whatsapp/record-context', async (req, res) => {
       orderId = record.id;
     }
 
-    const branch = await salonRepository.getBranchById(branchId);
+    const branch = branchId ? await salonRepository.getBranchById(branchId) : null;
     const phoneValidation = validateWhatsAppPhone(customerPhone);
 
     // Check 24-hour customer service window from permanent WhatsApp Inbox conversation
     let conversation: WhatsAppConversation | null = null;
     if (phoneValidation.isValid) {
       const convs = await salonRepository.getWhatsAppConversations({
-        salonId: 'tgl-gachibowli-main',
+        salonId: branchId || undefined,
         search: phoneValidation.digits
       });
       conversation = convs.find(c => {
@@ -4747,7 +5049,7 @@ app.post('/api/admin/whatsapp/send-record-template', async (req, res) => {
     const staffBranch = await resolveStaffAssignedBranchId(admin);
 
     let record: any = null;
-    let branchId = 'tgl-gachibowli-main';
+    let branchId = await getDefaultBranchIdFromRepo();
     let appointmentId: string | undefined;
     let orderId: string | undefined;
     let billNumber: string | undefined;
@@ -4759,7 +5061,7 @@ app.post('/api/admin/whatsapp/send-record-template', async (req, res) => {
       if (record.deleted_at) {
         return res.status(400).json({ error: 'Cannot send WhatsApp template for a deleted appointment. Restore it first.' });
       }
-      branchId = record.branch_id || 'tgl-gachibowli-main';
+      branchId = record.branch_id || branchId;
       if (!fullAccess && admin.branch_id && branchId !== staffBranch) {
         return res.status(403).json({ error: 'Access denied: Appointment belongs to another branch.' });
       }
@@ -4778,7 +5080,7 @@ app.post('/api/admin/whatsapp/send-record-template', async (req, res) => {
       if (record.deleted_at) {
         return res.status(400).json({ error: 'Cannot send WhatsApp template for a deleted bill. Restore it first.' });
       }
-      branchId = record.branch_id || 'tgl-gachibowli-main';
+      branchId = record.branch_id || branchId;
 
       if (!fullAccess) {
         if (!isWithinKolkataToday(record.created_at)) {
@@ -4846,7 +5148,7 @@ app.post('/api/admin/whatsapp/send-record-template', async (req, res) => {
     const customData: SendWhatsAppTemplateOptions['customData'] = {
       customerName: mergedVars.customer_name || record.customer_name,
       branchName: mergedVars.branch_name || branch?.name || 'The Glossy Looks Salon',
-      branchAddress: mergedVars.branch_address || branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad',
+      branchAddress: mergedVars.branch_address || branch?.address || 'Hyderabad',
       serviceNames: mergedVars.service_name,
       appointmentDate: mergedVars.appointment_date,
       appointmentTime: mergedVars.appointment_time,
@@ -4983,8 +5285,8 @@ app.post('/api/admin/whatsapp/test-send', async (req, res) => {
       return res.status(400).json({ error: 'Recipient mobile number and template name are required.' });
     }
 
-    const branchId = branch_id || 'tgl-gachibowli-main';
-    const branch = await salonRepository.getBranchById(branchId);
+    const branchId = branch_id || (await getDefaultBranchIdFromRepo());
+    const branch = branchId ? await salonRepository.getBranchById(branchId) : null;
 
     let components: any[] | undefined = undefined;
     if (template_name === 'gl_appointment_confirmation') {
@@ -4993,12 +5295,12 @@ app.post('/api/admin/whatsapp/test-send', async (req, res) => {
           type: 'body',
           parameters: [
             { type: 'text', parameter_name: 'customer_name', text: 'Test Recipient' },
-            { type: 'text', parameter_name: 'branch_name', text: branch?.name || 'Gachibowli Main Flagship' },
+            { type: 'text', parameter_name: 'branch_name', text: branch?.name || 'The Glossy Looks Salon' },
             { type: 'text', parameter_name: 'service_name', text: 'Bridal Trial Consultation' },
             { type: 'text', parameter_name: 'appointment_date', text: new Date().toISOString().split('T')[0] },
             { type: 'text', parameter_name: 'appointment_time', text: '11:00 AM' },
             { type: 'text', parameter_name: 'booking_id', text: 'TEST-BKG01' },
-            { type: 'text', parameter_name: 'branch_address', text: branch?.address || '31, Vinayak Nagar, Gachibowli' }
+            { type: 'text', parameter_name: 'branch_address', text: branch?.address || 'Hyderabad' }
           ]
         }
       ];
@@ -5053,7 +5355,7 @@ app.post('/api/webhook/simulate-feedback-reply', async (req, res) => {
       : allApts[0];
 
     const aptId = targetApt ? targetApt.id : `apt-${cleanPhone}`;
-    const branchId = targetApt?.branch_id || 'tgl-gachibowli-main';
+    const branchId = targetApt?.branch_id || (await getDefaultBranchIdFromRepo());
     const customerName = targetApt?.customer_name || 'Simulated Customer';
 
     // Idempotency check: only first valid response
@@ -5285,7 +5587,7 @@ app.post('/api/admin/whatsapp/inbox/conversations/:id/messages', async (req, res
       });
     }
 
-    const branchId = conv.branch_id || 'tgl-gachibowli-main';
+    const branchId = conv.branch_id || (await getDefaultBranchIdFromRepo());
     const cleanPhone = phoneDigits(conv.customer_phone).slice(-10);
 
     // Call existing sendWhatsAppFreeformReply
@@ -5360,7 +5662,7 @@ app.post('/api/admin/whatsapp/inbox/conversations/:id/send-template', async (req
       return res.status(404).json({ error: 'Conversation not found.' });
     }
 
-    const branchId = conv.branch_id || 'tgl-gachibowli-main';
+    const branchId = conv.branch_id || (await getDefaultBranchIdFromRepo());
     const sendResult = await sendBranchWhatsAppTemplate({
       branchId,
       recipientPhone: conv.customer_phone,
@@ -5506,7 +5808,7 @@ async function checkBranchAccess(req: express.Request, branchId: string): Promis
   return { authorized: true, admin, branch };
 }
 
-// Public / Operational endpoint for branches (enriched with canonical SMAV branch codes: GACHI / KONDA)
+// Public / Operational endpoint for branches (loaded dynamically from public.salon_branches)
 app.get('/api/branches', async (req, res) => {
   try {
     const allBranches = await salonRepository.getBranches();
@@ -5520,7 +5822,7 @@ app.get('/api/branches', async (req, res) => {
   }
 });
 
-// POS Permitted Branches loaded from SMAV for central bill numbering (Gachibowli = GACHI, Kondapur = KONDA)
+// POS Permitted Branches loaded dynamically from SMAV branch API (source of truth; zero hard-coded fallbacks)
 app.get('/api/pos/branches', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
@@ -5534,19 +5836,12 @@ app.get('/api/pos/branches', async (req, res) => {
       localBranches,
     });
 
-    // If user is branch-restricted staff/manager and SMAV fell back locally, honor assigned branch if present
-    let permitted = smavResult.branches;
-    if (smavResult.source === 'local_fallback' && !hasFullPaymentLedgerAccess(admin.role) && admin.branch_id) {
-      const assigned = permitted.filter(b => b.id === admin.branch_id || b.local_branch_id === admin.branch_id);
-      if (assigned.length > 0) {
-        permitted = assigned;
-      }
-    }
-
     return res.json({
-      branches: permitted,
+      branches: smavResult.branches,
+      all_branches: smavResult.allBranches,
       source: smavResult.source,
       warning: smavResult.warning || null,
+      error: smavResult.error || null,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -6185,7 +6480,7 @@ app.post('/api/appointments', async (req, res) => {
       return res.status(400).json({ error: 'Missing required booking fields' });
     }
 
-    const effectiveBranchId = branch_id || 'tgl-gachibowli-main';
+    const effectiveBranchId = branch_id || (await getDefaultBranchIdFromRepo());
     const total_amount = services.reduce((sum: number, s: any) => sum + (s.price || 0), 0);
     const newApt = await salonRepository.createAppointment({
       customer_name,
@@ -6218,9 +6513,9 @@ app.post('/api/appointments', async (req, res) => {
     }
 
     // Get branch details for address and name
-    const branch = await salonRepository.getBranchById(effectiveBranchId);
+    const branch = effectiveBranchId ? await salonRepository.getBranchById(effectiveBranchId) : null;
     const branchName = branch?.name || 'The Glossy Looks Salon';
-    const branchAddress = branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad';
+    const branchAddress = branch?.address || 'Hyderabad';
     const serviceNames = (services || []).map((s: any) => s.name).join(', ') || 'Salon Service';
 
     // Send real gl_appointment_confirmation template via branch WhatsApp connection
@@ -6283,7 +6578,7 @@ app.post('/api/admin/appointments/:id/whatsapp/confirm', async (req, res) => {
       return res.status(404).json({ error: 'Appointment not found.' });
     }
 
-    const effectiveBranchId = apt.branch_id || 'tgl-gachibowli-main';
+    const effectiveBranchId = apt.branch_id || (await getDefaultBranchIdFromRepo());
 
     // If manager, ensure they are assigned to this branch
     if (admin.role === 'manager') {
@@ -6310,9 +6605,9 @@ app.post('/api/admin/appointments/:id/whatsapp/confirm', async (req, res) => {
       }
     }
 
-    const branch = await salonRepository.getBranchById(effectiveBranchId);
+    const branch = effectiveBranchId ? await salonRepository.getBranchById(effectiveBranchId) : null;
     const branchName = branch?.name || 'The Glossy Looks Salon';
-    const branchAddress = branch?.address || '31, Vinayak Nagar, Gachibowli, Hyderabad';
+    const branchAddress = branch?.address || 'Hyderabad';
     const serviceNames = (apt.services || []).map((s: any) => s.name).join(', ') || 'Salon Service';
 
     const waResult = await sendBranchWhatsAppTemplate({
@@ -6374,7 +6669,7 @@ app.patch('/api/appointments/:id', async (req, res) => {
         const scheduledTime = getFeedbackScheduledTime();
         await salonRepository.createScheduledFeedbackJob({
           appointment_id: apt.id,
-          branch_id: apt.branch_id || 'tgl-gachibowli-main',
+          branch_id: apt.branch_id || (await getDefaultBranchIdFromRepo()),
           customer_name: apt.customer_name,
           customer_phone: apt.customer_phone,
           scheduled_at: scheduledTime,
@@ -6577,12 +6872,13 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    // 1. Require explicit Branch selection (Gachibowli = GACHI, Kondapur = KONDA) before bill generation
+    // 1. Require explicit active Branch selection loaded dynamically from SMAV before bill generation
     const requestedBranchId = String(branch_id || '').trim();
     const requestedBranchCode = String(branch_code || '').trim().toUpperCase();
+    const requestedBranchName = String(req.body?.branch_name || '').trim();
     if (!requestedBranchId && !requestedBranchCode) {
       return res.status(400).json({
-        error: 'Branch selection is required before bill generation (Gachibowli / GACHI or Kondapur / KONDA).'
+        error: 'Branch selection is required before bill generation.'
       });
     }
 
@@ -6596,15 +6892,23 @@ app.post('/api/orders', async (req, res) => {
         : undefined) ||
       null;
 
+    // Reject inactive/disabled local branches for new bills (historical bills remain viewable in ledger)
+    if (matchedLocalBranch && matchedLocalBranch.is_active === false) {
+      return res.status(400).json({
+        error: `Branch ${matchedLocalBranch.name} is disabled and cannot be used for new bills.`
+      });
+    }
+
     const canonicalBranchCode = resolveCanonicalBranchCode({
       branchCode: requestedBranchCode || undefined,
       branchId: requestedBranchId || undefined,
+      branchName: requestedBranchName || undefined,
       localBranch: matchedLocalBranch,
     });
 
     if (!canonicalBranchCode) {
       return res.status(400).json({
-        error: 'Unrecognized salon branch. Please select a valid branch (Gachibowli = GACHI or Kondapur = KONDA).'
+        error: 'Unrecognized salon branch. Please select an active permitted branch from SMAV.'
       });
     }
 
@@ -6615,13 +6919,18 @@ app.post('/api/orders', async (req, res) => {
     const cleanBranchName = getCleanReceiptBranchName({
       branchId: effectiveBranchId,
       branchCode: canonicalBranchCode,
+      branchName: requestedBranchName || undefined,
       localBranch: matchedLocalBranch,
     });
 
     // Verify staff branch permission when authenticated as non-owner/admin
     if (authAdmin && !hasFullPaymentLedgerAccess(authAdmin.role) && authAdmin.branch_id) {
-      const assignedCode = resolveCanonicalBranchCode({ branchId: authAdmin.branch_id });
-      if (effectiveBranchId !== authAdmin.branch_id && assignedCode && assignedCode !== canonicalBranchCode) {
+      const staffLocalBranch = localBranches.find(b => b.id === authAdmin.branch_id) || null;
+      const assignedCode = resolveCanonicalBranchCode({
+        branchId: authAdmin.branch_id,
+        localBranch: staffLocalBranch,
+      });
+      if (effectiveBranchId !== authAdmin.branch_id && (!assignedCode || assignedCode !== canonicalBranchCode)) {
         return res.status(403).json({
           error: `Access denied: Your account is not permitted to generate bills for branch ${cleanBranchName} (${canonicalBranchCode}).`
         });
@@ -6922,12 +7231,12 @@ app.post('/api/orders/:id/retry-smav-finalize', async (req, res) => {
       return res.json({ success: true, already_finalized: true, order });
     }
 
-    const branchCode = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || 'GACHI';
+    const branchCode = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || '';
     const branchName = order.branch_name || getCleanReceiptBranchName({ branchId: order.branch_id, branchCode });
     const result = await finalizeSmavCentralBillNumber({
       reservationId: order.smav_reservation_id,
       billNumber: order.bill_number,
-      branchId: order.branch_id || 'tgl-gachibowli-main',
+      branchId: order.branch_id || '',
       branchCode,
       branchName,
       localOrderId: order.id,
@@ -6985,7 +7294,7 @@ app.get('/api/orders/:id', async (req, res) => {
       if (
         order.deleted_at ||
         !isWithinKolkataToday(order.created_at) ||
-        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+        (order.branch_id || '') !== staffBranch
       ) {
         return res.status(403).json({
           error: 'Access denied: Staff may only view today\'s Payment Ledger bills for their assigned branch (Asia/Kolkata).'
@@ -7154,7 +7463,7 @@ app.get('/api/admin/orders/:id/whatsapp/status', async (req, res) => {
       if (
         order.deleted_at ||
         !isWithinKolkataToday(order.created_at) ||
-        (order.branch_id || 'tgl-gachibowli-main') !== staffBranch
+        (order.branch_id || '') !== staffBranch
       ) {
         return res.status(403).json({ error: 'Access denied for this bill.' });
       }
@@ -7191,7 +7500,7 @@ app.post('/api/admin/orders/:id/whatsapp/feedback', async (req, res) => {
 
     if (!hasFullPaymentLedgerAccess(admin.role)) {
       const staffBranch = await resolveStaffAssignedBranchId(admin);
-      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || 'tgl-gachibowli-main') !== staffBranch) {
+      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || '') !== staffBranch) {
         return res.status(403).json({ error: 'Access denied: staff may only send WhatsApp templates for today\'s bills in their assigned branch.' });
       }
     }
@@ -7217,7 +7526,7 @@ app.post('/api/admin/orders/:id/whatsapp/feedback', async (req, res) => {
     });
 
     const result = await sendBranchWhatsAppTemplate({
-      branchId: order.branch_id || 'tgl-gachibowli-main',
+      branchId: order.branch_id || (await getDefaultBranchIdFromRepo()),
       recipientPhone: order.customer_phone,
       templateName: 'glossylooks_customer_feedback',
       orderId: order.id,
@@ -7288,7 +7597,7 @@ app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
 
     if (!hasFullPaymentLedgerAccess(admin.role)) {
       const staffBranch = await resolveStaffAssignedBranchId(admin);
-      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || 'tgl-gachibowli-main') !== staffBranch) {
+      if (!isWithinKolkataToday(order.created_at) || (order.branch_id || '') !== staffBranch) {
         return res.status(403).json({ error: 'Access denied: staff may only retry WhatsApp templates for today\'s bills in their assigned branch.' });
       }
     }
@@ -7303,8 +7612,8 @@ app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
       });
     }
 
-    const branchId = order.branch_id || 'tgl-gachibowli-main';
-    const branch = await salonRepository.getBranchById(branchId);
+    const branchId = order.branch_id || (await getDefaultBranchIdFromRepo());
+    const branch = branchId ? await salonRepository.getBranchById(branchId) : null;
     const branchName = branch?.name || 'The Glossy Looks';
 
     if (jobType === 'bill_receipt') {
@@ -7483,13 +7792,14 @@ app.get('/api/payments/export', async (req, res) => {
     const filtered = modeFilter ? payments.filter(p => p.payment_mode === modeFilter) : payments;
 
     const escapeCsv = (val: any) => `"${String(val ?? '').replace(/"/g, '""')}"`;
-    const header = ['Bill Number', 'Date & Time (IST)', 'Customer Name', 'Customer Phone', 'Branch ID', 'Payment Mode', 'Amount (INR)', 'Status', 'Order ID'];
+    const header = ['Bill Number', 'Date & Time (IST)', 'Customer Name', 'Customer Phone', 'Branch', 'Branch ID', 'Payment Mode', 'Amount (INR)', 'Status', 'Order ID'];
     const rows = filtered.map(p => [
       p.bill_number,
       new Date(p.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
       p.customer_name,
       p.customer_phone || '',
-      p.branch_id || 'tgl-gachibowli-main',
+      p.branch_name ? `${p.branch_name}${p.branch_code ? ` (${p.branch_code})` : ''}` : (p.branch_code || ''),
+      p.branch_id || '',
       p.payment_mode,
       p.amount,
       p.status,
@@ -7952,7 +8262,7 @@ app.post('/api/print-jobs/reprint', async (req, res) => {
     const order = await salonRepository.getOrderById(order_id);
     if (order) {
       cleanPayload.bill_number = order.bill_number;
-      cleanPayload.branch_code = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || 'GACHI';
+      cleanPayload.branch_code = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || undefined;
       cleanPayload.branch_name = order.branch_name || getCleanReceiptBranchName({
         branchId: order.branch_id,
         branchCode: cleanPayload.branch_code,
@@ -8031,7 +8341,7 @@ app.post('/api/enquiries', async (req, res) => {
         } catch {}
 
         const conv = await salonRepository.getOrCreateWhatsAppConversation({
-          branch_id: req.body.branch_id || (enq as any).branch_id || 'tgl-gachibowli-main',
+          branch_id: req.body.branch_id || (enq as any).branch_id || (await getDefaultBranchIdFromRepo()),
           customer_id: matchedCustomer?.id,
           customer_phone: formattedPhone,
           customer_name: req.body.name || matchedCustomer?.name || 'Website Visitor',

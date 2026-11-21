@@ -320,31 +320,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [settings, setSettings] = useState<SalonSettings | null>(null);
   const [reports, setReports] = useState<any>(null);
-  const defaultBranchFallback: SalonBranch = {
-    id: 'tgl-gachibowli-main',
-    name: 'Gachibowli Main Flagship',
-    code: 'GCB-01',
-    address: '31, Vinayak Nagar, Gachibowli',
-    city: 'Hyderabad, Telangana - 500032',
-    phone: '8985799459',
-    whatsapp_number: '8985799459',
-    is_active: true,
-    created_at: '2026-01-01T10:00:00Z',
-    updated_at: '2026-10-31T09:09:41.008Z'
-  };
-  const defaultKondapurBranch: SalonBranch = {
-    id: 'brn-1793346038689',
-    name: 'Kondapur Branch',
-    code: 'KND-02',
-    address: 'Road No 2, Kondapur',
-    city: 'Hyderabad, Telangana - 500084',
-    phone: '9491914422',
-    whatsapp_number: '9491914422',
-    is_active: true,
-    created_at: '2026-10-30T07:40:38.689Z',
-    updated_at: '2026-10-30T07:40:38.689Z'
-  };
-  const [branches, setBranches] = useState<SalonBranch[]>([defaultBranchFallback, defaultKondapurBranch]);
+  const [branches, setBranches] = useState<SalonBranch[]>([]);
+  const [allHistoricalBranches, setAllHistoricalBranches] = useState<SalonBranch[]>([]);
 
   // Detailed Sales Report & Date Range Filters
   const [detailedReports, setDetailedReports] = useState<DetailedSalesReport | null>(null);
@@ -408,10 +385,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     name: string;
     full_name: string;
     is_active: boolean;
-    source: 'smav' | 'local';
+    is_authorized?: boolean;
+    source: 'smav';
   }>>([]);
-  const [posBranchesSource, setPosBranchesSource] = useState<'smav' | 'local_fallback' | 'loading'>('loading');
+  const [posBranchesSource, setPosBranchesSource] = useState<'smav' | 'smav_error' | 'loading' | 'error'>('loading');
   const [posBranchesWarning, setPosBranchesWarning] = useState<string | null>(null);
+  const [posBranchesError, setPosBranchesError] = useState<string | null>(null);
   const [retryingSmavFinalize, setRetryingSmavFinalize] = useState(false);
   const [posNotes, setPosNotes] = useState('');
   const [posSuccessOrder, setPosSuccessOrder] = useState<Order | null>(null);
@@ -670,44 +649,78 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       setPackages(pkgsData);
       setGallery(galleryData);
       setSettings(settingsData);
-      const activeBranches = (branchesData || []).filter(branch => branch.is_active !== false);
-      const hasKondapur = activeBranches.some(b => b.id === 'brn-1793346038689' || b.name.toLowerCase().includes('kondapur'));
-      const finalBranches = activeBranches.length > 0 
-        ? (hasKondapur ? activeBranches : [...activeBranches, defaultKondapurBranch])
-        : [defaultBranchFallback, defaultKondapurBranch];
-      setBranches(finalBranches);
+      const rawLocalBranches = Array.isArray(branchesData) ? branchesData : [];
+      const activeLocalBranches = rawLocalBranches.filter(branch => branch.is_active !== false);
+      setBranches(activeLocalBranches);
+      setAllHistoricalBranches(rawLocalBranches);
 
-      // Load permitted POS branches directly from SMAV (Gachibowli = GACHI, Kondapur = KONDA)
+      // Load permitted POS branches strictly and dynamically from SMAV via GET /api/pos/branches
       try {
         const smavBranchesRes = await api.getPosPermittedBranches();
-        const permittedList = smavBranchesRes.branches || [];
+        const seenIds = new Set<string>();
+        const seenCodes = new Set<string>();
+        const permittedList = (smavBranchesRes.branches || []).filter(b => {
+          if (b.is_active === false || b.is_authorized === false) return false;
+          const idKey = String(b.id || '').trim().toLowerCase();
+          const codeKey = String(b.smav_branch_code || b.code || '').trim().toUpperCase();
+          if (!idKey || !codeKey) return false;
+          if (seenIds.has(idKey) || seenCodes.has(codeKey)) return false;
+          seenIds.add(idKey);
+          seenCodes.add(codeKey);
+          return true;
+        });
+
         setPosPermittedBranches(permittedList);
         setPosBranchesSource(smavBranchesRes.source);
         setPosBranchesWarning(smavBranchesRes.warning || null);
-        // Auto-select ONLY if user is restricted to a single permitted branch; otherwise require explicit selection
+        setPosBranchesError(smavBranchesRes.error || null);
+
+        // Merge any SMAV branches (including inactive/future branches) into historical branch directory
+        const smavAll = Array.isArray(smavBranchesRes.all_branches) && smavBranchesRes.all_branches.length > 0
+          ? smavBranchesRes.all_branches
+          : permittedList;
+        if (smavAll.length > 0) {
+          setAllHistoricalBranches(prev => {
+            const merged = new Map<string, SalonBranch>();
+            for (const b of prev) {
+              merged.set(b.id, b);
+            }
+            for (const sb of smavAll) {
+              const existing = merged.get(sb.id);
+              merged.set(sb.id, {
+                id: sb.id,
+                name: sb.name || existing?.name || sb.id,
+                code: sb.smav_branch_code || sb.code || existing?.code || '',
+                smav_branch_code: sb.smav_branch_code || existing?.smav_branch_code,
+                address: existing?.address || '',
+                city: existing?.city || '',
+                phone: existing?.phone || '',
+                whatsapp_number: existing?.whatsapp_number || '',
+                is_active: sb.is_active !== false,
+                created_at: existing?.created_at || new Date().toISOString(),
+                updated_at: existing?.updated_at || new Date().toISOString(),
+              });
+            }
+            return Array.from(merged.values());
+          });
+        }
+
+        // POS Selection Rules:
+        // - 1 active authorized branch -> auto-select
+        // - >1 active authorized branches -> require explicit user selection (do not auto-select)
+        // - 0 active authorized branches -> block billing with clear error
         setPosBranchId(prev => {
-          if (prev && permittedList.some(b => b.id === prev)) return prev;
-          return permittedList.length === 1 ? permittedList[0].id : '';
+          if (permittedList.length === 1) return permittedList[0].id;
+          if (permittedList.length > 1 && prev && permittedList.some(b => b.id === prev)) return prev;
+          return '';
         });
-      } catch (branchErr) {
-        console.warn('Could not load permitted POS branches from SMAV:', branchErr);
-        const fallbackPermitted = finalBranches.map(b => {
-          const isKonda = b.id === 'brn-1793346038689' || b.name.toLowerCase().includes('kondapur') || b.smav_branch_code === 'KONDA';
-          return {
-            id: b.id,
-            local_branch_id: b.id,
-            code: b.smav_branch_code || (isKonda ? 'KONDA' : 'GACHI'),
-            smav_branch_code: b.smav_branch_code || (isKonda ? 'KONDA' : 'GACHI'),
-            name: isKonda ? 'Kondapur' : 'Gachibowli',
-            full_name: b.name,
-            is_active: true,
-            source: 'local' as const,
-          };
-        });
-        setPosPermittedBranches(fallbackPermitted);
-        setPosBranchesSource('local_fallback');
-        setPosBranchesWarning('Could not reach SMAV permitted branches endpoint.');
-        setPosBranchId(prev => (prev && fallbackPermitted.some(b => b.id === prev) ? prev : ''));
+      } catch (branchErr: any) {
+        console.warn('Could not load permitted POS branches from /api/pos/branches:', branchErr);
+        setPosPermittedBranches([]);
+        setPosBranchesSource('error');
+        setPosBranchesWarning(null);
+        setPosBranchesError(branchErr?.message || 'Unable to load authorized branches from SMAV. Billing is blocked until branches are available.');
+        setPosBranchId('');
       }
 
       // Role-gated fetches: Users & Audit logs ONLY for Owner
@@ -957,9 +970,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     e.preventDefault();
     if (posCheckoutAction.isLoading) return;
 
-    const selectedPermittedBranch = posPermittedBranches.find(b => b.id === posBranchId);
+    if (posPermittedBranches.length === 0) {
+      toast.error(posBranchesError || posBranchesWarning || 'No active authorized branch is available for billing. Please contact your administrator.');
+      return;
+    }
+
+    const selectedPermittedBranch = posPermittedBranches.find(b => b.id === posBranchId && b.is_active !== false);
     if (!posBranchId || !selectedPermittedBranch) {
-      toast.warning('Please select a permitted Salon Branch (Gachibowli / GACHI or Kondapur / KONDA) before generating a bill.');
+      toast.warning('Please select an active permitted Salon Branch before generating a bill.');
       posBranchRef.current?.focus();
       posBranchRef.current?.reportValidity();
       return;
@@ -1019,6 +1037,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           customer_phone: posCustomerPhone,
           branch_id: selectedPermittedBranch.id,
           branch_code: selectedPermittedBranch.smav_branch_code,
+          branch_name: selectedPermittedBranch.name,
           items,
           subtotal,
           discount: posDiscount,
@@ -2026,7 +2045,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   : activeTab.replace('_', ' ')}
               </h1>
               <p className="text-xs text-slate-500 hidden sm:block">
-                The Glossy Looks · 31, Vinayak Nagar, Gachibowli, Hyderabad {settings?.phone ? `· Ph: ${settings.phone}` : ''}
+                The Glossy Looks · {settings?.address || 'Hyderabad'} {settings?.phone ? `· Ph: ${settings.phone}` : ''}
               </p>
             </div>
           </div>
@@ -2347,7 +2366,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                           {filteredCustomers.map(c => {
-                            const branchName = branches.find(b => b.id === c.branch_id)?.name || c.branch_name || (c.branch_id === 'brn-1793346038689' ? 'Kondapur' : 'Gachibowli Main');
+                            const branchName = allHistoricalBranches.find(b => b.id === c.branch_id)?.name || branches.find(b => b.id === c.branch_id)?.name || c.branch_name || c.branch_id || 'Unassigned';
                             const firstVisitDisplay = c.first_visit_at ? formatKolkataDateTime(c.first_visit_at) : (c.created_at ? formatKolkataDateTime(c.created_at) : '—');
                             const lastVisitDisplay = c.last_visit_at ? formatKolkataDateTime(c.last_visit_at) : (c.updated_at ? formatKolkataDateTime(c.updated_at) : '—');
                             const rating = (c.feedback_rating || '').toLowerCase();
@@ -2496,7 +2515,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             const sourceAppointments = viewingDeletedApts ? deletedAppointments : appointments;
             const filteredAppointments = sourceAppointments.filter(apt => {
               if (appointmentBranchFilter === 'all') return true;
-              return (apt.branch_id || 'tgl-gachibowli-main') === appointmentBranchFilter;
+              return (apt.branch_id || '') === appointmentBranchFilter;
             });
 
             return (
@@ -2548,11 +2567,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       className="px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 outline-none focus:ring-2 focus:ring-[#5B132B]/20 font-medium cursor-pointer shadow-xs"
                     >
                       <option value="all">All Branches ({sourceAppointments.length})</option>
-                      {branches.map(b => {
-                        const count = sourceAppointments.filter(a => (a.branch_id || 'tgl-gachibowli-main') === b.id).length;
+                      {(allHistoricalBranches.length > 0 ? allHistoricalBranches : branches).map(b => {
+                        const count = sourceAppointments.filter(a => (a.branch_id || '') === b.id).length;
                         return (
                           <option key={b.id} value={b.id}>
-                            {b.name} ({count})
+                            {b.name}{b.is_active === false ? ' (Inactive)' : ''} ({count})
                           </option>
                         );
                       })}
@@ -2612,7 +2631,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <td className="p-3.5">
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-700 border border-slate-200">
                                 <MapPin className="w-3 h-3 text-[#8C235A]" />
-                                <span>{branches.find(b => b.id === apt.branch_id)?.name || (apt.branch_id === 'brn-1793346038689' ? 'Kondapur Branch' : 'Gachibowli Main Flagship')}</span>
+                                <span>{allHistoricalBranches.find(b => b.id === apt.branch_id)?.name || branches.find(b => b.id === apt.branch_id)?.name || apt.branch_id || 'Unassigned'}</span>
                               </span>
                             </td>
                             <td className="p-3.5">
@@ -3386,14 +3405,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       {/* Modal Body / Form */}
                       <div className="p-4 sm:p-5 overflow-y-auto flex-1 space-y-4">
                         <form onSubmit={handlePosCheckout} className="space-y-4">
-                          {/* Permitted Salon Branch Selector (Loaded from SMAV: Gachibowli = GACHI, Kondapur = KONDA) */}
+                          {/* Permitted Salon Branch Selector (Loaded dynamically from SMAV) */}
                           <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
                             <div className="flex items-center justify-between mb-1">
                               <label className="block text-[11px] font-bold text-slate-700">
                                 Salon Branch * (Required before bill generation)
                               </label>
-                              {posBranchesSource === 'smav' && (
-                                <span className="text-[10px] font-semibold text-emerald-700">SMAV Permitted</span>
+                              {posBranchesSource === 'smav' && posPermittedBranches.length > 0 && (
+                                <span className="text-[10px] font-semibold text-emerald-700">
+                                  {posPermittedBranches.length === 1 ? 'Auto-Selected' : 'SMAV Permitted'}
+                                </span>
                               )}
                             </div>
                             <select
@@ -3404,7 +3425,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               disabled={posPermittedBranches.length === 0}
                               className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-[#D4AF37]/50 font-medium text-slate-900 shadow-xs cursor-pointer disabled:bg-slate-100 disabled:text-slate-400"
                             >
-                              <option value="">Select branch before generating bill…</option>
+                              {posPermittedBranches.length !== 1 && (
+                                <option value="">Select branch before generating bill…</option>
+                              )}
                               {posPermittedBranches.map((branch) => (
                                 <option key={branch.id} value={branch.id}>
                                   {branch.name} ({branch.smav_branch_code})
@@ -3412,11 +3435,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               ))}
                             </select>
                             {posPermittedBranches.length === 0 && (
-                              <p className="mt-1 text-[10px] text-rose-700">
-                                {posBranchesSource === 'loading'
-                                  ? 'Loading permitted branches from SMAV...'
-                                  : 'No permitted branches available from SMAV for this account.'}
-                              </p>
+                              <div className="mt-2 p-2 rounded-lg bg-rose-50 border border-rose-200 text-[11px] text-rose-800 flex items-start gap-1.5">
+                                <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0 mt-0.5" />
+                                <span>
+                                  {posBranchesSource === 'loading'
+                                    ? 'Loading authorized branches from SMAV...'
+                                    : posBranchesError || posBranchesWarning || 'No active authorized branch is available for this account. Billing is blocked.'}
+                                </span>
+                              </div>
                             )}
                             {posBranchesWarning && posPermittedBranches.length > 0 && (
                               <p className="mt-1 text-[10px] text-amber-700">{posBranchesWarning}</p>
@@ -3633,7 +3659,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               type="submit"
                               loading={posCheckoutAction.isLoading}
                               loadingText="Generating..."
-                              disabled={posSelectedItems.length === 0}
+                              disabled={posSelectedItems.length === 0 || posPermittedBranches.length === 0}
                               icon={<Receipt className="w-4 h-4 text-[#D4AF37]" />}
                               spinnerClassName="w-4 h-4 text-[#D4AF37]"
                               className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-[#5B132B] hover:bg-[#430D1F] transition-colors flex items-center justify-center gap-2 shadow-md shadow-[#5B132B]/15 cursor-pointer"
@@ -3712,7 +3738,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                 <span>Bill {posSuccessOrder.bill_number} Created!</span>
                               </div>
                               <div className="text-[11px] text-emerald-800 font-medium pl-5">
-                                Branch: <span className="font-bold">{posSuccessOrder.branch_name || (posSuccessOrder.branch_code === 'KONDA' ? 'Kondapur' : 'Gachibowli')}</span>
+                                Branch: <span className="font-bold">{posSuccessOrder.branch_name || allHistoricalBranches.find(b => b.id === posSuccessOrder.branch_id)?.name || posSuccessOrder.branch_id || 'Branch'}</span>
                                 {posSuccessOrder.branch_code ? ` (${posSuccessOrder.branch_code})` : ''} · Bill No: <span className="font-mono font-bold">{posSuccessOrder.bill_number}</span>
                               </div>
                               {posSuccessOrder.smav_bill_status === 'finalize_pending' && (
@@ -3868,8 +3894,45 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             const sourcePayments = viewingDeletedLedger ? deletedPayments : payments;
             const sourceOrders = viewingDeletedLedger ? deletedOrders : orders;
             const todayKolkata = getKolkataDateString(new Date());
-            const staffAssignedBranchId = currentUser?.branch_id || 'tgl-gachibowli-main';
-            const staffBranchName = branches.find(b => b.id === staffAssignedBranchId)?.name || 'Assigned Branch';
+            const staffAssignedBranchId = currentUser?.branch_id || '';
+            const staffBranchName =
+              allHistoricalBranches.find(b => b.id === staffAssignedBranchId)?.name ||
+              branches.find(b => b.id === staffAssignedBranchId)?.name ||
+              'Assigned Branch';
+
+            // Build dynamic historical + active + future SMAV branch filter options (never drops disabled or new branches)
+            const ledgerBranchMap = new Map<string, { id: string; name: string; code?: string; is_active?: boolean }>();
+            for (const b of allHistoricalBranches) {
+              ledgerBranchMap.set(b.id, {
+                id: b.id,
+                name: b.name,
+                code: b.smav_branch_code || b.code,
+                is_active: b.is_active,
+              });
+            }
+            for (const b of branches) {
+              if (!ledgerBranchMap.has(b.id)) {
+                ledgerBranchMap.set(b.id, {
+                  id: b.id,
+                  name: b.name,
+                  code: b.smav_branch_code || b.code,
+                  is_active: b.is_active,
+                });
+              }
+            }
+            for (const p of sourcePayments) {
+              const bid = String(p.branch_id || '').trim();
+              if (bid && !ledgerBranchMap.has(bid)) {
+                const mo = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+                ledgerBranchMap.set(bid, {
+                  id: bid,
+                  name: p.branch_name || mo?.branch_name || bid,
+                  code: p.branch_code || mo?.branch_code,
+                  is_active: true,
+                });
+              }
+            }
+            const ledgerBranchOptions = Array.from(ledgerBranchMap.values());
 
             const filteredPayments = sourcePayments
               .slice()
@@ -3879,24 +3942,32 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 if (!fullPaymentLedgerAccess) {
                   if (p.deleted_at) return false;
                   if (getKolkataDateString(p.created_at) !== todayKolkata) return false;
-                  const pBranch = p.branch_id || 'tgl-gachibowli-main';
-                  if (pBranch !== staffAssignedBranchId) return false;
+                  const pBranch = p.branch_id || '';
+                  if (staffAssignedBranchId && pBranch !== staffAssignedBranchId) return false;
                 }
 
-                // 1. Search by Bill Number, Customer Name or Mobile
+                // 1. Search by Bill Number, Customer Name, Mobile, Branch, Service, or Stylist
                 if (ledgerSearch.trim()) {
                   const q = ledgerSearch.trim().toLowerCase();
+                  const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
+                  const rowItems = (p.items && p.items.length > 0 ? p.items : matchingOrder?.items) || [];
                   const match = (
                     (p.bill_number && p.bill_number.toLowerCase().includes(q)) ||
                     (p.customer_phone && p.customer_phone.includes(q)) ||
-                    (p.customer_name && p.customer_name.toLowerCase().includes(q))
+                    (p.customer_name && p.customer_name.toLowerCase().includes(q)) ||
+                    (p.branch_name && p.branch_name.toLowerCase().includes(q)) ||
+                    (p.branch_code && p.branch_code.toLowerCase().includes(q)) ||
+                    rowItems.some(it =>
+                      (it.item_name && it.item_name.toLowerCase().includes(q)) ||
+                      (it.staff_name && it.staff_name.toLowerCase().includes(q))
+                    )
                   );
                   if (!match) return false;
                 }
 
                 // 2. Branch Filter (OWNER / ADMIN / SUPERADMIN only)
                 if (fullPaymentLedgerAccess && ledgerBranchFilter !== 'all') {
-                  const pBranch = p.branch_id || 'tgl-gachibowli-main';
+                  const pBranch = p.branch_id || '';
                   if (pBranch !== ledgerBranchFilter) return false;
                 }
 
@@ -4201,8 +4272,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           className="w-full p-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:bg-white cursor-pointer"
                         >
                           <option value="all">All Branches</option>
-                          {branches.map(b => (
-                            <option key={b.id} value={b.id}>{b.name}</option>
+                          {ledgerBranchOptions.map(b => (
+                            <option key={b.id} value={b.id}>
+                              {b.name}{b.code ? ` (${b.code})` : ''}{b.is_active === false ? ' — Inactive' : ''}
+                            </option>
                           ))}
                         </select>
                       </div>
@@ -4279,6 +4352,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             <th className="p-3.5">Bill Number</th>
                             <th className="p-3.5">Date & Time (IST)</th>
                             <th className="p-3.5">Customer & Phone</th>
+                            <th className="p-3.5">Service / Stylist</th>
                             <th className="p-3.5">Branch</th>
                             <th className="p-3.5">Mode</th>
                             <th className="p-3.5">Subtotal</th>
@@ -4294,7 +4368,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           {filteredPayments.map(p => {
                             const matchingOrder = sourceOrders.find(o => o.id === p.order_id || o.bill_number === p.bill_number);
                             const receiptStatus = matchingOrder?.receipt_whatsapp_status || matchingOrder?.whatsapp_status || p.receipt_whatsapp_status || 'queued';
-                            const branchName = branches.find(b => b.id === p.branch_id)?.name || p.branch_name || (p.branch_id === 'brn-1793346038689' ? 'Kondapur' : 'Gachibowli Main');
+                            const matchingBranch = ledgerBranchMap.get(String(p.branch_id || matchingOrder?.branch_id || '').trim());
+                            const branchCode = String(
+                              p.branch_code || matchingOrder?.branch_code || matchingBranch?.code || ''
+                            ).trim().toUpperCase();
+                            const branchName = String(
+                              p.branch_name || matchingOrder?.branch_name || matchingBranch?.name || p.branch_id || 'Unassigned'
+                            ).trim();
+                            const rowItems = (p.items && p.items.length > 0 ? p.items : matchingOrder?.items) || [];
                             const subtotalVal = p.subtotal ?? matchingOrder?.subtotal ?? p.amount;
                             const discountVal = p.discount ?? matchingOrder?.discount ?? 0;
                             const taxVal = p.tax_amount ?? matchingOrder?.tax_amount ?? 0;
@@ -4312,10 +4393,34 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                   <div className="font-semibold text-slate-900">{p.customer_name}</div>
                                   <div className="font-mono text-[11px] text-slate-500">{p.customer_phone || 'No phone'}</div>
                                 </td>
+                                <td className="p-3.5 max-w-[220px]">
+                                  {rowItems.length > 0 ? (
+                                    <div className="space-y-0.5">
+                                      {rowItems.slice(0, 2).map((item, idx) => (
+                                        <div key={idx} className="text-[11px] leading-tight">
+                                          <span className="font-medium text-slate-800">
+                                            {item.item_name}
+                                            {Number(item.quantity || 1) > 1 ? ` ×${item.quantity}` : ''}
+                                          </span>
+                                          {item.staff_name && (
+                                            <span className="text-slate-500"> · {item.staff_name}</span>
+                                          )}
+                                        </div>
+                                      ))}
+                                      {rowItems.length > 2 && (
+                                        <div className="text-[10px] text-slate-500 font-medium">
+                                          +{rowItems.length - 2} more
+                                        </div>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-slate-400">—</span>
+                                  )}
+                                </td>
                                 <td className="p-3.5">
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-700">
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-700 whitespace-nowrap">
                                     <MapPin className="w-3 h-3 text-[#8C235A]" />
-                                    <span>{branchName}</span>
+                                    <span>{branchCode ? `${branchName} (${branchCode})` : branchName}</span>
                                   </span>
                                 </td>
                                 <td className="p-3.5">
@@ -6141,7 +6246,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                 <label className="block font-semibold mb-1 text-slate-700">Assigned Branch *</label>
                 <select
                   name="branch_id"
-                  defaultValue={customerModal.data?.branch_id || branches[0]?.id || 'tgl-gachibowli-main'}
+                  defaultValue={customerModal.data?.branch_id || branches[0]?.id || ''}
                   className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#5B132B]/20 cursor-pointer"
                 >
                   {branches.map(b => (

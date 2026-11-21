@@ -53,7 +53,9 @@ import type {
   WhatsAppInboxDiagnostics,
   SmavUserSyncOutboxItem,
   SmavUserSyncEventType,
-  SmavUserSyncAction
+  SmavUserSyncAction,
+  SmavFinalizedBillUpsertInput,
+  SmavFinalizedBillUpsertResult
 } from '../types/salon.ts';
 import {
   CentralAuthLinkForbiddenError,
@@ -150,48 +152,16 @@ function getInitialData(): DatabaseData {
     settings: {
       brand_name: 'The Glossy Looks',
       salon_type: 'Professional Women Salon & Bridal Studio',
-      address: '31, Vinayak Nagar, Gachibowli',
-      city: 'Hyderabad, Telangana - 500032',
+      address: 'Hyderabad',
+      city: 'Hyderabad, Telangana',
       phone: '8985799459',
       whatsapp: '8985799459',
       opening_hours: '10:00 AM to 10:00 PM (Monday to Sunday)',
       google_maps_url: 'https://share.google/TWPbPEEVlN5mPfqpL',
       announcement_text: 'Festive & Royal Bridal Season Bookings Open! Complimentary pre-bridal hair trial with every HD bridal package.'
     },
-    branches: [
-      {
-        id: 'tgl-gachibowli-main',
-        name: 'Gachibowli Main Flagship',
-        code: 'GCB-01',
-        address: '31, Vinayak Nagar, Gachibowli',
-        city: 'Hyderabad, Telangana - 500032',
-        phone: '8985799459',
-        whatsapp_number: '8985799459',
-        manager_id: 'usr-1',
-        manager_name: 'Madu Mounika',
-        is_active: true,
-        created_at: '2026-01-01T10:00:00Z',
-        updated_at: '2026-01-01T10:00:00Z'
-      }
-    ],
-    branch_whatsapp_integrations: [
-      {
-        id: 'bwa-gcb-01',
-        branch_id: 'tgl-gachibowli-main',
-        configured_business_number: '8985799459',
-        waba_id: '1608729824244675',
-        phone_number_id: '1379025201957313',
-        display_name: 'THE GLOSSY LOOKS',
-        display_phone_number: '+91 89857 99459',
-        masked_phone_number: '+91 ******9459',
-        status: 'connected',
-        connected_at: '2026-10-30T07:45:00.000Z',
-        last_verified_at: '2026-10-30T07:45:00.000Z',
-        diagnostics: 'FINISH event received / WABA ID received / Phone Number ID received / Graph verification passed.',
-        created_at: '2026-01-01T10:00:00Z',
-        updated_at: '2026-10-30T07:45:00.000Z'
-      }
-    ],
+    branches: [],
+    branch_whatsapp_integrations: [],
     users: [
       {
         id: 'usr-1',
@@ -201,7 +171,6 @@ function getInitialData(): DatabaseData {
         role: 'owner',
         name: 'Madu Mounika',
         phone: '8985799459',
-        branch_id: 'tgl-gachibowli-main',
         is_active: true,
         created_at: '2026-01-01T10:00:00Z',
         updated_at: '2026-01-01T10:00:00Z'
@@ -235,9 +204,9 @@ function getInitialData(): DatabaseData {
         mobile: '9988776655',
         email: 'pooja.a@outlook.com',
         birthday: '1998-04-20',
-        address: 'Tower 3, My Home Bhooja, Gachibowli, Hyderabad',
+        address: 'Tower 3, My Home Bhooja, Hyderabad',
         saved_addresses: [
-          { label: 'Residence', address_line: 'Tower 3, Apt 1804, My Home Bhooja', area: 'Gachibowli', city: 'Hyderabad' }
+          { label: 'Residence', address_line: 'Tower 3, Apt 1804, My Home Bhooja', area: 'Financial District', city: 'Hyderabad' }
         ],
         preferences: 'Dewy glass-skin finish for bridal makeup. Natural flutter lashes.',
         allergies: 'None reported.',
@@ -272,7 +241,7 @@ function getInitialData(): DatabaseData {
         mobile: '9000123890',
         email: 'harika.c@gmail.com',
         birthday: '2001-02-28',
-        address: 'Botanical Garden Road, Kondapur, Hyderabad',
+        address: 'Botanical Garden Road, Hyderabad',
         preferences: 'Enquired about Party Makeup and Saree Draping for family sangeet.',
         loyalty_points: 80,
         total_spend: 4200,
@@ -293,7 +262,6 @@ function getInitialData(): DatabaseData {
         phone: '8985799459',
         email: 'owner@theglossylooks.com',
         role: 'Salon Director & Master Stylist',
-        branch_id: 'tgl-gachibowli-main',
         joining_date: '2024-01-01',
         salary_type: 'monthly',
         base_salary: 85000,
@@ -982,7 +950,7 @@ function getInitialData(): DatabaseData {
         phone: '9849112233',
         email: 'swathi.c@gmail.com',
         service_interest: 'Bridal Makeup for 3 Functions',
-        message: 'Looking for bridal packages for December 2026 wedding in Gachibowli.',
+        message: 'Looking for bridal packages for December 2026 wedding in Hyderabad.',
         status: 'Contacted',
         created_at: '2026-10-22T10:00:00Z'
       }
@@ -1013,7 +981,7 @@ function getInitialData(): DatabaseData {
       {
         id: 'rev-1',
         customer_name: 'Pooja Agarwal',
-        customer_area: 'My Home Bhooja, Gachibowli',
+        customer_area: 'My Home Bhooja, Hyderabad',
         rating: 5,
         comment: 'Booked my wedding sangeet and reception makeup with Fatima at The Glossy Looks. The waterproof HD finish stayed fresh through 7 hours of dancing and photos. Absolutely flawless!',
         service_rendered: 'Bridal & Reception Makeup',
@@ -1025,7 +993,7 @@ function getInitialData(): DatabaseData {
         customer_name: 'Sneha Reddy',
         customer_area: 'Silicon County, Hitec City',
         rating: 5,
-        comment: 'The O3+ Bridal Glow facial and Crystal Pedicure gave my skin instant radiance. Impeccable hygiene and the staff is so gentle and polite. My go-to salon in Gachibowli!',
+        comment: 'The O3+ Bridal Glow facial and Crystal Pedicure gave my skin instant radiance. Impeccable hygiene and the staff is so gentle and polite. My go-to salon in Hyderabad!',
         service_rendered: 'O3+ Radiance Facial & Pedicure',
         is_published: true,
         created_at: '2026-10-18T19:00:00Z'
@@ -1046,7 +1014,7 @@ function getInitialData(): DatabaseData {
         id: 'dev-1',
         device_name: 'Reception Counter Thermal Printer 80mm',
         device_id: 'POS-COUNTER-01',
-        branch: '31, Vinayak Nagar, Gachibowli, Hyderabad',
+        branch: 'Salon Main Counter',
         printer_name: 'EPSON TM-T82 Receipt Printer',
         printer_type: 'thermal',
         paper_size: '80mm',
@@ -1060,7 +1028,7 @@ function getInitialData(): DatabaseData {
         id: 'dev-2',
         device_name: 'Stylist Station Slip Printer',
         device_id: 'STATION-SLIP-02',
-        branch: '31, Vinayak Nagar, Gachibowli, Hyderabad',
+        branch: 'Salon Main Counter',
         printer_name: 'TVS RP-3160 Gold Star',
         printer_type: 'thermal',
         paper_size: '58mm',
@@ -1112,7 +1080,7 @@ function getInitialData(): DatabaseData {
     ],
     whatsapp_integration: {
       id: 'wa-int-01',
-      salon_id: 'tgl-gachibowli-main',
+      salon_id: 'glossylooks',
       status: 'not_connected',
       updated_at: '2026-01-01T00:00:00Z'
     },
@@ -1229,7 +1197,6 @@ export class SalonDatabase implements ISalonRepository {
         owner.phone = '8985799459';
         owner.user_id = 'TGL-OWN01';
         owner.role = 'owner';
-        owner.branch_id = 'tgl-gachibowli-main';
         owner.is_active = true;
         changed = true;
       }
@@ -1312,7 +1279,7 @@ export class SalonDatabase implements ISalonRepository {
           phone: u.phone,
           email: u.email,
           role: this.formatRoleTitle(u.role),
-          branch_id: u.branch_id || 'tgl-gachibowli-main',
+          branch_id: u.branch_id,
           joining_date: u.created_at ? u.created_at.split('T')[0] : '2024-01-01',
           salary_type: 'monthly',
           base_salary: 35000,
@@ -1340,7 +1307,7 @@ export class SalonDatabase implements ISalonRepository {
           role: 'stylist',
           name: s.name,
           phone: s.phone,
-          branch_id: s.branch_id || 'tgl-gachibowli-main',
+          branch_id: s.branch_id,
           is_active: s.is_active,
           created_at: s.created_at || new Date().toISOString(),
           updated_at: s.created_at || new Date().toISOString()
@@ -1390,37 +1357,8 @@ export class SalonDatabase implements ISalonRepository {
       changed = true;
     }
 
-    if (!data.branches || !Array.isArray(data.branches) || data.branches.length === 0) {
-      data.branches = [
-        {
-          id: 'tgl-gachibowli-main',
-          name: 'Gachibowli Main Flagship',
-          code: 'GCB-01',
-          address: data.settings?.address || '31, Vinayak Nagar, Gachibowli',
-          city: data.settings?.city || 'Hyderabad, Telangana - 500032',
-          phone: '8985799459',
-          whatsapp_number: '8985799459',
-          manager_id: 'usr-1',
-          manager_name: 'Madu Mounika',
-          is_active: true,
-          created_at: '2026-01-01T10:00:00Z',
-          updated_at: new Date().toISOString()
-        }
-      ];
-      changed = true;
-    } else {
-      const gcb = data.branches.find(b => b.id === 'tgl-gachibowli-main');
-      if (gcb && (gcb.whatsapp_number !== '8985799459' || gcb.phone !== '8985799459')) {
-        gcb.whatsapp_number = '8985799459';
-        gcb.phone = '8985799459';
-        changed = true;
-      }
-    }
-
-    // Ensure owner/manager usr-1 has branch_id assigned
-    const ownerUser = (data.users || []).find(u => u.id === 'usr-1' || u.role === 'owner');
-    if (ownerUser && !ownerUser.branch_id) {
-      ownerUser.branch_id = 'tgl-gachibowli-main';
+    if (!data.branches || !Array.isArray(data.branches)) {
+      data.branches = [];
       changed = true;
     }
 
@@ -1429,12 +1367,21 @@ export class SalonDatabase implements ISalonRepository {
       changed = true;
     }
 
-    let gcbIntegration = data.branch_whatsapp_integrations.find(i => i.branch_id === 'tgl-gachibowli-main');
-    if (!gcbIntegration) {
+    const primaryBranch = data.branches.find(b => b.is_active !== false) || data.branches[0];
+    const ownerUser = (data.users || []).find(u => u.id === 'usr-1' || u.role === 'owner');
+    if (ownerUser && !ownerUser.branch_id && primaryBranch?.id) {
+      ownerUser.branch_id = primaryBranch.id;
+      changed = true;
+    }
+
+    let gcbIntegration = primaryBranch
+      ? data.branch_whatsapp_integrations.find(i => i.branch_id === primaryBranch.id)
+      : undefined;
+    if (primaryBranch && !gcbIntegration) {
       gcbIntegration = {
-        id: 'bwa-gcb-01',
-        branch_id: 'tgl-gachibowli-main',
-        configured_business_number: '8985799459',
+        id: `bwa-${primaryBranch.id}`,
+        branch_id: primaryBranch.id,
+        configured_business_number: primaryBranch.whatsapp_number || '8985799459',
         waba_id: '1608729824244675',
         phone_number_id: '1379025201957313',
         display_name: 'THE GLOSSY LOOKS',
@@ -1449,7 +1396,7 @@ export class SalonDatabase implements ISalonRepository {
       };
       data.branch_whatsapp_integrations.push(gcbIntegration);
       changed = true;
-    } else if (!gcbIntegration.waba_id || !gcbIntegration.phone_number_id || gcbIntegration.status !== 'connected') {
+    } else if (gcbIntegration && (!gcbIntegration.waba_id || !gcbIntegration.phone_number_id || gcbIntegration.status !== 'connected')) {
       gcbIntegration.configured_business_number = '8985799459';
       gcbIntegration.waba_id = '1608729824244675';
       gcbIntegration.phone_number_id = '1379025201957313';
@@ -1815,7 +1762,7 @@ export class SalonDatabase implements ISalonRepository {
     if (!this.data.whatsapp_integration) {
       this.data.whatsapp_integration = {
         id: 'wa-int-01',
-        salon_id: 'tgl-gachibowli-main',
+        salon_id: this.data.branches[0]?.id || 'glossylooks',
         status: 'not_connected',
         updated_at: new Date().toISOString()
       };
@@ -1869,7 +1816,7 @@ export class SalonDatabase implements ISalonRepository {
       const last4 = activeNumber.slice(-4);
       this.data.whatsapp_settings = {
         id: 'wa-set-01',
-        salon_id: 'tgl-gachibowli-main',
+        salon_id: this.data.branches[0]?.id || 'glossylooks',
         business_number: activeNumber,
         country_code: '+91',
         display_name: this.data.settings?.brand_name || 'The Glossy Looks',
@@ -2571,7 +2518,7 @@ export class SalonDatabase implements ISalonRepository {
       });
       return {
         ...apt,
-        branch_id: apt.branch_id || 'tgl-gachibowli-main',
+        branch_id: apt.branch_id,
         assigned_staff_id: resolvedStaff ? resolvedStaff.id : apt.assigned_staff_id,
         assigned_staff_name: resolvedStaff ? resolvedStaff.name : apt.assigned_staff_name,
         services: resolvedServices
@@ -2810,7 +2757,7 @@ export class SalonDatabase implements ISalonRepository {
       });
       return {
         ...o,
-        branch_id: o.branch_id || 'tgl-gachibowli-main',
+        branch_id: o.branch_id,
         cashier_id: cashier ? cashier.id : o.cashier_id,
         cashier_name: cashier ? cashier.name : o.cashier_name,
         items: resolvedItems
@@ -2819,7 +2766,7 @@ export class SalonDatabase implements ISalonRepository {
 
     if (deletedMode === 'active') list = list.filter(o => !o.deleted_at);
     else if (deletedMode === 'deleted') list = list.filter(o => Boolean(o.deleted_at));
-    if (filters?.branchId) list = list.filter(o => (o.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    if (filters?.branchId) list = list.filter(o => o.branch_id === filters.branchId);
     if (filters?.startIso) {
       const startMs = new Date(filters.startIso).getTime();
       list = list.filter(o => new Date(o.created_at).getTime() >= startMs);
@@ -2834,7 +2781,7 @@ export class SalonDatabase implements ISalonRepository {
   }
 
   public async getOrderById(id: string): Promise<Order | null> {
-    const o = this.data.orders.find(ord => ord.id === id || ord.bill_number === id);
+    const o = this.data.orders.find(ord => ord.id === id);
     if (!o) return null;
     const cashier = this.resolveStaff(o.cashier_id || o.cashier_name);
     return {
@@ -2852,12 +2799,265 @@ export class SalonDatabase implements ISalonRepository {
     };
   }
 
+  public async getOrderByBillNumber(billNumber: string): Promise<Order | null> {
+    const clean = String(billNumber || '').trim();
+    if (!clean) return null;
+    const found = this.data.orders.find(o => o.bill_number === clean);
+    if (!found) return null;
+    return this.getOrderById(found.id);
+  }
+
+  public async getOrderBySmavCentralBillId(smavCentralBillId: string): Promise<Order | null> {
+    const clean = String(smavCentralBillId || '').trim();
+    if (!clean) return null;
+    const found = this.data.orders.find(
+      o => o.smav_central_bill_id === clean || o.smav_sale_id === clean
+    );
+    if (!found) return null;
+    return this.getOrderById(found.id);
+  }
+
   public async getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null> {
     const clean = String(idempotencyKey || '').trim();
     if (!clean) return null;
     const found = this.data.orders.find(o => o.idempotency_key === clean);
     if (!found) return null;
     return this.getOrderById(found.id);
+  }
+
+  public async upsertSmavFinalizedBill(input: SmavFinalizedBillUpsertInput): Promise<SmavFinalizedBillUpsertResult> {
+    const centralBillNum = String(input.central_bill_number || '').trim();
+    if (!centralBillNum) {
+      throw new Error('CENTRAL_BILL_NUMBER_REQUIRED: central_bill_number is required.');
+    }
+
+    const nowIso = new Date().toISOString();
+    const billDateIso = input.billed_at || input.finalized_at || nowIso;
+    const finalizedAtIso = input.finalized_at || nowIso;
+    const paymentLedgerStatus: PaymentRecord['status'] =
+      input.payment_status === 'Refunded'
+        ? 'Refunded'
+        : input.payment_status === 'Cancelled'
+        ? 'Void'
+        : 'Success';
+
+    let existingOrder = await this.getOrderByBillNumber(centralBillNum);
+    if (!existingOrder && input.idempotency_key) {
+      existingOrder = await this.getOrderByIdempotencyKey(input.idempotency_key);
+    }
+    if (!existingOrder && input.smav_central_bill_id) {
+      existingOrder = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
+    }
+    if (!existingOrder && input.local_order_id && input.local_order_id !== centralBillNum) {
+      existingOrder = await this.getOrderById(input.local_order_id);
+    }
+
+    if (existingOrder && existingOrder.bill_number && existingOrder.bill_number !== centralBillNum) {
+      throw new Error(
+        `IMMUTABLE_BILL_NUMBER_CONFLICT: Local order ${existingOrder.id} is already assigned bill_number ${existingOrder.bill_number}; refusing to replace with ${centralBillNum}.`
+      );
+    }
+
+    const resolvedItems = (input.items || []).map(item => {
+      const itemStaff = this.resolveStaff(item.staff_id || item.staff_name);
+      return {
+        ...item,
+        staff_id: itemStaff ? itemStaff.id : item.staff_id,
+        staff_name: itemStaff ? itemStaff.name : (item.staff_name || 'Station Stylist'),
+      };
+    });
+
+    if (existingOrder) {
+      const idx = this.data.orders.findIndex(o => o.id === existingOrder!.id);
+      const current = this.data.orders[idx];
+      const nextItems = current.items && current.items.length > 0 ? current.items : resolvedItems;
+      const updatedOrder: Order = {
+        ...current,
+        branch_id: current.branch_id || input.branch_id,
+        branch_code: input.branch_code,
+        branch_name: input.branch_name,
+        smav_central_bill_id: input.smav_central_bill_id || current.smav_central_bill_id,
+        smav_sale_id: input.smav_sale_id || input.smav_central_bill_id || current.smav_sale_id,
+        smav_reservation_id: input.smav_reservation_id || current.smav_reservation_id,
+        idempotency_key: current.idempotency_key || input.idempotency_key,
+        smav_bill_status: input.payment_status === 'Cancelled' ? 'voided' : 'finalized',
+        smav_finalized_at: finalizedAtIso,
+        smav_finalize_error: null,
+        smav_last_event_id: input.event_id,
+        smav_last_event_at: nowIso,
+        customer_name: input.customer_name || current.customer_name,
+        customer_phone: input.customer_phone || current.customer_phone,
+        subtotal: input.subtotal,
+        discount: input.discount,
+        tax_percent: input.tax_percent,
+        tax_amount: input.tax_amount,
+        tip_amount: input.tip_amount,
+        grand_total: input.grand_total,
+        paid_amount: input.paid_amount,
+        due_amount: input.due_amount,
+        payment_status: input.payment_status,
+        primary_payment_mode: input.primary_payment_mode,
+        cashier_name: input.cashier_name || current.cashier_name,
+        items: nextItems,
+      };
+      this.data.orders[idx] = updatedOrder;
+
+      // Replay-safe CRM update: isVisit=false, spend=0 (no duplicate CRM visits or spend inflation)
+      const cleanPhone = String(input.customer_phone || '').replace(/\D/g, '').slice(-10);
+      if (cleanPhone) {
+        await this.upsertCustomerFromOrderOrAppointment({
+          name: input.customer_name,
+          phone: cleanPhone,
+          email: input.customer_email,
+          branchId: input.branch_id,
+          spend: 0,
+          billNumber: centralBillNum,
+          isVisit: false,
+        });
+      }
+
+      // Replay-safe Payment Ledger: update existing row or create ONE if missing (never duplicate)
+      let payIdx = this.data.payments.findIndex(
+        p => p.order_id === updatedOrder.id || p.bill_number === centralBillNum
+      );
+      let committedPayment: PaymentRecord;
+      if (payIdx !== -1) {
+        committedPayment = {
+          ...this.data.payments[payIdx],
+          smav_central_bill_id: input.smav_central_bill_id || this.data.payments[payIdx].smav_central_bill_id,
+          branch_id: input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          customer_name: input.customer_name || this.data.payments[payIdx].customer_name,
+          customer_phone: input.customer_phone || this.data.payments[payIdx].customer_phone,
+          amount: input.paid_amount,
+          payment_mode: input.primary_payment_mode,
+          transaction_ref: input.transaction_ref || this.data.payments[payIdx].transaction_ref,
+          status: paymentLedgerStatus,
+          recorded_by: input.cashier_name || this.data.payments[payIdx].recorded_by,
+        };
+        this.data.payments[payIdx] = committedPayment;
+      } else {
+        committedPayment = {
+          id: `pay-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+          order_id: updatedOrder.id,
+          bill_number: centralBillNum,
+          smav_central_bill_id: input.smav_central_bill_id || null,
+          branch_id: input.branch_id,
+          branch_code: input.branch_code,
+          branch_name: input.branch_name,
+          customer_name: input.customer_name,
+          customer_phone: input.customer_phone,
+          amount: input.paid_amount,
+          payment_mode: input.primary_payment_mode,
+          transaction_ref: input.transaction_ref || `SMAV-${centralBillNum}`,
+          status: paymentLedgerStatus,
+          notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+          recorded_by: input.cashier_name,
+          created_at: billDateIso,
+        };
+        this.data.payments.unshift(committedPayment);
+      }
+
+      this.save();
+      return {
+        order: updatedOrder,
+        payment: { ...committedPayment, items: updatedOrder.items },
+        created: false,
+        duplicate: true,
+      };
+    }
+
+    // Create CRM customer (counts 1 visit on first delivery)
+    let customerId: string | undefined;
+    const cleanPhone = String(input.customer_phone || '').replace(/\D/g, '').slice(-10);
+    if (cleanPhone) {
+      const cust = await this.upsertCustomerFromOrderOrAppointment({
+        name: input.customer_name,
+        phone: cleanPhone,
+        email: input.customer_email,
+        branchId: input.branch_id,
+        spend: Number(input.paid_amount || input.grand_total || 0),
+        billNumber: centralBillNum,
+        isVisit: true,
+      });
+      customerId = cust.id;
+    }
+
+    const newOrder: Order = {
+      id: `ord-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+      bill_number: centralBillNum,
+      branch_id: input.branch_id,
+      branch_code: input.branch_code,
+      branch_name: input.branch_name,
+      smav_central_bill_id: input.smav_central_bill_id || null,
+      smav_reservation_id: input.smav_reservation_id || undefined,
+      smav_sale_id: input.smav_sale_id || input.smav_central_bill_id || undefined,
+      smav_bill_status: input.payment_status === 'Cancelled' ? 'voided' : 'finalized',
+      smav_finalized_at: finalizedAtIso,
+      smav_finalize_error: null,
+      smav_last_event_id: input.event_id,
+      smav_last_event_at: nowIso,
+      is_legacy_bill: false,
+      idempotency_key: input.idempotency_key,
+      customer_id: customerId,
+      customer_name: input.customer_name,
+      customer_phone: input.customer_phone,
+      items: resolvedItems,
+      subtotal: input.subtotal,
+      discount: input.discount,
+      tax_percent: input.tax_percent,
+      tax_amount: input.tax_amount,
+      tip_amount: input.tip_amount,
+      grand_total: input.grand_total,
+      paid_amount: input.paid_amount,
+      due_amount: input.due_amount,
+      payment_status: input.payment_status,
+      primary_payment_mode: input.primary_payment_mode,
+      cashier_name: input.cashier_name,
+      notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+      whatsapp_status: 'queued',
+      receipt_whatsapp_status: 'queued',
+      created_at: billDateIso,
+    };
+
+    this.data.orders.unshift(newOrder);
+
+    const committedPayment: PaymentRecord = {
+      id: `pay-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+      order_id: newOrder.id,
+      bill_number: centralBillNum,
+      smav_central_bill_id: input.smav_central_bill_id || null,
+      branch_id: input.branch_id,
+      branch_code: input.branch_code,
+      branch_name: input.branch_name,
+      customer_name: input.customer_name,
+      customer_phone: input.customer_phone,
+      amount: input.paid_amount,
+      payment_mode: input.primary_payment_mode,
+      transaction_ref: input.transaction_ref || `SMAV-${centralBillNum}`,
+      status: paymentLedgerStatus,
+      notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
+      recorded_by: input.cashier_name,
+      created_at: billDateIso,
+    };
+    this.data.payments.unshift(committedPayment);
+
+    await this.logAudit(
+      'SMAV_CENTRAL_BILL_FINALIZED',
+      'Order',
+      newOrder.id,
+      'SMAV Central',
+      `Committed SMAV finalized bill ${centralBillNum} (Branch: ${input.branch_name}/${input.branch_code}, Payment ID: ${committedPayment.id})`
+    );
+    this.save();
+
+    return {
+      order: newOrder,
+      payment: { ...committedPayment, items: resolvedItems },
+      created: true,
+      duplicate: false,
+    };
   }
 
   public async createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order> {
@@ -2884,12 +3084,10 @@ export class SalonDatabase implements ISalonRepository {
     });
 
     const matchedBranch = this.data.branches.find(b => b.id === orderData.branch_id);
-    const cleanBranchName = orderData.branch_name || (
-      matchedBranch?.name?.toLowerCase().includes('kondapur') || orderData.branch_id === 'brn-1793346038689'
-        ? 'Kondapur'
-        : 'Gachibowli'
-    );
-    const resolvedBranchCode = orderData.branch_code || (cleanBranchName.toLowerCase().includes('kondapur') ? 'KONDA' : 'GACHI');
+    const cleanBranchName = String(orderData.branch_name || matchedBranch?.name || '').trim();
+    const resolvedBranchCode = String(
+      orderData.branch_code || matchedBranch?.smav_branch_code || matchedBranch?.code || ''
+    ).trim().toUpperCase();
 
     const newOrder: Order = {
       ...orderData,
@@ -3174,11 +3372,28 @@ export class SalonDatabase implements ISalonRepository {
     const ordersById = new Map(this.data.orders.map(o => [o.id, o]));
     const ordersByBill = new Map(this.data.orders.map(o => [o.bill_number, o]));
 
+    const branchesById = new Map(this.data.branches.map(b => [b.id, b]));
     let list = this.data.payments.map(p => {
       const ord = ordersById.get(p.order_id) || ordersByBill.get(p.bill_number);
+      const effectiveBranchId = p.branch_id || ord?.branch_id || '';
+      const matchedBranch = effectiveBranchId ? branchesById.get(effectiveBranchId) : undefined;
+      const effectiveBranchCode =
+        p.branch_code ||
+        ord?.branch_code ||
+        matchedBranch?.smav_branch_code ||
+        matchedBranch?.code ||
+        '';
+      const effectiveBranchName =
+        p.branch_name ||
+        ord?.branch_name ||
+        matchedBranch?.name ||
+        '';
       return {
         ...p,
-        branch_id: p.branch_id || ord?.branch_id || 'tgl-gachibowli-main',
+        branch_id: effectiveBranchId || undefined,
+        branch_code: effectiveBranchCode || undefined,
+        branch_name: effectiveBranchName || undefined,
+        smav_central_bill_id: p.smav_central_bill_id || ord?.smav_central_bill_id || null,
         subtotal: ord?.subtotal ?? p.subtotal ?? p.amount,
         discount: ord?.discount ?? p.discount ?? 0,
         tax_amount: ord?.tax_amount ?? p.tax_amount ?? 0,
@@ -3197,7 +3412,7 @@ export class SalonDatabase implements ISalonRepository {
 
     if (deletedMode === 'active') list = list.filter(p => !p.deleted_at);
     else if (deletedMode === 'deleted') list = list.filter(p => Boolean(p.deleted_at));
-    if (filters?.branchId) list = list.filter(p => (p.branch_id || 'tgl-gachibowli-main') === filters.branchId);
+    if (filters?.branchId) list = list.filter(p => p.branch_id === filters.branchId);
     if (filters?.startIso) {
       const startMs = new Date(filters.startIso).getTime();
       list = list.filter(p => new Date(p.created_at).getTime() >= startMs);
@@ -3419,7 +3634,7 @@ export class SalonDatabase implements ISalonRepository {
         id: `dev-${Date.now()}`,
         device_name: device.device_name || 'Counter Thermal Printer',
         device_id: device.device_id || `DEV-${Date.now()}`,
-        branch: device.branch || '31, Vinayak Nagar, Gachibowli, Hyderabad',
+        branch: device.branch || 'Salon Main Counter',
         printer_name: device.printer_name || 'Standard 80mm ESC/POS Printer',
         printer_type: device.printer_type || 'thermal',
         paper_size: device.paper_size || '80mm',
@@ -4172,8 +4387,9 @@ export class SalonDatabase implements ISalonRepository {
     source_channel?: 'WHATSAPP' | 'WEBSITE_ENQUIRY' | 'MIXED';
   }): Promise<WhatsAppConversation> {
     if (!this.data.whatsapp_conversations) this.data.whatsapp_conversations = [];
-    const salonId = data.salonId || data.salon_id || 'tgl-gachibowli-main';
-    const branchId = data.branchId || data.branch_id || 'tgl-gachibowli-main';
+    const defaultBranchId = this.data.branches[0]?.id || '';
+    const salonId = data.salonId || data.salon_id || defaultBranchId || 'glossylooks';
+    const branchId = data.branchId || data.branch_id || defaultBranchId || '';
     const rawPhone = data.customerPhone || data.customer_phone || '';
     const cleanPhone = rawPhone.replace(/\D/g, '').slice(-10);
     const formattedPhone = cleanPhone.length === 10 ? `+91${cleanPhone}` : rawPhone;
@@ -4280,9 +4496,9 @@ export class SalonDatabase implements ISalonRepository {
 
   public async getWhatsAppInboxUnreadCount(salonId?: string, branchId?: string): Promise<number> {
     if (!this.data.whatsapp_conversations) this.data.whatsapp_conversations = [];
-    const targetSalonId = salonId || 'tgl-gachibowli-main';
+    const targetSalonId = salonId || '';
     return this.data.whatsapp_conversations
-      .filter(c => c.salon_id === targetSalonId && c.status === 'OPEN' && (!branchId || c.branch_id === branchId))
+      .filter(c => (!targetSalonId || c.salon_id === targetSalonId) && c.status === 'OPEN' && (!branchId || c.branch_id === branchId))
       .reduce((acc, curr) => acc + (curr.unread_count || 0), 0);
   }
 
@@ -4341,8 +4557,8 @@ export class SalonDatabase implements ISalonRepository {
     const newMsg: WhatsAppMessage = {
       ...message,
       id: `wam-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
-      salon_id: message.salon_id || 'tgl-gachibowli-main',
-      branch_id: message.branch_id || 'tgl-gachibowli-main',
+      salon_id: message.salon_id || this.data.branches[0]?.id || 'glossylooks',
+      branch_id: message.branch_id || this.data.branches[0]?.id || undefined,
       conversation_id: message.conversation_id,
       direction,
       message_type: messageType,
@@ -4488,7 +4704,7 @@ export class SalonDatabase implements ISalonRepository {
       phone: String(userData.phone || '').trim(),
       role: String(userData.role || '').trim().toLowerCase(),
       username: resolvedUsername,
-      branch_id: userData.branch_id || 'tgl-gachibowli-main',
+      branch_id: userData.branch_id || '',
       is_active: userData.is_active !== false,
       credential_mode: credentialMode,
       event_type: outbox.event_type,

@@ -360,10 +360,24 @@ export const api = {
         name: string;
         full_name: string;
         is_active: boolean;
-        source: 'smav' | 'local';
+        is_authorized?: boolean;
+        source: 'smav';
       }>;
-      source: 'smav' | 'local_fallback';
+      all_branches?: Array<{
+        id: string;
+        local_branch_id: string;
+        smav_branch_id?: string;
+        code: string;
+        smav_branch_code: string;
+        name: string;
+        full_name: string;
+        is_active: boolean;
+        is_authorized?: boolean;
+        source: 'smav';
+      }>;
+      source: 'smav' | 'smav_error';
       warning?: string | null;
+      error?: string | null;
     }>(`${API_BASE}/pos/branches`),
   getOrderById: (orderId: string) => fetchJson<Order>(`${API_BASE}/orders/${orderId}`),
   createOrder: (data: any, adminName?: string) =>

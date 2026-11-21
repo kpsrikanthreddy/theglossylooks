@@ -19,31 +19,24 @@ interface ThermalReceiptProps {
   salonPhone?: string;
 }
 
-function resolveThermalBranchName(input: {
+function resolveThermalBranchDetails(input: {
   branchName?: string | null;
   branchCode?: string | null;
   branchId?: string | null;
-}): string {
+}): { name: string; code: string; label: string } {
   const code = String(input.branchCode || '').trim().toUpperCase();
-  if (code === 'GACHI' || code === 'GCB-01') return 'Gachibowli';
-  if (code === 'KONDA' || code === 'KND-02') return 'Kondapur';
-
-  const id = String(input.branchId || '').trim();
-  if (id === 'tgl-gachibowli-main') return 'Gachibowli';
-  if (id === 'brn-1793346038689') return 'Kondapur';
-
   const raw = String(input.branchName || '').trim();
-  if (raw) {
-    if (/gachibowli/i.test(raw)) return 'Gachibowli';
-    if (/kondapur/i.test(raw)) return 'Kondapur';
-    const cleaned = raw
-      .split(',')[0]
-      .replace(/\s*(Main\s+Flagship|Flagship|Branch)\s*$/i, '')
-      .trim();
-    if (cleaned) return cleaned;
-  }
-
-  return 'Gachibowli';
+  const cleanName = raw
+    ? raw
+        .split(',')[0]
+        .replace(/\s*(Main\s+Flagship|Flagship|Branch)\s*$/i, '')
+        .trim()
+    : '';
+  const name = cleanName || code || String(input.branchId || '').trim() || 'Salon Branch';
+  const label = cleanName && code && cleanName.toUpperCase() !== code && !cleanName.toUpperCase().endsWith(`(${code})`)
+    ? `${cleanName} (${code})`
+    : name;
+  return { name, code, label };
 }
 
 export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
@@ -58,15 +51,16 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
   const [browserPrinting, setBrowserPrinting] = React.useState(false);
   const [reprintFeedback, setReprintFeedback] = React.useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  const displayBranchName = order
-    ? resolveThermalBranchName({
+  const branchDetails = order
+    ? resolveThermalBranchDetails({
         branchName: order.branch_name,
         branchCode: order.branch_code,
         branchId: order.branch_id,
       })
-    : resolveThermalBranchName({
+    : resolveThermalBranchDetails({
         branchId: appointment?.branch_id,
       });
+  const displayBranchName = branchDetails.label;
 
   const handlePrint = () => {
     if (browserPrinting) return;
@@ -83,8 +77,8 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
     setReprintFeedback(null);
     const payload = order
       ? {
-          branch_name: displayBranchName,
-          branch_code: order.branch_code || (displayBranchName === 'Kondapur' ? 'KONDA' : 'GACHI'),
+          branch_name: branchDetails.name,
+          branch_code: branchDetails.code || undefined,
           bill_number: order.bill_number,
           customer_name: order.customer_name,
           customer_phone: order.customer_phone,
@@ -98,7 +92,7 @@ export const ThermalReceipt: React.FC<ThermalReceiptProps> = ({
           date: new Date(order.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
         }
       : {
-          branch_name: displayBranchName,
+          branch_name: branchDetails.name,
           booking_reference: appointment?.booking_reference,
           customer_name: appointment?.customer_name,
           customer_phone: appointment?.customer_phone,

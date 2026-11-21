@@ -49,7 +49,7 @@ export const CuratedSections: React.FC<CuratedSectionsProps> = ({
         <div className="flex items-center justify-between mb-6">
           <div>
             <span className="text-[11px] font-semibold tracking-widest uppercase text-[#8C235A]">
-              Trending in Gachibowli
+              Trending in Hyderabad
             </span>
             <h2 className="text-xl sm:text-2xl font-serif font-bold text-slate-900 tracking-tight">
               Most Booked Services This Week
@@ -239,7 +239,7 @@ export const CuratedSections: React.FC<CuratedSectionsProps> = ({
               The Glossy Looks Salon & Bridal Studio
             </h2>
             <p className="text-xs sm:text-sm text-white/80 leading-relaxed mb-6">
-              Located conveniently in the heart of Gachibowli, close to DLF Cybercity and Hitec City. Walk-ins and pre-booked appointments welcomed 7 days a week.
+              Conveniently located across Hyderabad with luxury bridal suites and dedicated styling studios. Walk-ins and pre-booked appointments welcomed 7 days a week.
             </p>
 
             <div className="space-y-3 text-xs mb-6">
@@ -280,15 +280,15 @@ export const CuratedSections: React.FC<CuratedSectionsProps> = ({
           <div className="h-64 sm:h-80 rounded-2xl overflow-hidden border border-white/20 bg-[#1D0612] p-4 flex flex-col justify-between relative shadow-2xl">
             <div className="flex justify-between items-center text-xs text-white/80">
               <span className="font-semibold">Google Maps Live Route</span>
-              <span className="text-[#D4AF37]">Gachibowli, Hyderabad</span>
+              <span className="text-[#D4AF37]">{settings.city || 'Hyderabad'}</span>
             </div>
             <div className="my-auto text-center space-y-2">
               <div className="w-12 h-12 rounded-full bg-[#5B132B] mx-auto flex items-center justify-center text-[#D4AF37] shadow-lg ring-4 ring-[#D4AF37]/30">
                 <MapPin className="w-6 h-6 animate-bounce" />
               </div>
-              <h4 className="font-serif font-bold text-sm text-white">31, Vinayak Nagar, Gachibowli</h4>
+              <h4 className="font-serif font-bold text-sm text-white">{settings.address || 'The Glossy Looks Studio'}</h4>
               <p className="text-[11px] text-white/70 max-w-xs mx-auto">
-                Near Gachibowli flyover & Telecom Nagar. Dedicated client parking available.
+                Dedicated client parking available. Walk-ins and pre-booked appointments welcome.
               </p>
             </div>
             <a

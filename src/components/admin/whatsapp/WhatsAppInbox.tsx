@@ -446,7 +446,7 @@ export const WhatsAppInbox: React.FC<WhatsAppInboxProps> = ({
 
         const optimisticMsg: WhatsAppMessage = {
           id: tempId,
-          salon_id: activeConversation?.salon_id || 'tgl-gachibowli-main',
+          salon_id: activeConversation?.salon_id || activeConversation?.branch_id || '',
           conversation_id: targetConvId,
           direction: 'OUTBOUND',
           message_type: 'text',

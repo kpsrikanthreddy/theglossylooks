@@ -91,7 +91,7 @@ class SalonPrintAgent {
           device_name: this.deviceName,
           printer_name: this.printerName,
           printer_type: this.printerType,
-          branch: process.env.PRINT_BRANCH_NAME || 'Gachibowli'
+          branch: process.env.PRINT_BRANCH_NAME || process.env.PRINT_BRANCH_ID || 'Salon Counter'
         })
       });
       const data = await response.json();
@@ -173,7 +173,11 @@ class SalonPrintAgent {
   private printThermalBill(data: PrintJob['payload']) {
     const divider = '------------------------------------------';
     const doubleDivider = '==========================================';
-    const cleanBranch = data.branch_name || (data.branch_code === 'KONDA' ? 'Kondapur' : 'Gachibowli');
+    const branchName = String(data.branch_name || '').trim();
+    const branchCode = String(data.branch_code || '').trim().toUpperCase();
+    const cleanBranch = branchName && branchCode && branchName.toUpperCase() !== branchCode
+      ? `${branchName} (${branchCode})`
+      : branchName || branchCode || 'Salon Branch';
 
     console.log(doubleDivider);
     console.log('             THE GLOSSY LOOKS             ');
@@ -215,7 +219,11 @@ class SalonPrintAgent {
 
   private printServiceTicket(data: PrintJob['payload']) {
     const divider = '------------------------------------------';
-    const cleanBranch = data.branch_name || 'Gachibowli';
+    const branchName = String(data.branch_name || '').trim();
+    const branchCode = String(data.branch_code || '').trim().toUpperCase();
+    const cleanBranch = branchName && branchCode && branchName.toUpperCase() !== branchCode
+      ? `${branchName} (${branchCode})`
+      : branchName || branchCode || 'Salon Branch';
     console.log(divider);
     console.log('      THE GLOSSY LOOKS - SERVICE SLIP     ');
     console.log(`Branch:   ${cleanBranch}`);

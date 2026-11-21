@@ -50,7 +50,9 @@ import type {
   WhatsAppInboxDiagnostics,
   SmavUserSyncOutboxItem,
   SmavUserSyncEventType,
-  SmavUserSyncAction
+  SmavUserSyncAction,
+  SmavFinalizedBillUpsertInput,
+  SmavFinalizedBillUpsertResult
 } from '../../types/salon.ts';
 
 export interface ISalonRepository {
@@ -149,8 +151,11 @@ export interface ISalonRepository {
     endIso?: string;
   }): Promise<Order[]>;
   getOrderById(id: string): Promise<Order | null>;
+  getOrderByBillNumber(billNumber: string): Promise<Order | null>;
+  getOrderBySmavCentralBillId(smavCentralBillId: string): Promise<Order | null>;
   getOrderByIdempotencyKey(idempotencyKey: string): Promise<Order | null>;
   createOrder(orderData: Omit<Order, 'id' | 'created_at'>, performedBy: string): Promise<Order>;
+  upsertSmavFinalizedBill(input: SmavFinalizedBillUpsertInput): Promise<SmavFinalizedBillUpsertResult>;
   updateOrder(id: string, data: Partial<Order>): Promise<Order | null>;
   updateOrderStatus(id: string, status: Order['payment_status'], performedBy: string): Promise<Order | null>;
   softDeleteOrderTransaction(

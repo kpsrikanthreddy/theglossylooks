@@ -58,7 +58,7 @@ export const Header: React.FC<HeaderProps> = ({
                     The Glossy Looks
                   </span>
                   <span className="text-[10px] text-[#D4AF37] font-medium tracking-wider uppercase mt-1">
-                    Luxury Salon · Gachibowli
+                    Luxury Salon · Hyderabad
                   </span>
                 </div>
               </a>
@@ -70,7 +70,7 @@ export const Header: React.FC<HeaderProps> = ({
                 title="Salon Location & Timings"
               >
                 <MapPin className="w-3.5 h-3.5 text-[#D4AF37]" />
-                <span className="font-medium text-white/90">Gachibowli, Hyderabad</span>
+                <span className="font-medium text-white/90">{settings.city || 'Hyderabad'}</span>
                 <ChevronDown className="w-3 h-3 text-white/50" />
               </button>
             </div>
@@ -142,7 +142,7 @@ export const Header: React.FC<HeaderProps> = ({
               <MapPin className="w-5 h-5" />
               <h3 className="font-serif font-bold text-lg text-white">Salon Location</h3>
             </div>
-            <p className="text-xs text-white font-semibold mb-1">The Glossy Looks - Gachibowli Branch</p>
+            <p className="text-xs text-white font-semibold mb-1">{settings.brand_name || 'The Glossy Looks'}</p>
             <p className="text-xs text-white/70 mb-4">{settings.address}, {settings.city}</p>
             <div className="p-3 bg-white/5 rounded-xl text-xs space-y-2 mb-4 border border-white/10">
               <div className="flex justify-between">

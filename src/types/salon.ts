@@ -64,7 +64,7 @@ export interface User {
   role: AdminRole;
   name: string;
   phone: string;
-  branch_id?: string; // Assigned salon branch (e.g. 'tgl-gachibowli-main')
+  branch_id?: string; // Assigned salon branch ID (from public.salon_branches / SMAV)
   is_active: boolean;
   username?: string;
   central_auth_id?: string;
@@ -365,6 +365,7 @@ export interface Order {
   branch_id?: string;
   branch_code?: string;
   branch_name?: string;
+  smav_central_bill_id?: string | null;
   smav_reservation_id?: string;
   smav_sale_id?: string;
   smav_bill_status?: SmavBillStatus;
@@ -419,6 +420,7 @@ export interface PaymentRecord {
   id: string;
   order_id: string;
   bill_number: string;
+  smav_central_bill_id?: string | null;
   customer_name: string;
   customer_phone: string;
   amount: number;
@@ -445,6 +447,45 @@ export interface PaymentRecord {
   restored_at?: string | null;
   restored_by?: string | null;
   created_at: string;
+}
+
+export interface SmavFinalizedBillUpsertInput {
+  event_id: string;
+  central_bill_number: string;
+  smav_central_bill_id?: string | null;
+  smav_reservation_id?: string | null;
+  smav_sale_id?: string | null;
+  local_order_id?: string | null;
+  idempotency_key: string;
+  branch_id: string;
+  branch_code: string;
+  branch_name: string;
+  customer_name: string;
+  customer_phone: string;
+  customer_email?: string;
+  items: OrderItem[];
+  subtotal: number;
+  discount: number;
+  tax_percent: number;
+  tax_amount: number;
+  tip_amount: number;
+  grand_total: number;
+  paid_amount: number;
+  due_amount: number;
+  payment_status: Order['payment_status'];
+  primary_payment_mode: Order['primary_payment_mode'];
+  transaction_ref?: string;
+  cashier_name: string;
+  notes?: string;
+  billed_at?: string;
+  finalized_at?: string;
+}
+
+export interface SmavFinalizedBillUpsertResult {
+  order: Order;
+  payment: PaymentRecord;
+  created: boolean;
+  duplicate: boolean;
 }
 
 export interface Product {
@@ -656,10 +697,10 @@ export interface WhatsAppStatusResponse {
 // ============================================================================
 
 export interface SalonBranch {
-  id: string; // e.g. 'tgl-gachibowli-main'
-  name: string; // e.g. 'Gachibowli Main Flagship'
-  code: string; // e.g. 'GCB-01'
-  smav_branch_code?: string; // Canonical SMAV branch code: 'GACHI' | 'KONDA'
+  id: string; // Canonical branch ID from public.salon_branches / SMAV
+  name: string; // Display branch name
+  code: string; // Branch code
+  smav_branch_code?: string; // Dynamic SMAV branch code
   smav_branch_id?: string;
   address: string;
   city: string;
