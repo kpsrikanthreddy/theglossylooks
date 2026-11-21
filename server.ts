@@ -454,6 +454,58 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
         return res.status(503).json({ error: 'Local payment ledger record was not committed' });
       }
 
+      // A central finalized-sale event is the bill-creation event for bills
+      // raised in SMAV. Dispatch the receipt here, after the local order and
+      // payment commit, rather than leaving it permanently in "Queued".
+      // Existing sent/delivered/read receipts are never sent again on replay.
+      let receiptDispatch: { status: WhatsAppMessageStatus; messageId?: string; error?: string } | null = null;
+      const currentReceiptStatus = String(result.order.receipt_whatsapp_status || '').toLowerCase();
+      const shouldDispatchReceipt = Boolean(customerPhone) && !['sent', 'delivered', 'read'].includes(currentReceiptStatus);
+      if (shouldDispatchReceipt) {
+        try {
+          const receiptResult = await sendBranchWhatsAppTemplate({
+            branchId: resolvedBranchId,
+            recipientPhone: customerPhone,
+            templateName: 'gl_bill_receipt',
+            orderId: result.order.id,
+            billNumber: result.order.bill_number,
+            jobType: 'bill_receipt',
+            customData: {
+              customerName,
+              billNumber: result.order.bill_number || centralBillNumber,
+              billDate: new Date(billedAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+              itemsSummary: mappedItems.map(item => `${item.item_name} (x${item.quantity})`).join(', ') || 'Salon Services',
+              grandTotal: String(grandTotal),
+              paymentMode: primaryPaymentMode,
+              branchName: cleanBranchName,
+            },
+          });
+          const receiptStatus: WhatsAppMessageStatus = receiptResult.sent
+            ? 'sent'
+            : receiptResult.status === 'retrying'
+              ? 'retrying'
+              : receiptResult.status === 'pending_approval'
+                ? 'pending_approval'
+                : 'failed';
+          await salonRepository.updateOrder(result.order.id, {
+            receipt_whatsapp_status: receiptStatus,
+            receipt_whatsapp_message_id: receiptResult.messageId,
+            receipt_whatsapp_sent_at: receiptResult.sent ? new Date().toISOString() : undefined,
+            receipt_whatsapp_error: receiptResult.sent ? undefined : receiptResult.error,
+            whatsapp_status: receiptStatus,
+          });
+          receiptDispatch = { status: receiptStatus, messageId: receiptResult.messageId, error: receiptResult.error };
+        } catch (receiptError: any) {
+          const error = String(receiptError?.message || receiptError || 'Receipt dispatch failed').slice(0, 500);
+          await salonRepository.updateOrder(result.order.id, {
+            receipt_whatsapp_status: 'failed',
+            receipt_whatsapp_error: error,
+            whatsapp_status: 'failed',
+          }).catch(() => undefined);
+          receiptDispatch = { status: 'failed', error };
+        }
+      }
+
       return res.status(result.created ? 201 : 200).json({
         accepted: true,
         created: result.created,
@@ -468,6 +520,9 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
         branch_name: result.order.branch_name || cleanBranchName,
         smav_central_bill_id: result.order.smav_central_bill_id || smavCentralBillId,
         idempotency_key: result.order.idempotency_key || key,
+        receipt_status: receiptDispatch?.status || result.order.receipt_whatsapp_status || 'queued',
+        receipt_message_id: receiptDispatch?.messageId || result.order.receipt_whatsapp_message_id,
+        receipt_error: receiptDispatch?.error || result.order.receipt_whatsapp_error,
       });
     } catch (err: any) {
       const msg = String(err?.message || err || 'Failed to commit SMAV finalized bill');
@@ -7602,13 +7657,19 @@ app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
       }
     }
 
-    const jobType = req.body?.job_type || (order.receipt_whatsapp_status === 'failed' ? 'bill_receipt' : 'customer_feedback');
+    const requestedJobType = String(req.body?.job_type || '').trim();
+    const jobType = requestedJobType === 'bill_receipt' || requestedJobType === 'customer_feedback'
+      ? requestedJobType
+      : ['queued', 'retrying', 'failed'].includes(String(order.receipt_whatsapp_status || order.whatsapp_status || '').toLowerCase())
+        ? 'bill_receipt'
+        : 'customer_feedback';
     const currentStatus = jobType === 'bill_receipt'
       ? (order.receipt_whatsapp_status || order.whatsapp_status)
       : order.feedback_whatsapp_status;
-    if (currentStatus !== 'failed') {
+    const retryableStatuses = ['queued', 'retrying', 'failed'];
+    if (!retryableStatuses.includes(String(currentStatus || '').toLowerCase())) {
       return res.status(409).json({
-        error: `Retry is only allowed for failed sends. Current status is '${currentStatus || 'unknown'}'.`
+        error: `Send is not available for status '${currentStatus || 'unknown'}'.`
       });
     }
 

@@ -4479,15 +4479,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                          receiptStatus === 'sent' ? 'Sent' :
                                          receiptStatus === 'failed' ? 'Failed' : 'Queued'}
                                       </span>
-                                      {/* Retry button strictly shown ONLY for failed sends */}
-                                      {receiptStatus === 'failed' && targetOrderId && canSendWaTemplates && (
+                                      {/* A historical SMAV bill may have been mirrored before
+                                          receipt dispatch existed. Permit an authorized user to
+                                          dispatch only queued/retrying/failed receipts. */}
+                                      {['queued', 'retrying', 'failed'].includes(String(receiptStatus).toLowerCase()) && targetOrderId && canSendWaTemplates && (
                                         <button
                                           type="button"
                                           onClick={() => handleRetryPosReceipt(targetOrderId)}
                                           className="text-[10px] font-bold text-rose-600 hover:text-rose-800 underline cursor-pointer"
-                                          title="Retry failed WhatsApp receipt"
+                                          title={receiptStatus === 'queued' ? 'Send queued WhatsApp receipt now' : 'Retry WhatsApp receipt'}
                                         >
-                                          Retry
+                                          {receiptStatus === 'queued' ? 'Send now' : 'Retry'}
                                         </button>
                                       )}
                                     </div>
