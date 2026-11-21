@@ -407,6 +407,11 @@ export interface Order {
   feedback_whatsapp_sent_at?: string;
   feedback_whatsapp_source?: 'AUTO_FEEDBACK' | 'MANUAL_FEEDBACK';
   feedback_rating?: FeedbackRating;
+  /** Business date selected for this bill. created_at remains the actual entry time. */
+  billing_date?: string | null;
+  billed_at?: string | null;
+  backdated_by?: string | null;
+  backdated_at?: string | null;
   deleted_at?: string | null;
   deleted_by?: string | null;
   deleted_by_user_id?: string | null;
@@ -446,6 +451,10 @@ export interface PaymentRecord {
   deletion_reason?: string | null;
   restored_at?: string | null;
   restored_by?: string | null;
+  billing_date?: string | null;
+  billed_at?: string | null;
+  backdated_by?: string | null;
+  backdated_at?: string | null;
   created_at: string;
 }
 

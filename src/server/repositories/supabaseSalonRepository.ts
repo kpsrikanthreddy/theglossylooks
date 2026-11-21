@@ -1749,11 +1749,11 @@ export class SupabaseSalonRepository implements ISalonRepository {
     endIso?: string;
   }): Promise<Order[]> {
     const deletedMode = filters?.deleted || 'active';
-    let query = this.client.from('orders').select('*').order('created_at', { ascending: false });
+    let query = this.client.from('orders').select('*').order('billed_at', { ascending: false });
     if (filters?.customerMobile) query = query.ilike('customer_phone', `%${filters.customerMobile}%`);
     if (filters?.paymentStatus) query = query.eq('payment_status', filters.paymentStatus);
-    if (filters?.startIso) query = query.gte('created_at', filters.startIso);
-    if (filters?.endIso) query = query.lte('created_at', filters.endIso);
+    if (filters?.startIso) query = query.gte('billed_at', filters.startIso);
+    if (filters?.endIso) query = query.lte('billed_at', filters.endIso);
     const { data } = await query;
     let ordersList = (data || []) as Order[];
 
@@ -2033,7 +2033,11 @@ export class SupabaseSalonRepository implements ISalonRepository {
         branch_id: insertedOrder.branch_id || null,
         branch_code: orderData.branch_code || insertedOrder.branch_code || null,
         branch_name: orderData.branch_name || insertedOrder.branch_name || null,
-        created_at: insertedOrder.created_at || new Date().toISOString()
+        billing_date: orderData.billing_date || insertedOrder.billing_date || null,
+        billed_at: orderData.billed_at || insertedOrder.billed_at || insertedOrder.created_at || new Date().toISOString(),
+        ...(orderData.backdated_by ? { backdated_by: orderData.backdated_by } : {}),
+        ...(orderData.backdated_at ? { backdated_at: orderData.backdated_at } : {}),
+        created_at: new Date().toISOString()
       });
     }
 
@@ -2728,9 +2732,9 @@ export class SupabaseSalonRepository implements ISalonRepository {
     endIso?: string;
   }): Promise<PaymentRecord[]> {
     const deletedMode = filters?.deleted || 'active';
-    let query = this.client.from('payments').select('*').order('created_at', { ascending: false });
-    if (filters?.startIso) query = query.gte('created_at', filters.startIso);
-    if (filters?.endIso) query = query.lte('created_at', filters.endIso);
+    let query = this.client.from('payments').select('*').order('billed_at', { ascending: false });
+    if (filters?.startIso) query = query.gte('billed_at', filters.startIso);
+    if (filters?.endIso) query = query.lte('billed_at', filters.endIso);
     const { data: paymentsData } = await query;
     let list = (paymentsData || []) as PaymentRecord[];
 

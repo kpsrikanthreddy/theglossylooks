@@ -2769,15 +2769,15 @@ export class SalonDatabase implements ISalonRepository {
     if (filters?.branchId) list = list.filter(o => o.branch_id === filters.branchId);
     if (filters?.startIso) {
       const startMs = new Date(filters.startIso).getTime();
-      list = list.filter(o => new Date(o.created_at).getTime() >= startMs);
+      list = list.filter(o => new Date(o.billed_at || o.created_at).getTime() >= startMs);
     }
     if (filters?.endIso) {
       const endMs = new Date(filters.endIso).getTime();
-      list = list.filter(o => new Date(o.created_at).getTime() <= endMs);
+      list = list.filter(o => new Date(o.billed_at || o.created_at).getTime() <= endMs);
     }
     if (filters?.customerMobile) list = list.filter(o => o.customer_phone.includes(filters.customerMobile!));
     if (filters?.paymentStatus) list = list.filter(o => o.payment_status === filters.paymentStatus);
-    return list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    return list.sort((a, b) => new Date(b.billed_at || b.created_at).getTime() - new Date(a.billed_at || a.created_at).getTime());
   }
 
   public async getOrderById(id: string): Promise<Order | null> {
@@ -3099,6 +3099,8 @@ export class SalonDatabase implements ISalonRepository {
       cashier_id: cashier ? cashier.id : orderData.cashier_id,
       cashier_name: cashier ? cashier.name : (orderData.cashier_name || 'Cashier'),
       items: resolvedItems,
+      billing_date: orderData.billing_date || new Date().toISOString().slice(0, 10),
+      billed_at: orderData.billed_at || new Date().toISOString(),
       created_at: new Date().toISOString()
     };
 
@@ -3165,6 +3167,10 @@ export class SalonDatabase implements ISalonRepository {
         status: 'Success',
         notes: newOrder.notes || 'POS Order Payment',
         recorded_by: performedBy || newOrder.cashier_name || 'Front Desk',
+        billing_date: newOrder.billing_date,
+        billed_at: newOrder.billed_at || newOrder.created_at,
+        backdated_by: newOrder.backdated_by,
+        backdated_at: newOrder.backdated_at,
         created_at: new Date().toISOString()
       };
       this.data.payments.unshift(payment);
@@ -3415,11 +3421,11 @@ export class SalonDatabase implements ISalonRepository {
     if (filters?.branchId) list = list.filter(p => p.branch_id === filters.branchId);
     if (filters?.startIso) {
       const startMs = new Date(filters.startIso).getTime();
-      list = list.filter(p => new Date(p.created_at).getTime() >= startMs);
+      list = list.filter(p => new Date(p.billed_at || p.created_at).getTime() >= startMs);
     }
     if (filters?.endIso) {
       const endMs = new Date(filters.endIso).getTime();
-      list = list.filter(p => new Date(p.created_at).getTime() <= endMs);
+      list = list.filter(p => new Date(p.billed_at || p.created_at).getTime() <= endMs);
     }
     return list;
   }

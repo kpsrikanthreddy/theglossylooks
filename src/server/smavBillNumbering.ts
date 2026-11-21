@@ -44,6 +44,9 @@ export interface SmavBillReserveRequest {
   requestedBy: string;
   requestedByUserId?: string;
   centralAuthId?: string;
+  /** YYYY-MM-DD business date. Omitted means today's Asia/Kolkata date. */
+  billingDate?: string;
+  actorRole?: string;
 }
 
 export interface SmavBillReserveResponse {
@@ -648,6 +651,8 @@ export async function reserveSmavCentralBillNumber(
     requested_by: input.requestedBy,
     ...(input.requestedByUserId ? { requestedByUserId: input.requestedByUserId, requested_by_user_id: input.requestedByUserId } : {}),
     ...(input.centralAuthId ? { centralAuthId: input.centralAuthId, central_auth_id: input.centralAuthId } : {}),
+    ...(input.actorRole ? { actorRole: input.actorRole, actor_role: input.actorRole } : {}),
+    ...(input.billingDate ? { billingDate: input.billingDate, billing_date: input.billingDate } : {}),
     currency: 'INR',
   };
 
@@ -811,8 +816,8 @@ export async function finalizeSmavCentralBillNumber(
     cashier_name: input.order.cashier_name || input.finalizedBy,
     ...(input.finalizedByUserId ? { finalizedByUserId: input.finalizedByUserId } : {}),
     ...(input.centralAuthId ? { centralAuthId: input.centralAuthId } : {}),
-    billedAt: input.order.created_at,
-    billed_at: input.order.created_at,
+    billedAt: input.order.billed_at || input.order.created_at,
+    billed_at: input.order.billed_at || input.order.created_at,
     items: (input.order.items || []).map(item => ({
       serviceId: item.service_id,
       productId: item.product_id,

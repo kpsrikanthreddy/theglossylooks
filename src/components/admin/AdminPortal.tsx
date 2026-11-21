@@ -375,6 +375,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   const [posDiscount, setPosDiscount] = useState<number>(0);
   const [posTip, setPosTip] = useState<number>(0);
   const [posPaymentMode, setPosPaymentMode] = useState<Order['primary_payment_mode'] | ''>('UPI');
+  const [posBillingDate, setPosBillingDate] = useState(() =>
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
+  );
   const [posBranchId, setPosBranchId] = useState('');
   const [posPermittedBranches, setPosPermittedBranches] = useState<Array<{
     id: string;
@@ -982,6 +985,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       posBranchRef.current?.reportValidity();
       return;
     }
+    const todayInIndia = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(posBillingDate) || posBillingDate > todayInIndia) {
+      toast.error('Billing Date must be today or a past date. Future dates are not allowed.');
+      return;
+    }
+    if (!isOwner && posBillingDate !== todayInIndia) {
+      toast.error('Only Owner, Admin, and Superadmin may create a backdated bill.');
+      return;
+    }
     if (!posCustomerName.trim()) {
       posCustomerNameRef.current?.focus();
       posCustomerNameRef.current?.reportValidity();
@@ -1048,7 +1060,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           payment_status: 'Paid',
           primary_payment_mode: posPaymentMode as Order['primary_payment_mode'],
           cashier_name: currentUser?.name || 'Reception',
-          notes: posNotes
+          notes: posNotes,
+          billing_date: posBillingDate
         }, currentUser?.name);
 
         setPosSuccessOrder(newOrder);
@@ -1095,6 +1108,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     setPosDiscount(0);
     setPosTip(0);
     setPosNotes('');
+    setPosBillingDate(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()));
     setPosSuccessOrder(null);
     setPosBillingStatus(null);
     setPosBillingError(null);
@@ -3448,6 +3462,25 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               <p className="mt-1 text-[10px] text-amber-700">{posBranchesWarning}</p>
                             )}
                           </div>
+
+                          {isOwner && (
+                            <div className="bg-amber-50 p-3 rounded-xl border border-amber-200">
+                              <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                                Billing Date
+                              </label>
+                              <input
+                                type="date"
+                                required
+                                max={new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())}
+                                value={posBillingDate}
+                                onChange={(e) => setPosBillingDate(e.target.value)}
+                                className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-xl outline-none focus:ring-2 focus:ring-[#D4AF37]/50 font-medium text-slate-900"
+                              />
+                              <p className="mt-1 text-[10px] text-amber-800">
+                                Backdated bills are audit logged. The central bill number uses this selected date.
+                              </p>
+                            </div>
+                          )}
 
                           {/* Customer Info */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

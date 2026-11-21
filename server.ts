@@ -54,6 +54,7 @@ import {
   hasFullPaymentLedgerAccess,
   isRestrictedPaymentLedgerStaff,
   canSendWhatsAppTemplates,
+  getKolkataDateString,
   getKolkataTodayBounds,
   isWithinKolkataToday,
   validateWhatsAppPhone,
@@ -6909,7 +6910,8 @@ app.post('/api/orders', async (req, res) => {
       appointment_id,
       branch_id,
       branch_code,
-      idempotency_key
+      idempotency_key,
+      billing_date
     } = req.body;
 
     if (!customer_name || !items || !items.length) {
@@ -6926,6 +6928,24 @@ app.post('/api/orders', async (req, res) => {
         error: 'Invalid recipient phone number. A valid 10-digit Indian mobile number (e.g. 9848012345) is required.'
       });
     }
+
+    // Business date is deliberately separate from created_at.  This retains an
+    // immutable record of when a backdated bill was actually entered.
+    const todayInIndia = getKolkataDateString();
+    const requestedBillingDate = String(billing_date || todayInIndia).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedBillingDate)) {
+      return res.status(400).json({ error: 'Billing Date must be a valid YYYY-MM-DD date.' });
+    }
+    if (requestedBillingDate > todayInIndia) {
+      return res.status(400).json({ error: 'Billing Date cannot be in the future.' });
+    }
+    const isBackdatedBill = requestedBillingDate !== todayInIndia;
+    if (isBackdatedBill && (!authAdmin || !hasFullPaymentLedgerAccess(authAdmin.role))) {
+      return res.status(403).json({
+        error: 'Only Owner, Admin, and Superadmin may generate bills for past dates.'
+      });
+    }
+    const billedAt = `${requestedBillingDate}T12:00:00.000+05:30`;
 
     // 1. Require explicit active Branch selection loaded dynamically from SMAV before bill generation
     const requestedBranchId = String(branch_id || '').trim();
@@ -7036,6 +7056,8 @@ app.post('/api/orders', async (req, res) => {
       requestedBy: actor,
       requestedByUserId: authAdmin?.id,
       centralAuthId: authAdmin?.central_auth_id,
+      actorRole: authAdmin?.role,
+      billingDate: requestedBillingDate,
     });
 
     if (!reserveResult.ok || !reserveResult.billNumber) {
@@ -7087,13 +7109,28 @@ app.post('/api/orders', async (req, res) => {
       payment_status: payment_status || 'Paid',
       primary_payment_mode: primary_payment_mode || 'UPI',
       cashier_name: cashier_name || actor,
-      notes: notes || '',
+      notes: isBackdatedBill
+        ? `${String(notes || '').trim()}${notes ? ' ' : ''}[Backdated bill entered by ${actor} on ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} for billing date ${requestedBillingDate}]`
+        : (notes || ''),
+      billing_date: requestedBillingDate,
+      billed_at: billedAt,
+      ...(isBackdatedBill ? { backdated_by: actor, backdated_at: new Date().toISOString() } : {}),
       whatsapp_status: 'sending',
       receipt_whatsapp_status: 'sending',
       feedback_whatsapp_status: 'scheduled',
       feedback_whatsapp_scheduled_at: feedbackScheduledTime,
       feedback_whatsapp_source: 'AUTO_FEEDBACK'
     }, actor);
+
+    if (isBackdatedBill) {
+      await salonRepository.logAudit(
+        'CREATE_BACKDATED_BILL',
+        'Order',
+        order.id,
+        actor,
+        `Backdated bill ${order.bill_number} created on ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} for billing date ${requestedBillingDate}.`
+      );
+    }
 
     // 5. Call SMAV Finalize API ONLY AFTER the local bill transaction is committed
     const finalizeResult = await finalizeSmavCentralBillNumber({
@@ -7168,7 +7205,7 @@ app.post('/api/orders', async (req, res) => {
               total: order.grand_total,
               payment_method: order.primary_payment_mode,
               payment_status: order.payment_status,
-              date: new Date(order.created_at || now).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+              date: new Date(order.billed_at || order.created_at || now).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
             },
           });
         }
@@ -7214,7 +7251,7 @@ app.post('/api/orders', async (req, res) => {
 
     // 9. Immediately send the approved WhatsApp template: gl_bill_receipt with the immutable central bill number
     const itemsSummary = (order.items || []).map(i => `${i.item_name} (x${i.quantity})`).join(', ');
-    const billDate = new Date(order.created_at || now).toLocaleString('en-IN', {
+    const billDate = new Date(order.billed_at || order.created_at || now).toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       day: '2-digit',
       month: 'short',
@@ -7679,7 +7716,7 @@ app.post('/api/admin/orders/:id/whatsapp/retry', async (req, res) => {
 
     if (jobType === 'bill_receipt') {
       const itemsSummary = (order.items || []).map(i => `${i.item_name} (x${i.quantity})`).join(', ');
-      const billDate = new Date(order.created_at || Date.now()).toLocaleString('en-IN', {
+      const billDate = new Date(order.billed_at || order.created_at || Date.now()).toLocaleString('en-IN', {
         timeZone: 'Asia/Kolkata',
         day: '2-digit',
         month: 'short',
