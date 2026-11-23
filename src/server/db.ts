@@ -2841,12 +2841,16 @@ export class SalonDatabase implements ISalonRepository {
         ? 'Void'
         : 'Success';
 
-    let existingOrder = await this.getOrderByBillNumber(centralBillNum);
+    // Match by smav_central_bill_id FIRST, then canonical bill_number
+    let existingOrder: Order | null = null;
+    if (input.smav_central_bill_id) {
+      existingOrder = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
+    }
+    if (!existingOrder) {
+      existingOrder = await this.getOrderByBillNumber(centralBillNum);
+    }
     if (!existingOrder && input.idempotency_key) {
       existingOrder = await this.getOrderByIdempotencyKey(input.idempotency_key);
-    }
-    if (!existingOrder && input.smav_central_bill_id) {
-      existingOrder = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
     }
     if (!existingOrder && input.local_order_id && input.local_order_id !== centralBillNum) {
       existingOrder = await this.getOrderById(input.local_order_id);
@@ -2954,6 +2958,7 @@ export class SalonDatabase implements ISalonRepository {
           status: paymentLedgerStatus,
           notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
           recorded_by: input.cashier_name,
+          billed_at: billDateIso,
           created_at: billDateIso,
         };
         this.data.payments.unshift(committedPayment);
@@ -3018,6 +3023,7 @@ export class SalonDatabase implements ISalonRepository {
       notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
       whatsapp_status: 'queued',
       receipt_whatsapp_status: 'queued',
+      billed_at: billDateIso,
       created_at: billDateIso,
     };
 
@@ -3039,6 +3045,7 @@ export class SalonDatabase implements ISalonRepository {
       status: paymentLedgerStatus,
       notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
       recorded_by: input.cashier_name,
+      billed_at: billDateIso,
       created_at: billDateIso,
     };
     this.data.payments.unshift(committedPayment);

@@ -17,7 +17,6 @@ import {
   reserveSmavCentralBillNumber,
   finalizeSmavCentralBillNumber,
   upsertSmavCentralBill,
-  fetchSmavCentralLedger,
   voidSmavCentralBill,
   restoreSmavCentralBill,
   getSmavGatewayBaseUrl,
@@ -37,6 +36,10 @@ import {
   buildAdminAlertDedupKeys,
   type ApprovedMetaTemplateSchema,
 } from './src/server/whatsappAdminAlerts.ts';
+import {
+  reconcileCentralLedgerIntoLocal,
+  buildMergedLedgerPayments,
+} from './src/server/paymentLedgerReconcile.ts';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -1477,25 +1480,182 @@ app.get('/api/customer/orders', async (req, res) => {
 // HMAC-signed salon sessions. Configure SALON_SESSION_SECRET in the server environment.
 // No client-supplied user ID or role is trusted for authorization.
 const sessionSecret = process.env.SALON_SESSION_SECRET || '';
+const ADMIN_SESSION_COOKIE_NAME = 'tgl_admin_session';
+const configuredSessionDays = Number(process.env.ADMIN_SESSION_TTL_DAYS || '30');
+const ADMIN_SESSION_TTL_MS =
+  (Number.isFinite(configuredSessionDays) && configuredSessionDays >= 1
+    ? Math.min(90, Math.floor(configuredSessionDays))
+    : 30) *
+  24 *
+  60 *
+  60 *
+  1000;
+const revokedAdminSessionJtis = new Set<string>();
+
+interface ParsedSalonSession {
+  sub: string;
+  jti?: string;
+  iat?: number;
+  exp: number;
+}
+
 function signSalonSession(userId: string): string {
   if (sessionSecret.length < 32) throw new Error('SALON_SESSION_SECRET must contain at least 32 characters');
-  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
+  const now = Date.now();
+  const payload = Buffer.from(
+    JSON.stringify({
+      sub: userId,
+      jti: crypto.randomBytes(12).toString('hex'),
+      iat: now,
+      exp: now + ADMIN_SESSION_TTL_MS,
+    })
+  ).toString('base64url');
   const signature = crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
-function readSalonSession(token: string): string | null {
-  if (!sessionSecret || !token) return null;
+
+function parseSalonSessionDetailed(token: string):
+  | { ok: true; session: ParsedSalonSession }
+  | { ok: false; code: 'SESSION_INVALID' | 'SESSION_EXPIRED' } {
+  if (!sessionSecret || !token) return { ok: false, code: 'SESSION_INVALID' };
   const [payload, signature, extra] = token.split('.');
-  if (!payload || !signature || extra) return null;
+  if (!payload || !signature || extra) return { ok: false, code: 'SESSION_INVALID' };
   const expected = crypto.createHmac('sha256', sessionSecret).update(payload).digest();
   let actual: Buffer;
-  try { actual = Buffer.from(signature, 'base64url'); } catch { return null; }
-  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    actual = Buffer.from(signature, 'base64url');
+  } catch {
+    return { ok: false, code: 'SESSION_INVALID' };
+  }
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    return { ok: false, code: 'SESSION_INVALID' };
+  }
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return typeof parsed.sub === 'string' && Number.isFinite(parsed.exp) && parsed.exp > Date.now() ? parsed.sub : null;
-  } catch { return null; }
+    if (typeof parsed.sub !== 'string' || !Number.isFinite(parsed.exp)) {
+      return { ok: false, code: 'SESSION_INVALID' };
+    }
+    if (parsed.exp <= Date.now()) {
+      return { ok: false, code: 'SESSION_EXPIRED' };
+    }
+    return { ok: true, session: parsed as ParsedSalonSession };
+  } catch {
+    return { ok: false, code: 'SESSION_INVALID' };
+  }
 }
+
+function readSalonSession(token: string): string | null {
+  const result = parseSalonSessionDetailed(token);
+  return result.ok ? result.session.sub : null;
+}
+
+function extractCookieValue(req: express.Request, name: string): string {
+  const raw = req.headers.cookie;
+  if (!raw) return '';
+  const pairs = raw.split(';');
+  for (const part of pairs) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx).trim();
+    if (key === name) {
+      try {
+        return decodeURIComponent(part.slice(eqIdx + 1).trim());
+      } catch {
+        return part.slice(eqIdx + 1).trim();
+      }
+    }
+  }
+  return '';
+}
+
+function isHttpsRequest(req: express.Request): boolean {
+  const forwarded = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return Boolean(req.secure || forwarded === 'https');
+}
+
+function setAdminSessionCookie(req: express.Request, res: express.Response, token: string): void {
+  const maxAgeSeconds = Math.floor(ADMIN_SESSION_TTL_MS / 1000);
+  const parts = [
+    `${ADMIN_SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+function clearAdminSessionCookie(req: express.Request, res: express.Response): void {
+  const parts = [
+    `${ADMIN_SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    'Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+function hasValidCookieCsrfHeader(req: express.Request): boolean {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return true;
+  if (req.headers['x-requested-with']) return true;
+  const origin = String(req.headers.origin || '').trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  if (origin && host) {
+    try {
+      return new URL(origin).host === host;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function isAdminSessionRevoked(jti?: string): Promise<boolean> {
+  if (!jti) return false;
+  if (revokedAdminSessionJtis.has(jti)) return true;
+  try {
+    const revoked = await salonRepository.isWebhookEventProcessed(`admin_session_revoked:${jti}`);
+    if (revoked) revokedAdminSessionJtis.add(jti);
+    return revoked;
+  } catch {
+    return false;
+  }
+}
+
+async function revokeAdminSession(jti?: string): Promise<void> {
+  if (!jti) return;
+  revokedAdminSessionJtis.add(jti);
+  try {
+    await salonRepository.recordProcessedWebhookEvent(`admin_session_revoked:${jti}`, 'admin_session_revoked');
+  } catch {
+    // Non-fatal; in-memory set still blocks replay in current instance
+  }
+}
+
+function extractAdminTokenFromRequest(req: express.Request): { token: string; source: 'bearer' | 'cookie' | 'none' } {
+  const header = req.headers.authorization;
+  const bearer = header?.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (bearer) {
+    return { token: bearer, source: 'bearer' };
+  }
+  const cookieToken = extractCookieValue(req, ADMIN_SESSION_COOKIE_NAME);
+  if (cookieToken) {
+    return { token: cookieToken, source: 'cookie' };
+  }
+  return { token: '', source: 'none' };
+}
+
 function verifySalonPassword(stored: string, supplied: string): boolean {
   if (stored.startsWith('scrypt$')) {
     const [, salt, expectedHex] = stored.split('$');
@@ -1511,13 +1671,115 @@ function hashSalonPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
   return `scrypt$${salt}$${crypto.scryptSync(password, salt, 64).toString('hex')}`;
 }
+
+async function resolveAdminBranchPermissions(admin: any): Promise<{
+  all_branches: boolean;
+  assigned_branch_id: string | null;
+  branches: Array<{ id: string; name: string; code?: string }>;
+}> {
+  const fullAccess = hasFullPaymentLedgerAccess(admin?.role);
+  const allBranches = await salonRepository.getBranches().catch(() => []);
+  const activeBranches = allBranches.filter(b => b.is_active !== false);
+  if (fullAccess) {
+    return {
+      all_branches: true,
+      assigned_branch_id: admin?.branch_id || null,
+      branches: activeBranches.map(b => ({
+        id: b.id,
+        name: b.name,
+        code: b.smav_branch_code || b.code,
+      })),
+    };
+  }
+
+  const assignedBranchId = await resolveStaffAssignedBranchId(admin).catch(() => admin?.branch_id || undefined);
+  const matched = activeBranches.filter(b => assignedBranchId && b.id === assignedBranchId);
+  return {
+    all_branches: false,
+    assigned_branch_id: assignedBranchId || null,
+    branches: matched.map(b => ({
+      id: b.id,
+      name: b.name,
+      code: b.smav_branch_code || b.code,
+    })),
+  };
+}
+
+const getAuthAdminDetailed = async (req: express.Request): Promise<
+  | { ok: true; admin: any; session: ParsedSalonSession }
+  | { ok: false; status: number; code: string; error: string }
+> => {
+  const { token, source } = extractAdminTokenFromRequest(req);
+  if (!token) {
+    return { ok: false, status: 401, code: 'SESSION_INVALID', error: 'Authentication required.' };
+  }
+  if (source === 'cookie' && !hasValidCookieCsrfHeader(req)) {
+    return { ok: false, status: 403, code: 'CSRF_CHECK_FAILED', error: 'Cross-site request blocked.' };
+  }
+
+  const parsed = parseSalonSessionDetailed(token);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      status: 401,
+      code: parsed.code,
+      error: parsed.code === 'SESSION_EXPIRED' ? 'Session expired. Please sign in again.' : 'Invalid session token.',
+    };
+  }
+
+  if (await isAdminSessionRevoked(parsed.session.jti)) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'SESSION_REVOKED',
+      error: 'Session has been signed out. Please sign in again.',
+    };
+  }
+
+  let users: any[];
+  try {
+    users = await salonRepository.getUsers();
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 503,
+      code: 'AUTH_BACKEND_UNAVAILABLE',
+      error: err?.message || 'Unable to verify session right now. Please retry.',
+    };
+  }
+
+  const user = users.find(u => u.id === parsed.session.sub);
+  if (!user) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'SESSION_INVALID',
+      error: 'Account no longer exists. Please sign in again.',
+    };
+  }
+  if (!user.is_active) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'ACCOUNT_DISABLED',
+      error: 'This staff account has been deactivated. Please contact the Salon Owner.',
+    };
+  }
+  if (!user.role || !AUTHORIZED_STAFF_ROLES.includes(user.role)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'ACCOUNT_UNAUTHORIZED',
+      error: 'Account role is not authorized for the admin portal.',
+    };
+  }
+
+  return { ok: true, admin: user, session: parsed.session };
+};
+
 const getAuthAdmin = async (req: express.Request) => {
-  const header = req.headers.authorization;
-  const token = header?.startsWith('Bearer ') ? header.slice(7) : '';
-  const userId = readSalonSession(token);
-  if (!userId) return null;
-  const user = (await salonRepository.getUsers()).find(u => u.id === userId);
-  return user?.is_active ? user : null;
+  const result = await getAuthAdminDetailed(req);
+  return result.ok ? result.admin : null;
 };
 
 // ----------------------------------------------------------------------------
@@ -1673,11 +1935,19 @@ app.post(['/api/auth/admin/login', '/auth/admin/login'], async (req, res) => {
     );
 
     // Update last login
-    await salonRepository.updateUser(user.id, { last_login_at: new Date().toISOString() }, user.name);
+    const nowIso = new Date().toISOString();
+    await salonRepository.updateUser(user.id, { last_login_at: nowIso }, user.name);
+
+    const sessionToken = signSalonSession(user.id);
+    const expiresAtIso = new Date(Date.now() + ADMIN_SESSION_TTL_MS).toISOString();
+    const branchPermissions = await resolveAdminBranchPermissions(user);
+    setAdminSessionCookie(req, res, sessionToken);
 
     res.json({
       success: true,
-      token: signSalonSession(user.id),
+      token: sessionToken,
+      expires_at: expiresAtIso,
+      branch_permissions: branchPermissions,
       user: {
         id: user.id,
         user_id: user.user_id,
@@ -1685,7 +1955,9 @@ app.post(['/api/auth/admin/login', '/auth/admin/login'], async (req, res) => {
         email: user.email,
         role: user.role,
         phone: user.phone,
-        last_login_at: new Date().toISOString()
+        branch_id: user.branch_id || branchPermissions.assigned_branch_id || undefined,
+        is_active: user.is_active,
+        last_login_at: nowIso
       }
     });
   } catch (err: any) {
@@ -1693,22 +1965,72 @@ app.post(['/api/auth/admin/login', '/auth/admin/login'], async (req, res) => {
   }
 });
 
-// Current Authenticated Admin User Profile (Single Source of Truth)
-app.get(['/api/auth/admin/me', '/auth/admin/me', '/api/admin/me', '/admin/me'], async (req, res) => {
-  const admin = await getAuthAdmin(req);
-  if (!admin) {
-    return res.status(401).json({ error: 'Unauthorized or session expired.' });
+// Current Authenticated Admin User Profile & Sliding Session Renewal (Single Source of Truth)
+const handleAdminSessionProfile = async (req: express.Request, res: express.Response) => {
+  try {
+    const auth = await getAuthAdminDetailed(req);
+    if (!auth.ok) {
+      if (auth.status === 401 || auth.status === 403) {
+        clearAdminSessionCookie(req, res);
+      }
+      return res.status(auth.status).json({ error: auth.error, code: auth.code });
+    }
+
+    const { admin } = auth;
+    const branchPermissions = await resolveAdminBranchPermissions(admin);
+    // Sliding session renewal: keep active admins signed in across refreshes/days until explicit Sign Out
+    const refreshedToken = signSalonSession(admin.id);
+    const expiresAtIso = new Date(Date.now() + ADMIN_SESSION_TTL_MS).toISOString();
+    setAdminSessionCookie(req, res, refreshedToken);
+
+    return res.json({
+      id: admin.id,
+      user_id: admin.user_id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      phone: admin.phone,
+      branch_id: admin.branch_id || branchPermissions.assigned_branch_id || undefined,
+      is_active: admin.is_active,
+      last_login_at: admin.last_login_at,
+      branch_permissions: branchPermissions,
+      token: refreshedToken,
+      expires_at: expiresAtIso,
+    });
+  } catch (err: any) {
+    return res.status(503).json({
+      error: err?.message || 'Unable to verify session right now. Please retry.',
+      code: 'AUTH_BACKEND_UNAVAILABLE',
+    });
   }
-  res.json({
-    id: admin.id,
-    user_id: admin.user_id,
-    name: admin.name,
-    email: admin.email,
-    role: admin.role,
-    phone: admin.phone,
-    is_active: admin.is_active,
-    last_login_at: admin.last_login_at
-  });
+};
+
+app.get(['/api/auth/admin/me', '/auth/admin/me', '/api/admin/me', '/admin/me'], handleAdminSessionProfile);
+app.post(['/api/auth/admin/session/refresh', '/auth/admin/session/refresh'], handleAdminSessionProfile);
+
+// Explicit Sign Out — revokes current session token & clears HttpOnly session cookie
+app.post(['/api/auth/admin/logout', '/auth/admin/logout'], async (req, res) => {
+  try {
+    const { token } = extractAdminTokenFromRequest(req);
+    if (token) {
+      const parsed = parseSalonSessionDetailed(token);
+      if (parsed.ok) {
+        await revokeAdminSession(parsed.session.jti);
+        await salonRepository.logAudit(
+          'SECURITY_LOGOUT',
+          'Auth',
+          parsed.session.sub,
+          'Admin',
+          'Explicit admin sign out'
+        ).catch(() => {});
+      }
+    }
+    clearAdminSessionCookie(req, res);
+    return res.json({ success: true });
+  } catch (err: any) {
+    clearAdminSessionCookie(req, res);
+    return res.status(200).json({ success: true });
+  }
 });
 
 // User Management - RESTRICTED TO OWNER ONLY
@@ -8745,37 +9067,86 @@ app.get('/api/payments', async (req, res) => {
     }
 
     const fullAccess = hasFullPaymentLedgerAccess(admin.role);
-    if (!fullAccess) {
-      // STAFF roles (RECEPTIONIST, STYLIST, POS_BILLING, MANAGER, INVENTORY_STAFF, etc.):
-      // Strictly enforce today's Asia/Kolkata window (12:00 AM - 11:59:59.999 PM) and assigned branch.
-      // Ignore any client query tampering (deleted, branch_id, start_iso, end_iso, date range).
-      const todayBounds = getKolkataTodayBounds();
-      const staffBranch = await resolveStaffAssignedBranchId(admin);
-      const list = await salonRepository.getPayments({
-        deleted: 'active',
-        branchId: staffBranch,
-        startIso: todayBounds.startIso,
-        endIso: todayBounds.endIso
-      });
-      return res.json(list);
-    }
+    const todayBounds = getKolkataTodayBounds();
+    const todayStr = todayBounds.dateStr;
 
-    const deletedParam = String(req.query.deleted || 'active').toLowerCase() as 'active' | 'deleted' | 'all';
-    const branchId = req.query.branch_id && req.query.branch_id !== 'all'
-      ? String(req.query.branch_id)
-      : undefined;
-    const startIso = typeof req.query.start_iso === 'string' ? req.query.start_iso : undefined;
-    const endIso = typeof req.query.end_iso === 'string' ? req.query.end_iso : undefined;
+    const deletedParam = fullAccess
+      ? (String(req.query.deleted || 'active').toLowerCase() as 'active' | 'deleted' | 'all')
+      : 'active';
+    const effectiveDeleted: 'active' | 'deleted' | 'all' =
+      ['active', 'deleted', 'all'].includes(deletedParam) ? deletedParam : 'active';
 
-    const list = await salonRepository.getPayments({
-      deleted: ['active', 'deleted', 'all'].includes(deletedParam) ? deletedParam : 'active',
-      branchId,
-      startIso,
-      endIso
+    const effectiveBranchId = fullAccess
+      ? (req.query.branch_id && req.query.branch_id !== 'all' ? String(req.query.branch_id) : undefined)
+      : await resolveStaffAssignedBranchId(admin);
+
+    const startIso = fullAccess
+      ? (typeof req.query.start_iso === 'string' ? req.query.start_iso : undefined)
+      : todayBounds.startIso;
+    const endIso = fullAccess
+      ? (typeof req.query.end_iso === 'string' ? req.query.end_iso : undefined)
+      : todayBounds.endIso;
+
+    const fromDate = !fullAccess
+      ? todayStr
+      : (startIso ? getKolkataDateString(startIso) : undefined);
+    const toDate = !fullAccess
+      ? todayStr
+      : (endIso ? getKolkataDateString(endIso) : undefined);
+
+    const reconcileScope: 'today' | 'history' | 'deleted' =
+      !fullAccess
+        ? 'today'
+        : effectiveDeleted === 'deleted'
+        ? 'deleted'
+        : 'history';
+
+    const localBranches = await salonRepository.getBranches().catch(() => []);
+
+    // Reconcile finalized central bills from SMAV Central into local orders/order_items/payments/CRM
+    // (non-fatal fallback to local records if SMAV Central is temporarily unreachable)
+    const reconcileResult = await reconcileCentralLedgerIntoLocal({
+      repo: salonRepository,
+      scope: reconcileScope,
+      fromDate,
+      toDate,
+      branchId: effectiveBranchId,
+      admin,
+      localBranches,
     });
-    res.json(list);
+
+    // Reload local orders & payments AFTER reconciliation so newly upserted bills are included
+    const [localOrders, localPayments] = await Promise.all([
+      salonRepository.getOrders({
+        deleted: effectiveDeleted,
+        branchId: effectiveBranchId,
+        startIso,
+        endIso,
+      }).catch(() => []),
+      salonRepository.getPayments({
+        deleted: effectiveDeleted,
+        branchId: effectiveBranchId,
+        startIso,
+        endIso,
+      }).catch(() => []),
+    ]);
+
+    const merged = buildMergedLedgerPayments({
+      scope: reconcileScope,
+      todayStr,
+      fromDate,
+      toDate,
+      effectiveBranchId,
+      adminRole: admin.role,
+      smavResult: reconcileResult.smavResult,
+      reconcileResult,
+      localOrders,
+      localPayments,
+    });
+
+    return res.json(merged.payments);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -8890,8 +9261,24 @@ app.get('/api/admin/payments/ledger', async (req, res) => {
     const endIso = effectiveToDate ? `${effectiveToDate}T23:59:59.999+05:30` : undefined;
     const localDeletedMode: 'active' | 'deleted' = scope === 'deleted' ? 'deleted' : 'active';
 
-    const [localBranches, localOrders, localPayments] = await Promise.all([
-      salonRepository.getBranches().catch(() => []),
+    const localBranches = await salonRepository.getBranches().catch(() => []);
+
+    // Pull finalized central bills from SMAV Central and idempotently reconcile
+    // missing local orders, order_items, payments, and CRM visit records
+    const reconcileResult = await reconcileCentralLedgerIntoLocal({
+      repo: salonRepository,
+      scope,
+      fromDate: effectiveFromDate,
+      toDate: effectiveToDate,
+      branchId: effectiveBranchId,
+      search: rawSearch || undefined,
+      admin,
+      localBranches,
+    });
+
+    // Read local orders & payments AFTER reconciliation so freshly reconciled bills
+    // and existing local WhatsApp statuses are both present
+    const [localOrders, localPayments] = await Promise.all([
       salonRepository.getOrders({
         deleted: localDeletedMode,
         branchId: effectiveBranchId,
@@ -8906,134 +9293,18 @@ app.get('/api/admin/payments/ledger', async (req, res) => {
       }).catch(() => []),
     ]);
 
-    const orderByCentralId = new Map<string, Order>();
-    const orderByBillNum = new Map<string, Order>();
-    const orderById = new Map<string, Order>();
-    for (const o of localOrders) {
-      orderById.set(o.id, o);
-      if (o.bill_number) orderByBillNum.set(o.bill_number, o);
-      if (o.smav_central_bill_id) orderByCentralId.set(o.smav_central_bill_id, o);
-    }
-
-    const smavResult = await fetchSmavCentralLedger(
-      {
-        scope,
-        timezone: 'Asia/Kolkata',
-        fromDate: effectiveFromDate,
-        toDate: effectiveToDate,
-        branchId: effectiveBranchId,
-        search: rawSearch || undefined,
-        admin,
-      },
-      localBranches
-    );
-
-    const matchesLocalFilters = (p: PaymentRecord): boolean => {
-      if (effectiveBranchId && p.branch_id && p.branch_id !== effectiveBranchId) return false;
-      const effectiveTs = p.billed_at || p.created_at;
-      const dateStr = getKolkataDateString(effectiveTs);
-      if (scope === 'today' && dateStr !== todayStr) return false;
-      if (effectiveFromDate && dateStr < effectiveFromDate) return false;
-      if (effectiveToDate && dateStr > effectiveToDate) return false;
-      if (rawSearch) {
-        const q = rawSearch.toLowerCase();
-        const hay = `${p.bill_number || ''} ${p.customer_name || ''} ${p.customer_phone || ''} ${p.branch_name || ''} ${p.branch_code || ''} ${(p.items || []).map(i => `${i.item_name} ${i.staff_name || ''}`).join(' ')}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    };
-
-    const enrichWithLocalOrder = (p: PaymentRecord): PaymentRecord => {
-      const localOrd =
-        (p.smav_central_bill_id ? orderByCentralId.get(p.smav_central_bill_id) : undefined) ||
-        (p.bill_number ? orderByBillNum.get(p.bill_number) : undefined) ||
-        (p.order_id ? orderById.get(p.order_id) : undefined);
-
-      if (!localOrd) return p;
-
-      return {
-        ...p,
-        order_id: localOrd.id,
-        branch_id: p.branch_id || localOrd.branch_id,
-        branch_code: p.branch_code || localOrd.branch_code,
-        branch_name: p.branch_name || localOrd.branch_name,
-        subtotal: p.subtotal ?? localOrd.subtotal,
-        discount: p.discount ?? localOrd.discount,
-        tax_amount: p.tax_amount ?? localOrd.tax_amount,
-        items: p.items && p.items.length > 0 ? p.items : localOrd.items,
-        receipt_whatsapp_status: localOrd.receipt_whatsapp_status || p.receipt_whatsapp_status,
-        receipt_whatsapp_error: localOrd.receipt_whatsapp_error || p.receipt_whatsapp_error,
-        feedback_whatsapp_status: localOrd.feedback_whatsapp_status || p.feedback_whatsapp_status,
-        smav_bill_status: localOrd.smav_bill_status || p.smav_bill_status,
-        smav_finalize_error: localOrd.smav_finalize_error ?? p.smav_finalize_error,
-        is_legacy_bill: localOrd.is_legacy_bill ?? p.is_legacy_bill,
-        billing_date: p.billing_date || localOrd.billing_date,
-        billed_at: p.billed_at || localOrd.billed_at,
-        backdated_by: p.backdated_by || localOrd.backdated_by,
-        backdated_at: p.backdated_at || localOrd.backdated_at,
-      };
-    };
-
-    let mergedPayments: PaymentRecord[] = [];
-    let source: 'smav' | 'local_fallback' = 'smav';
-    let warning: string | null = null;
-
-    if (smavResult.ok) {
-      const seenBillNums = new Set<string>();
-      const seenCentralIds = new Set<string>();
-      const seenOrderIds = new Set<string>();
-
-      for (const row of smavResult.payments) {
-        const enriched = enrichWithLocalOrder(row);
-        if (scope === 'deleted') {
-          if (!enriched.deleted_at && enriched.status !== 'Void') continue;
-        } else {
-          if (enriched.deleted_at || enriched.status === 'Void') continue;
-        }
-        if (!matchesLocalFilters(enriched)) continue;
-        mergedPayments.push(enriched);
-        if (enriched.bill_number) seenBillNums.add(enriched.bill_number);
-        if (enriched.smav_central_bill_id) seenCentralIds.add(enriched.smav_central_bill_id);
-        if (enriched.order_id) seenOrderIds.add(enriched.order_id);
-      }
-
-      // Include local bills that are pending SMAV sync (finalize_pending) or pre-SMAV legacy historical bills
-      for (const localPay of localPayments) {
-        const enrichedLocal = enrichWithLocalOrder(localPay);
-        const alreadyPresent =
-          (enrichedLocal.bill_number && seenBillNums.has(enrichedLocal.bill_number)) ||
-          (enrichedLocal.smav_central_bill_id && seenCentralIds.has(enrichedLocal.smav_central_bill_id)) ||
-          (enrichedLocal.order_id && seenOrderIds.has(enrichedLocal.order_id));
-        if (alreadyPresent) continue;
-
-        const isPendingSync =
-          enrichedLocal.smav_bill_status === 'finalize_pending' ||
-          enrichedLocal.smav_bill_status === 'reserved';
-        const isLegacyHistorical = Boolean(enrichedLocal.is_legacy_bill);
-
-        if ((isPendingSync || isLegacyHistorical) && matchesLocalFilters(enrichedLocal)) {
-          mergedPayments.push({
-            ...enrichedLocal,
-            source_channel: enrichedLocal.source_channel || (isLegacyHistorical ? 'GLOSSYLOOKS_LEGACY' : 'GLOSSYLOOKS_ADMIN'),
-          });
-        }
-      }
-    } else {
-      source = 'local_fallback';
-      warning = smavResult.error || 'SMAV Central Ledger is temporarily unavailable; displaying local cached bills.';
-      mergedPayments = localPayments
-        .map(p => ({
-          ...enrichWithLocalOrder(p),
-          source_channel: p.source_channel || 'GLOSSYLOOKS_LOCAL_CACHE',
-        }))
-        .filter(matchesLocalFilters);
-    }
-
-    // Sort strictly newest first by billed_at || created_at
-    mergedPayments.sort((a, b) => {
-      const timeA = Date.parse(a.billed_at || a.created_at || '') || 0;
-      const timeB = Date.parse(b.billed_at || b.created_at || '') || 0;
-      return timeB - timeA;
+    const merged = buildMergedLedgerPayments({
+      scope,
+      todayStr,
+      fromDate: effectiveFromDate,
+      toDate: effectiveToDate,
+      effectiveBranchId,
+      search: rawSearch || undefined,
+      adminRole: admin.role,
+      smavResult: reconcileResult.smavResult,
+      reconcileResult,
+      localOrders,
+      localPayments,
     });
 
     const pendingSyncCount = localOrders.filter(
@@ -9041,13 +9312,13 @@ app.get('/api/admin/payments/ledger', async (req, res) => {
     ).length;
 
     const responsePayload: CentralPaymentLedgerResponse = {
-      source,
+      source: merged.source,
       scope,
       timezone: 'Asia/Kolkata',
-      payments: mergedPayments,
-      totals: computePaymentLedgerTotals(mergedPayments),
+      payments: merged.payments,
+      totals: computePaymentLedgerTotals(merged.payments),
       pending_sync_count: pendingSyncCount,
-      warning,
+      warning: merged.warning,
     };
 
     return res.json(responsePayload);

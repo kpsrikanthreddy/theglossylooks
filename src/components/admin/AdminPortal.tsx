@@ -96,6 +96,14 @@ import {
   DailySalesReportLog
 } from '../../types/salon';
 import { api, SmavSyncClientResult, SmavReconciliationReport } from '../../lib/api';
+import {
+  AdminBranchPermissions,
+  readPersistedAdminSession,
+  savePersistedAdminSession,
+  updatePersistedAdminUser,
+  clearPersistedAdminSession,
+  restoreAdminSession,
+} from '../../lib/adminSession';
 import { useToast, getSafeErrorMessage } from '../common/ToastProvider';
 import { ActionButton } from '../common/ActionButton';
 import { useAsyncAction, useKeyedAsyncAction } from '../../hooks/useAsyncAction';
@@ -106,32 +114,31 @@ interface AdminPortalProps {
 }
 
 export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onViewReceipt }) => {
-  // Authentication & Session - Read strictly from local session storage; null by default when unauthenticated
+  // Authentication & Session - Hydrate from persistent storage while verifying with server
+  const initialPersistedSession = readPersistedAdminSession();
   const [currentUser, setCurrentUser] = useState<AdminUser | null>(() => {
-    try {
-      const saved = sessionStorage.getItem('the_glossy_looks_admin_session') || localStorage.getItem('the_glossy_looks_admin_session');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed.user) {
-          // If cached user has old sample name "Priya Sharma" or matches owner ID, sanitize to real owner "Madu Mounika"
-          if (parsed.user.name === 'Priya Sharma' || parsed.user.user_id === 'TGL-OWN01' || parsed.user.email === 'owner@theglossylooks.com') {
-            parsed.user.name = 'Madu Mounika';
-            parsed.user.user_id = 'TGL-OWN01';
-            parsed.user.email = 'owner@theglossylooks.com';
-            parsed.user.phone = '8985799459';
-            try {
-              sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify(parsed));
-              localStorage.setItem('the_glossy_looks_admin_session', JSON.stringify(parsed));
-            } catch {}
-          }
-          return parsed.user;
-        }
-      }
-    } catch {
-      // Ignore
+    const user = initialPersistedSession?.user || null;
+    if (!user) return null;
+    if (user.name === 'Priya Sharma' || user.user_id === 'TGL-OWN01' || user.email === 'owner@theglossylooks.com') {
+      const sanitized: AdminUser = {
+        ...user,
+        name: 'Madu Mounika',
+        user_id: 'TGL-OWN01',
+        email: 'owner@theglossylooks.com',
+        phone: '8985799459',
+      };
+      updatePersistedAdminUser(sanitized);
+      return sanitized;
     }
-    return null;
+    return user;
   });
+  const [branchPermissions, setBranchPermissions] = useState<AdminBranchPermissions | null>(
+    () => initialPersistedSession?.branch_permissions ?? null
+  );
+  const [sessionStatus, setSessionStatus] = useState<'restoring' | 'authenticated' | 'offline_retry' | 'unauthenticated'>('restoring');
+  const [sessionOfflineWarning, setSessionOfflineWarning] = useState<string | null>(null);
+  const [sessionSignOutNotice, setSessionSignOutNotice] = useState<string | null>(null);
+  const [retryingSession, setRetryingSession] = useState(false);
 
   const toast = useToast();
 
@@ -601,30 +608,75 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     );
   };
 
+  const verifyAndRestoreSession = async (options?: { silent?: boolean }) => {
+    const hadPersisted = Boolean(readPersistedAdminSession()?.user || currentUser);
+    if (!options?.silent && !currentUser) {
+      setSessionStatus('restoring');
+    }
+    setRetryingSession(true);
+    try {
+      const result = await restoreAdminSession({
+        fetchMe: () => api.getAdminMe(),
+      });
+
+      if (result.status === 'authenticated' && result.user) {
+        setCurrentUser(result.user);
+        setBranchPermissions(result.branchPermissions);
+        setSessionOfflineWarning(result.offline ? result.warning : null);
+        setSessionSignOutNotice(null);
+        setSessionStatus('authenticated');
+        return result;
+      }
+
+      if (result.status === 'offline_retry') {
+        setSessionOfflineWarning(result.warning);
+        setSessionStatus('offline_retry');
+        return result;
+      }
+
+      // Confirmed invalid/expired/revoked/disabled auth only
+      setCurrentUser(null);
+      setBranchPermissions(null);
+      setSessionOfflineWarning(null);
+      setSessionSignOutNotice(hadPersisted ? (result.signOutReason || 'Your session has expired. Please sign in again.') : null);
+      setSessionStatus('unauthenticated');
+      return result;
+    } finally {
+      setRetryingSession(false);
+    }
+  };
+
+  // Restore session on mount & re-verify silently when network reconnects
+  useEffect(() => {
+    void verifyAndRestoreSession();
+    const handleOnline = () => {
+      void verifyAndRestoreSession({ silent: true });
+    };
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Periodic sliding session refresh while active (never signs out on transient errors)
+  useEffect(() => {
+    if (sessionStatus !== 'authenticated' || !currentUser?.id) return;
+    const interval = setInterval(() => {
+      void verifyAndRestoreSession({ silent: true });
+    }, 30 * 60 * 1000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStatus, currentUser?.id]);
+
   const loadAllData = async () => {
+    if (!currentUser) return;
     try {
       setLoading(true);
-      const isOwnerRole = currentUser?.role === 'owner';
-      const isManagerOrOwner = ['owner', 'manager'].includes(currentUser?.role || '');
+      const isOwnerRole = currentUser.role === 'owner';
+      const isManagerOrOwner = ['owner', 'manager'].includes(currentUser.role || '');
 
-      const [
-        aptsData,
-        custsData,
-        ordersData,
-        paymentsData,
-        prodsData,
-        supsData,
-        movsData,
-        staffData,
-        devsData,
-        jobsData,
-        catsData,
-        srvsData,
-        pkgsData,
-        galleryData,
-        settingsData,
-        branchesData
-      ] = await Promise.all([
+      const settled = await Promise.allSettled([
         api.getAppointments(),
         api.getCustomers(),
         api.getOrders(),
@@ -640,28 +692,47 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         api.getPackages(),
         api.getGallery(false),
         api.getSettings(),
-        api.getBranches().catch(() => [])
+        api.getBranches(),
       ]);
 
-      setAppointments(aptsData);
-      setCustomers(custsData);
-      setOrders(ordersData);
-      setPayments(paymentsData);
-      setProducts(prodsData);
-      setSuppliers(supsData);
-      setMovements(movsData);
-      setStaffList(staffData);
-      setPrintDevices(devsData);
-      setPrintJobs(jobsData);
-      setCategories(catsData);
-      setServices(srvsData);
-      setPackages(pkgsData);
-      setGallery(galleryData);
-      setSettings(settingsData);
-      const rawLocalBranches = Array.isArray(branchesData) ? branchesData : [];
-      const activeLocalBranches = rawLocalBranches.filter(branch => branch.is_active !== false);
-      setBranches(activeLocalBranches);
-      setAllHistoricalBranches(rawLocalBranches);
+      let failedCount = 0;
+      const unwrap = <T,>(idx: number, onValue: (v: T) => void) => {
+        const r = settled[idx];
+        if (r.status === 'fulfilled') {
+          onValue(r.value as T);
+        } else {
+          failedCount += 1;
+          console.warn(`Admin data request #${idx} failed transiently (session kept active):`, r.reason);
+        }
+      };
+
+      unwrap<Appointment[]>(0, setAppointments);
+      unwrap<Customer[]>(1, setCustomers);
+      unwrap<Order[]>(2, setOrders);
+      unwrap<PaymentRecord[]>(3, setPayments);
+      unwrap<Product[]>(4, setProducts);
+      unwrap<Supplier[]>(5, setSuppliers);
+      unwrap<InventoryMovement[]>(6, setMovements);
+      unwrap<Staff[]>(7, setStaffList);
+      unwrap<PrintDevice[]>(8, setPrintDevices);
+      unwrap<PrintJob[]>(9, setPrintJobs);
+      unwrap<ServiceCategory[]>(10, setCategories);
+      unwrap<ServiceItem[]>(11, setServices);
+      unwrap<PackageCombo[]>(12, setPackages);
+      unwrap<GalleryItem[]>(13, setGallery);
+      unwrap<SalonSettings>(14, setSettings);
+      unwrap<SalonBranch[]>(15, (branchesData) => {
+        const rawLocalBranches = Array.isArray(branchesData) ? branchesData : [];
+        const activeLocalBranches = rawLocalBranches.filter(branch => branch.is_active !== false);
+        setBranches(activeLocalBranches);
+        setAllHistoricalBranches(rawLocalBranches);
+      });
+
+      if (failedCount === settled.length) {
+        setSessionOfflineWarning('Server connection temporarily unavailable. Your session remains active — retry when reconnected.');
+      } else if (failedCount === 0 && sessionOfflineWarning) {
+        setSessionOfflineWarning(null);
+      }
 
       // Load permitted POS branches strictly and dynamically from SMAV via GET /api/pos/branches
       try {
@@ -735,12 +806,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       // Role-gated fetches: Users & Audit logs ONLY for Owner
       if (isOwnerRole) {
         try {
-          const [usersData, logsData] = await Promise.all([
+          const [usersRes, logsRes] = await Promise.allSettled([
             api.getAdminUsers(),
             api.getAuditLogs()
           ]);
-          setAdminUsers(usersData);
-          setAuditLogs(logsData);
+          if (usersRes.status === 'fulfilled') setAdminUsers(usersRes.value);
+          if (logsRes.status === 'fulfilled') setAuditLogs(logsRes.value);
         } catch (e) {
           console.warn('Could not load owner records:', e);
         }
@@ -749,44 +820,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
       // Role-gated fetches: Reports & Feedback ONLY for Owner & Manager
       if (isManagerOrOwner) {
         try {
-          const [reportsData, fbData] = await Promise.all([
+          const [reportsRes, fbRes] = await Promise.allSettled([
             api.getReports(),
-            api.getAppointmentFeedback().catch(() => [])
+            api.getAppointmentFeedback()
           ]);
-          setReports(reportsData);
-          setFeedbackList(fbData || []);
+          if (reportsRes.status === 'fulfilled') setReports(reportsRes.value);
+          if (fbRes.status === 'fulfilled') setFeedbackList(fbRes.value || []);
           await loadDetailedReports(reportFilterPeriod, customStartDate, customEndDate);
         } catch (e) {
           console.warn('Could not load reports or feedback:', e);
         }
       }
-
-      // Refresh current user identity from master server single source of truth
-      try {
-        const me = await api.getAdminMe();
-        if (me && me.name && (me.name !== currentUser?.name || me.user_id !== currentUser?.user_id || me.role !== currentUser?.role)) {
-          setCurrentUser(me);
-          const saved = sessionStorage.getItem('the_glossy_looks_admin_session') || localStorage.getItem('the_glossy_looks_admin_session');
-          if (saved) {
-            const parsed = JSON.parse(saved);
-            parsed.user = me;
-            sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify(parsed));
-            localStorage.setItem('the_glossy_looks_admin_session', JSON.stringify(parsed));
-          }
-        }
-      } catch {
-        // Not authenticated or session expired
-      }
     } catch (err) {
-      console.error('Error loading admin records:', err);
+      console.error('Error loading admin records (keeping session active):', err);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    if (currentUser) {
-      loadAllData();
+    if (sessionStatus === 'authenticated' && currentUser?.id) {
+      void loadAllData();
       const isPrivileged = currentUser.role === 'owner' || currentUser.role === 'manager';
       if (isPrivileged) {
         api.getWhatsAppInboxUnreadCount()
@@ -800,18 +854,28 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         return () => clearInterval(interval);
       }
     }
-  }, [currentUser]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStatus, currentUser?.id, currentUser?.role]);
 
   // Handle Login
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError('');
+    setSessionSignOutNotice(null);
     await loginAction.run(
       async () => {
         const res = await api.loginAdmin(loginIdentifier.trim(), loginPassword);
-        sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
-        localStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ token: res.token, user: res.user }));
+        savePersistedAdminSession({
+          token: res.token,
+          user: res.user,
+          branch_permissions: res.branch_permissions ?? null,
+          expires_at: res.expires_at ?? null,
+        });
         setCurrentUser(res.user);
+        setBranchPermissions(res.branch_permissions ?? null);
+        setSessionOfflineWarning(null);
+        setSessionSignOutNotice(null);
+        setSessionStatus('authenticated');
 
         // Auto-route to role module
         if (res.user.role === 'receptionist') handleNavigateTab('pos');
@@ -828,10 +892,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     );
   };
 
-  const handleLogout = () => {
-    sessionStorage.removeItem('the_glossy_looks_admin_session');
-    localStorage.removeItem('the_glossy_looks_admin_session');
+  const handleLogout = async () => {
+    try {
+      await api.logoutAdmin();
+    } catch {
+      // Even if server is unreachable, explicit Sign Out clears local session immediately
+    }
+    clearPersistedAdminSession();
     setCurrentUser(null);
+    setBranchPermissions(null);
+    setSessionOfflineWarning(null);
+    setSessionSignOutNotice(null);
+    setSessionStatus('unauthenticated');
     toast.info('Signed out successfully');
   };
 
@@ -1016,9 +1088,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             : 'Payment ledger refreshed from local cache'
         );
       }
+      return ledgerRes;
     } catch (err) {
-      console.error('Failed to load central payment ledger:', err);
+      console.error('Failed to load central payment ledger (keeping session active):', err);
+      setCentralLedgerWarning(getSafeErrorMessage(err, 'Payment ledger refresh failed temporarily.'));
       toast.error(getSafeErrorMessage(err, 'Failed to load payment ledger.'));
+      return null;
     } finally {
       if (isDeletedView) {
         setLoadingDeletedLedger(false);
@@ -1028,6 +1103,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     }
   };
 
+  const handleRefreshPaymentLedger = async (targetMode: 'active' | 'deleted' = ledgerDeletedFilter) => {
+    // 1. Reconcile finalized bills from SMAV Central into local DB first
+    await loadCentralPaymentLedger(targetMode, true);
+    // 2. Refresh local orders, payments, and CRM customers so all views stay synced
+    const [ordersRes, paymentsRes, customersRes] = await Promise.allSettled([
+      api.getOrders(),
+      api.getPayments(),
+      api.getCustomers(),
+    ]);
+    if (ordersRes.status === 'fulfilled') setOrders(ordersRes.value);
+    if (paymentsRes.status === 'fulfilled') setPayments(paymentsRes.value);
+    if (customersRes.status === 'fulfilled') setCustomers(customersRes.value);
+  };
+
   const loadDeletedLedger = async () => {
     if (!canDeleteOrRestore) return;
     await loadCentralPaymentLedger('deleted');
@@ -1035,13 +1124,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
   // Automatically fetch authoritative SMAV Central Ledger when Payments tab or filters change
   useEffect(() => {
-    if (!currentUser || activeTab !== 'payments') return;
+    if (sessionStatus !== 'authenticated' || !currentUser || activeTab !== 'payments') return;
     const timer = setTimeout(() => {
       void loadCentralPaymentLedger(ledgerDeletedFilter);
     }, ledgerSearch.trim() ? 250 : 0);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    sessionStatus,
     currentUser?.id,
     activeTab,
     ledgerDeletedFilter,
@@ -1569,7 +1659,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           const updatedMe = usersData.find(u => u.id === currentUser.id);
           if (updatedMe) {
             setCurrentUser(updatedMe);
-            sessionStorage.setItem('the_glossy_looks_admin_session', JSON.stringify({ user: updatedMe }));
+            updatePersistedAdminUser(updatedMe);
           }
         }
         return res;
@@ -1706,9 +1796,73 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
   };
 
   // =========================================================================
+  // SESSION RESTORATION LOADING & OFFLINE RETRY VIEWS (Never render blank)
+  // =========================================================================
+  if (sessionStatus === 'restoring') {
+    return (
+      <div className="min-h-screen bg-[#120B0F] flex items-center justify-center p-4">
+        <div className="bg-[#1A0F16] border border-[#D4AF37]/30 text-white rounded-3xl max-w-md w-full p-8 shadow-2xl text-center">
+          <img
+            src="/assets/brand/glossy-looks-logo.png"
+            alt="The Glossy Looks logo"
+            className="w-14 h-14 rounded-full object-cover mx-auto shadow-xl mb-4 border border-[#D4AF37]/40"
+          />
+          <h2 className="font-serif font-bold text-xl text-white">The Glossy Looks</h2>
+          <p className="text-xs text-[#D4AF37] uppercase tracking-widest font-bold mt-1">
+            Operations & Management System
+          </p>
+          <div className="mt-6 flex items-center justify-center gap-2.5 text-sm text-white/80">
+            <Loader2 className="w-5 h-5 animate-spin text-[#D4AF37]" />
+            <span>Restoring your secure salon session...</span>
+          </div>
+          <p className="text-[11px] text-white/50 mt-2">
+            Verifying staff credentials and branch permissions.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (sessionStatus === 'offline_retry' && !currentUser) {
+    return (
+      <div className="min-h-screen bg-[#120B0F] flex items-center justify-center p-4">
+        <div className="bg-[#1A0F16] border border-amber-500/30 text-white rounded-3xl max-w-md w-full p-7 shadow-2xl text-center">
+          <img
+            src="/assets/brand/glossy-looks-logo.png"
+            alt="The Glossy Looks logo"
+            className="w-14 h-14 rounded-full object-cover mx-auto shadow-xl mb-3 border border-[#D4AF37]/40"
+          />
+          <h2 className="font-serif font-bold text-xl text-white">Connection Temporarily Unavailable</h2>
+          <p className="text-xs text-amber-200/90 mt-2 leading-relaxed">
+            {sessionOfflineWarning || 'Unable to reach the server to verify your session. Please check your connection and try again.'}
+          </p>
+          <div className="mt-6 flex flex-col gap-2.5">
+            <button
+              type="button"
+              disabled={retryingSession}
+              onClick={() => void verifyAndRestoreSession()}
+              className="w-full py-3 bg-gradient-to-r from-[#D4AF37] to-[#F3D7D7] text-[#120B0F] font-bold rounded-xl shadow-lg hover:opacity-95 transition-all flex items-center justify-center gap-2 text-xs disabled:opacity-60 cursor-pointer"
+            >
+              <RefreshCw className={`w-4 h-4 ${retryingSession ? 'animate-spin' : ''}`} />
+              <span>{retryingSession ? 'Checking Connection...' : 'Retry Connection'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={onBackToWebsite}
+              className="w-full py-2.5 bg-white/5 hover:bg-white/10 text-white/80 rounded-xl border border-white/10 text-xs font-semibold transition-colors cursor-pointer"
+            >
+              Return to Public Customer Website
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
   // PROTECTED LOGIN VIEW (If not logged in)
   // =========================================================================
-  if (!currentUser) {
+  if (!currentUser || sessionStatus === 'unauthenticated') {
     return (
       <div className="min-h-screen bg-[#120B0F] flex items-center justify-center p-4">
         <div className="bg-[#1A0F16] border border-[#D4AF37]/30 text-white rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl relative">
@@ -1740,6 +1894,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
               Authorized salon personnel only. Customers and unauthorized visitors are strictly prohibited.
             </p>
           </div>
+
+          {sessionSignOutNotice && (
+            <div className="p-3 bg-amber-950/50 border border-amber-400/40 rounded-xl text-amber-200 text-xs leading-relaxed mb-4 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+              <span>{sessionSignOutNotice}</span>
+            </div>
+          )}
 
           {/* Security Banner */}
           <div className="p-3 bg-rose-950/40 border border-rose-500/30 rounded-xl text-rose-200 text-[11px] leading-relaxed mb-5 flex items-start gap-2.5">
@@ -2234,6 +2395,30 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             )}
           </div>
         </header>
+
+        {/* Offline / Temporary Connection Warning Banner (keeps session active) */}
+        {sessionOfflineWarning && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-6 py-2.5 flex items-center justify-between gap-3 text-xs text-amber-900">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{sessionOfflineWarning}</span>
+            </div>
+            <button
+              type="button"
+              disabled={retryingSession}
+              onClick={async () => {
+                const res = await verifyAndRestoreSession({ silent: true });
+                if (res.status === 'authenticated' && !res.offline) {
+                  void loadAllData();
+                }
+              }}
+              className="px-3 py-1 bg-white border border-amber-300 text-amber-900 font-bold rounded-lg hover:bg-amber-100 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3 h-3 ${retryingSession ? 'animate-spin' : ''}`} />
+              <span>{retryingSession ? 'Retrying...' : 'Retry Connection'}</span>
+            </button>
+          </div>
+        )}
 
         {/* TAB CONTENTS */}
         <div ref={tabContentRef} className="p-4 sm:p-6 flex-1 overflow-y-auto">
@@ -4057,16 +4242,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
             const sourcePayments = viewingDeletedLedger ? deletedPayments : activeLedgerList;
             const sourceOrders = viewingDeletedLedger ? deletedOrders : orders;
             const todayKolkata = getKolkataDateString(new Date());
-            const staffAssignedBranchId = currentUser?.branch_id || '';
+            const staffAssignedBranchId = currentUser?.branch_id || branchPermissions?.assigned_branch_id || '';
             const staffBranchName =
               allHistoricalBranches.find(b => b.id === staffAssignedBranchId)?.name ||
               branches.find(b => b.id === staffAssignedBranchId)?.name ||
+              branchPermissions?.branches?.find(b => b.id === staffAssignedBranchId)?.name ||
               'Assigned Branch';
 
             // Payment filtering must offer only active branches. Historical / legacy
             // branch rows are retained in Supabase to preserve old bill and audit
             // references, but must not remain selectable for new ledger filtering.
             const ledgerBranchMap = new Map<string, { id: string; name: string; code?: string; is_active?: boolean }>();
+            for (const b of branchPermissions?.branches || []) {
+              if (!b.id) continue;
+              ledgerBranchMap.set(b.id, {
+                id: b.id,
+                name: b.name,
+                code: b.code,
+                is_active: true,
+              });
+            }
             for (const b of allHistoricalBranches) {
               if (b.is_active === false) continue;
               ledgerBranchMap.set(b.id, {
@@ -4287,8 +4482,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     <button
                       type="button"
                       onClick={() => {
-                        void loadCentralPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active', true);
-                        loadAllData();
+                        void handleRefreshPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active');
                       }}
                       className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
                       title="Refresh payment records from SMAV Central Ledger"
@@ -4332,7 +4526,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                     </div>
                     <button
                       type="button"
-                      onClick={() => void loadCentralPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active', true)}
+                      onClick={() => void handleRefreshPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active')}
                       className="px-2.5 py-1 text-[11px] font-bold text-amber-900 bg-white border border-amber-300 rounded-lg hover:bg-amber-100 shrink-0 cursor-pointer"
                     >
                       Retry Now

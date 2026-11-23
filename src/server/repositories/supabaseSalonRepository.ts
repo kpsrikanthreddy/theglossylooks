@@ -2073,12 +2073,16 @@ export class SupabaseSalonRepository implements ISalonRepository {
         : 'Success';
 
     const findExisting = async (): Promise<Order | null> => {
-      let found = await this.getOrderByBillNumber(centralBillNum);
+      // Match by smav_central_bill_id FIRST, then canonical bill_number
+      let found: Order | null = null;
+      if (input.smav_central_bill_id) {
+        found = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
+      }
+      if (!found) {
+        found = await this.getOrderByBillNumber(centralBillNum);
+      }
       if (!found && input.idempotency_key) {
         found = await this.getOrderByIdempotencyKey(input.idempotency_key);
-      }
-      if (!found && input.smav_central_bill_id) {
-        found = await this.getOrderBySmavCentralBillId(input.smav_central_bill_id);
       }
       if (!found && input.local_order_id && input.local_order_id !== centralBillNum) {
         found = await this.getOrderById(input.local_order_id);
@@ -2313,6 +2317,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
       notes: input.notes || `SMAV finalized bill ${centralBillNum}`,
       whatsapp_status: 'queued',
       receipt_whatsapp_status: 'queued',
+      billed_at: billDateIso,
       created_at: billDateIso,
     };
 

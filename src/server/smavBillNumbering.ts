@@ -1133,7 +1133,7 @@ function normalizeLedgerItems(rawItems: any): OrderItem[] {
   });
 }
 
-function normalizeSmavLedgerBillToPaymentRecord(row: any, localBranches: SalonBranch[]): PaymentRecord | null {
+export function normalizeSmavLedgerBillToPaymentRecord(row: any, localBranches: SalonBranch[]): PaymentRecord | null {
   if (!row || typeof row !== 'object') return null;
 
   const billNumber = String(
@@ -1155,13 +1155,23 @@ function normalizeSmavLedgerBillToPaymentRecord(row: any, localBranches: SalonBr
   const rawBranchName = String(row.branch_name ?? row.branchName ?? '').trim();
 
   const matchedLocalBranch =
+    localBranches.find(b => rawBranchId && b.id === rawBranchId) ||
     localBranches.find(
       b =>
-        (rawBranchId && b.id === rawBranchId) ||
-        (rawBranchCode && (String(b.smav_branch_code || '').toUpperCase() === rawBranchCode || String(b.code || '').toUpperCase() === rawBranchCode))
-    ) || null;
+        rawBranchCode &&
+        (String(b.smav_branch_code || '').trim().toUpperCase() === rawBranchCode ||
+          String(b.code || '').trim().toUpperCase() === rawBranchCode)
+    ) ||
+    localBranches.find(b => {
+      if (!rawBranchName) return false;
+      const cleanLocal = getCleanReceiptBranchName({ localBranch: b }).toLowerCase();
+      const lowerRaw = rawBranchName.toLowerCase();
+      return Boolean(cleanLocal && (cleanLocal === lowerRaw || lowerRaw.includes(cleanLocal) || cleanLocal.includes(lowerRaw)));
+    }) ||
+    null;
 
-  const resolvedBranchId = rawBranchId || matchedLocalBranch?.id || undefined;
+  // Prefer matched local salon_branches.id so UI branch filters and local FK upserts align cleanly
+  const resolvedBranchId = matchedLocalBranch?.id || rawBranchId || undefined;
   const resolvedBranchCode =
     rawBranchCode ||
     String(matchedLocalBranch?.smav_branch_code || matchedLocalBranch?.code || '').trim().toUpperCase() ||
@@ -1346,10 +1356,28 @@ export async function fetchSmavCentralLedger(
       ? data.payments
       : Array.isArray(data?.items)
       ? data.items
+      : Array.isArray(data?.rows)
+      ? data.rows
+      : Array.isArray(data?.entries)
+      ? data.entries
+      : Array.isArray(data?.sales)
+      ? data.sales
       : Array.isArray(data?.data)
       ? data.data
       : Array.isArray(data?.data?.bills)
       ? data.data.bills
+      : Array.isArray(data?.data?.ledger)
+      ? data.data.ledger
+      : Array.isArray(data?.data?.records)
+      ? data.data.records
+      : Array.isArray(data?.data?.payments)
+      ? data.data.payments
+      : Array.isArray(data?.data?.items)
+      ? data.data.items
+      : Array.isArray(data?.data?.rows)
+      ? data.data.rows
+      : Array.isArray(data?.data?.sales)
+      ? data.data.sales
       : [];
 
     const normalized = rawRows

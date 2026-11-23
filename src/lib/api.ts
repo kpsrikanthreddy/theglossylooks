@@ -46,6 +46,11 @@ import {
   SmavOutletRole,
   AdminRole
 } from '../types/salon';
+import {
+  readPersistedAdminSession,
+  type AdminBranchPermissions,
+  type AdminMeResponse,
+} from './adminSession';
 
 export interface SmavSyncClientResult {
   synced: boolean;
@@ -154,29 +159,41 @@ const API_BASE = '/api';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function fetchJson<T>(url: string, options?: RequestInit, adminName?: string): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest',
     ...(options?.headers as Record<string, string> || {})
   };
 
-  // Retrieve admin session token if available
+  // Retrieve admin session token safely (preferring a copy that has a valid token)
   try {
-    const savedSession = sessionStorage.getItem('the_glossy_looks_admin_session') || localStorage.getItem('the_glossy_looks_admin_session');
+    const savedSession = readPersistedAdminSession();
     if (savedSession) {
-      const parsed = JSON.parse(savedSession);
-      if (parsed.token) {
-        headers['Authorization'] = `Bearer ${parsed.token}`;
+      if (savedSession.token) {
+        headers['Authorization'] = `Bearer ${savedSession.token}`;
       }
-      if (parsed.user) {
-        if (!headers['x-admin-name'] && (parsed.user.name || adminName)) {
-          headers['x-admin-name'] = parsed.user.name || adminName || '';
+      if (savedSession.user) {
+        if (!headers['x-admin-name'] && (savedSession.user.name || adminName)) {
+          headers['x-admin-name'] = savedSession.user.name || adminName || '';
         }
-        if (parsed.user.role) {
-          headers['x-admin-role'] = parsed.user.role;
+        if (savedSession.user.role) {
+          headers['x-admin-role'] = savedSession.user.role;
         }
-        if (parsed.user.id) {
-          headers['x-admin-user-id'] = parsed.user.id;
+        if (savedSession.user.id) {
+          headers['x-admin-user-id'] = savedSession.user.id;
         }
       }
     }
@@ -200,6 +217,7 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
     try {
       const res = await fetch(url, {
         ...options,
+        credentials: 'include',
         headers,
         signal: options?.signal ?? controller?.signal
       });
@@ -209,7 +227,11 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
           continue;
         }
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || errorData.message || `Request failed (HTTP ${res.status})`);
+        throw new ApiError(
+          errorData.error || errorData.message || `Request failed (HTTP ${res.status})`,
+          res.status,
+          typeof errorData.code === 'string' ? errorData.code : undefined
+        );
       }
       return await res.json();
     } catch (err: any) {
@@ -219,10 +241,10 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
         continue;
       }
       if (err?.name === 'AbortError') {
-        throw new Error('Request timed out. Please check your connection and try again.');
+        throw new ApiError('Request timed out. Please check your connection and try again.', 0, 'REQUEST_TIMEOUT');
       }
       if (err instanceof TypeError) {
-        throw new Error('Network error. Please check your internet connection and try again.');
+        throw new ApiError('Network error. Please check your internet connection and try again.', 0, 'NETWORK_ERROR');
       }
       throw err;
     } finally {
@@ -232,7 +254,7 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
     }
   }
 
-  throw new Error('Request failed unexpectedly.');
+  throw new ApiError('Request failed unexpectedly.', 0, 'UNKNOWN_ERROR');
 }
 
 export const api = {
@@ -258,11 +280,21 @@ export const api = {
 
   // Admin Auth & User Management (Owner)
   loginAdmin: (identifier: string, password: string) =>
-    fetchJson<{ success: boolean; token: string; user: AdminUser }>(`${API_BASE}/auth/admin/login`, {
+    fetchJson<{
+      success: boolean;
+      token: string;
+      expires_at?: string;
+      user: AdminUser;
+      branch_permissions?: AdminBranchPermissions;
+    }>(`${API_BASE}/auth/admin/login`, {
       method: 'POST',
       body: JSON.stringify({ identifier, password })
     }),
-  getAdminMe: () => fetchJson<AdminUser>(`${API_BASE}/auth/admin/me`),
+  getAdminMe: () => fetchJson<AdminMeResponse>(`${API_BASE}/auth/admin/me`),
+  refreshAdminSession: () =>
+    fetchJson<AdminMeResponse>(`${API_BASE}/auth/admin/session/refresh`, { method: 'POST' }),
+  logoutAdmin: () =>
+    fetchJson<{ success: boolean }>(`${API_BASE}/auth/admin/logout`, { method: 'POST' }),
   getAdminUsers: () => fetchJson<User[]>(`${API_BASE}/admin/users`),
   createAdminUser: (data: Partial<User>, adminName?: string) =>
     fetchJson<User & { smavSync?: SmavSyncClientResult }>(`${API_BASE}/admin/users`, { method: 'POST', body: JSON.stringify(data) }, adminName),
@@ -478,15 +510,14 @@ export const api = {
     if (filters?.endIso) params.append('end_iso', filters.endIso);
     if (filters?.mode && filters.mode !== 'all') params.append('mode', filters.mode);
     const qs = params.toString() ? `?${params.toString()}` : '';
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = {
+      'X-Requested-With': 'XMLHttpRequest',
+    };
     try {
-      const savedSession = sessionStorage.getItem('the_glossy_looks_admin_session') || localStorage.getItem('the_glossy_looks_admin_session');
-      if (savedSession) {
-        const parsed = JSON.parse(savedSession);
-        if (parsed.token) headers['Authorization'] = `Bearer ${parsed.token}`;
-      }
+      const savedSession = readPersistedAdminSession();
+      if (savedSession?.token) headers['Authorization'] = `Bearer ${savedSession.token}`;
     } catch {}
-    const res = await fetch(`${API_BASE}/payments/export${qs}`, { headers });
+    const res = await fetch(`${API_BASE}/payments/export${qs}`, { headers, credentials: 'include' });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Failed to export Payment Ledger CSV (HTTP ${res.status})`);
