@@ -455,7 +455,32 @@ export interface PaymentRecord {
   billed_at?: string | null;
   backdated_by?: string | null;
   backdated_at?: string | null;
+  source_channel?: string;
+  smav_bill_status?: SmavBillStatus;
+  smav_finalize_error?: string | null;
+  is_legacy_bill?: boolean;
   created_at: string;
+}
+
+export interface CentralPaymentLedgerResponse {
+  source: 'smav' | 'local_fallback';
+  scope: 'today' | 'history' | 'deleted';
+  timezone: string;
+  payments: PaymentRecord[];
+  totals: {
+    count: number;
+    gross_revenue: number;
+    cash: number;
+    upi: number;
+    card: number;
+    bank_transfer: number;
+    split_payment: number;
+    pay_later: number;
+    refunded_count: number;
+    refunded_amount: number;
+  };
+  pending_sync_count: number;
+  warning?: string | null;
 }
 
 export interface SmavFinalizedBillUpsertInput {

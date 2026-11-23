@@ -16,11 +16,27 @@ import {
   fetchSmavPermittedBranches,
   reserveSmavCentralBillNumber,
   finalizeSmavCentralBillNumber,
+  upsertSmavCentralBill,
+  fetchSmavCentralLedger,
+  voidSmavCentralBill,
+  restoreSmavCentralBill,
+  getSmavGatewayBaseUrl,
   verifySmavSaleEventRequest,
   resolveCanonicalBranchCode,
   resolveLocalBranchIdForCode,
   getCleanReceiptBranchName,
 } from './src/server/smavBillNumbering.ts';
+import {
+  APPOINTMENT_ADMIN_ALERT_TEMPLATE,
+  ENQUIRY_ADMIN_ALERT_TEMPLATE,
+  resolveBranchAlertRecipients,
+  resolveEnquiryBranch,
+  buildAppointmentAlertVariables,
+  buildEnquiryAlertVariables,
+  buildAlertTemplateComponents,
+  buildAdminAlertDedupKeys,
+  type ApprovedMetaTemplateSchema,
+} from './src/server/whatsappAdminAlerts.ts';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -43,6 +59,8 @@ import {
 import type {
   WhatsAppMessageStatus,
   Order,
+  PaymentRecord,
+  CentralPaymentLedgerResponse,
   DailySalesReportStatus,
   DailySalesReportLog,
   WhatsAppConversation,
@@ -169,6 +187,187 @@ function normalizeIsoTimestamp(raw: unknown, fallbackIso: string): string {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallbackIso;
 }
 
+async function syncPaymentCentralBillId(
+  orderId: string,
+  billNumber: string,
+  centralBillId?: string | null
+): Promise<void> {
+  if (!centralBillId) return;
+  try {
+    const client = (salonRepository as any).client;
+    if (client) {
+      await client
+        .from('payments')
+        .update({ smav_central_bill_id: centralBillId })
+        .eq('order_id', orderId);
+      if (billNumber) {
+        await client
+          .from('payments')
+          .update({ smav_central_bill_id: centralBillId })
+          .eq('bill_number', billNumber);
+      }
+    }
+  } catch {
+    // Non-fatal if column is absent or JSON repo is active
+  }
+}
+
+async function syncOrderToSmavCentral(
+  order: Order,
+  actor: { id?: string; name: string; role?: string; central_auth_id?: string },
+  mode: 'finalize_or_upsert' | 'upsert' = 'finalize_or_upsert'
+): Promise<{ ok: boolean; status: number; centralBillId?: string; saleId?: string; finalizedAt?: string; error?: string; order: Order }> {
+  const localBranches = await salonRepository.getBranches().catch(() => []);
+  const matchedBranch = order.branch_id ? localBranches.find(b => b.id === order.branch_id) : undefined;
+  const branchCode =
+    order.branch_code ||
+    resolveCanonicalBranchCode({ branchId: order.branch_id, localBranch: matchedBranch }) ||
+    '';
+  const branchName =
+    order.branch_name ||
+    getCleanReceiptBranchName({ branchId: order.branch_id, branchCode, localBranch: matchedBranch });
+
+  const reqPayload = {
+    reservationId: order.smav_reservation_id,
+    centralBillId: order.smav_central_bill_id || order.smav_sale_id || undefined,
+    billNumber: order.bill_number,
+    branchId: order.branch_id || '',
+    branchCode,
+    branchName,
+    localOrderId: order.id,
+    idempotencyKey: order.idempotency_key || order.bill_number,
+    order,
+    finalizedBy: actor.name,
+    finalizedByUserId: actor.id,
+    centralAuthId: actor.central_auth_id,
+    actorRole: actor.role,
+  };
+
+  let smavRes =
+    mode === 'upsert' || !order.smav_reservation_id
+      ? await upsertSmavCentralBill(reqPayload)
+      : await finalizeSmavCentralBillNumber(reqPayload);
+
+  // If reservation expired or bill already finalized on SMAV during retry, fall back cleanly to idempotent bills/upsert
+  if (!smavRes.ok && mode === 'finalize_or_upsert' && order.smav_reservation_id && [404, 409, 410].includes(smavRes.status)) {
+    const upsertRes = await upsertSmavCentralBill(reqPayload);
+    if (upsertRes.ok) {
+      smavRes = upsertRes;
+    }
+  }
+
+  if (smavRes.ok) {
+    const finalizedAt = smavRes.finalizedAt || new Date().toISOString();
+    const resolvedCentralBillId = smavRes.centralBillId || smavRes.saleId || order.smav_central_bill_id || null;
+    const updates: Partial<Order> = {
+      smav_bill_status: 'finalized',
+      smav_central_bill_id: resolvedCentralBillId,
+      smav_sale_id: smavRes.saleId || resolvedCentralBillId || order.smav_sale_id,
+      smav_finalized_at: finalizedAt,
+      smav_finalize_error: null,
+    };
+    const updated = (await salonRepository.updateOrder(order.id, updates)) || { ...order, ...updates };
+    if (resolvedCentralBillId) {
+      await syncPaymentCentralBillId(order.id, order.bill_number, resolvedCentralBillId);
+    }
+    return {
+      ok: true,
+      status: smavRes.status,
+      centralBillId: resolvedCentralBillId || undefined,
+      saleId: smavRes.saleId || resolvedCentralBillId || undefined,
+      finalizedAt,
+      order: updated,
+    };
+  }
+
+  const errMsg = String(smavRes.error || 'SMAV central sync failed').slice(0, 500);
+  const failUpdates: Partial<Order> = {
+    smav_bill_status: 'finalize_pending',
+    smav_finalize_error: errMsg,
+  };
+  const updated = (await salonRepository.updateOrder(order.id, failUpdates)) || { ...order, ...failUpdates };
+  return {
+    ok: false,
+    status: smavRes.status || 503,
+    error: errMsg,
+    order: updated,
+  };
+}
+
+let pendingBillSyncInFlight = false;
+async function drainPendingSmavCentralBills(maxBatch = 10): Promise<{ attempted: number; synced: number; failed: number }> {
+  if (pendingBillSyncInFlight) return { attempted: 0, synced: 0, failed: 0 };
+  if (!process.env.GLOSSYLOOKS_INTEGRATION_KEY || (!getSmavGatewayBaseUrl() && !process.env.SMAV_BILL_FINALIZE_URL)) {
+    return { attempted: 0, synced: 0, failed: 0 };
+  }
+  pendingBillSyncInFlight = true;
+  let attempted = 0;
+  let synced = 0;
+  let failed = 0;
+  try {
+    const activeOrders = await salonRepository.getOrders({ deleted: 'active' });
+    const nowMs = Date.now();
+    const candidates = activeOrders
+      .filter(o => {
+        if (o.is_legacy_bill || o.deleted_at || !o.bill_number) return false;
+        if (o.smav_bill_status === 'finalize_pending') return true;
+        if (o.smav_bill_status === 'reserved') {
+          const createdMs = Date.parse(o.created_at || '');
+          return Number.isFinite(createdMs) && nowMs - createdMs > 30_000;
+        }
+        return false;
+      })
+      .slice(0, maxBatch);
+
+    for (const ord of candidates) {
+      attempted++;
+      const res = await syncOrderToSmavCentral(
+        ord,
+        { name: ord.cashier_name || 'Glossy Looks Auto-Sync', role: 'admin' },
+        'finalize_or_upsert'
+      );
+      if (res.ok) {
+        synced++;
+        await salonRepository.logAudit(
+          'SMAV_AUTO_SYNC_RECOVERED',
+          'Order',
+          ord.id,
+          'SMAV Background Sync',
+          `Auto-synced pending central bill ${ord.bill_number} to SMAV Central Ledger`
+        );
+      } else {
+        failed++;
+      }
+    }
+  } catch (err: any) {
+    console.warn('⚠️ [SMAV Bill Sync Worker] Drain cycle failed:', err?.message || err);
+  } finally {
+    pendingBillSyncInFlight = false;
+  }
+  return { attempted, synced, failed };
+}
+
+function computePaymentLedgerTotals(payments: PaymentRecord[]): CentralPaymentLedgerResponse['totals'] {
+  const active = payments.filter(p => !p.deleted_at && p.status !== 'Void');
+  const paidActive = active.filter(p => p.status !== 'Refunded');
+  const refunded = active.filter(p => p.status === 'Refunded');
+  const sumByMode = (mode: PaymentRecord['payment_mode']) =>
+    paidActive.filter(p => p.payment_mode === mode).reduce((sum, p) => sum + Number(p.amount || 0), 0);
+
+  return {
+    count: active.length,
+    gross_revenue: paidActive.reduce((sum, p) => sum + Number(p.amount || 0), 0),
+    cash: sumByMode('Cash'),
+    upi: sumByMode('UPI'),
+    card: sumByMode('Card'),
+    bank_transfer: sumByMode('Bank Transfer'),
+    split_payment: sumByMode('Split Payment'),
+    pay_later: sumByMode('Pay Later'),
+    refunded_count: refunded.length,
+    refunded_amount: refunded.reduce((sum, p) => sum + Number(p.amount || 0), 0),
+  };
+}
+
 // SMAV authenticated server-to-server sale-event receiver.
 // Validates BOTH X-Integration-Key (GLOSSYLOOKS_INTEGRATION_KEY) AND HMAC-SHA256 signature
 // (X-SMAV-Timestamp + X-SMAV-Signature over `${timestamp}.${rawBody}` using SMAV_DISPATCH_SECRET)
@@ -191,6 +390,9 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
   const eventType = String(e.event_type || e.eventType || '').trim().toLowerCase();
   const supportedEvents = [
     'central_bill_finalized',
+    'central_bill_updated',
+    'central_bill_voided',
+    'central_bill_restored',
     'receipt',
     'feedback',
     'sale_recorded',
@@ -200,6 +402,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     'payment_updated',
     'bill_voided',
     'sale_voided',
+    'bill_restored',
     'refund',
   ];
 
@@ -535,17 +738,20 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     }
   }
 
-  // 2. Look up existing GlossyLooks local bill strictly by bill_number / idempotency / central bill ID
+  // 2. Look up existing GlossyLooks local bill strictly by central_bill_id / bill_number / external_order_id / idempotency
   //    (NEVER pass bill_number into getOrderById as an order UUID!)
-  let existingLocalOrder: Order | null = await salonRepository.getOrderByBillNumber(centralBillNumber);
-  if (!existingLocalOrder && key) {
-    existingLocalOrder = await salonRepository.getOrderByIdempotencyKey(key);
-  }
-  if (!existingLocalOrder && smavCentralBillId) {
+  let existingLocalOrder: Order | null = null;
+  if (smavCentralBillId) {
     existingLocalOrder = await salonRepository.getOrderBySmavCentralBillId(smavCentralBillId);
+  }
+  if (!existingLocalOrder) {
+    existingLocalOrder = await salonRepository.getOrderByBillNumber(centralBillNumber);
   }
   if (!existingLocalOrder && localOrderRef && localOrderRef !== centralBillNumber) {
     existingLocalOrder = await salonRepository.getOrderById(localOrderRef);
+  }
+  if (!existingLocalOrder && key) {
+    existingLocalOrder = await salonRepository.getOrderByIdempotencyKey(key);
   }
 
   // Immutable bill number guard: never overwrite an existing order's bill_number
@@ -555,7 +761,207 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
     });
   }
 
-  // 3. If updating an existing local bill (finalized/updated/voided/payment sync)
+  // 3a. Handle central_bill_voided / bill_voided / sale_voided idempotently (soft-delete order + items + payments)
+  if (['central_bill_voided', 'bill_voided', 'sale_voided'].includes(eventType)) {
+    const actorName = String(p.actor_name || p.actorName || p.deleted_by || p.deletedBy || p.voided_by || p.voidedBy || 'SMAV Central').trim();
+    const actorId = String(p.actor_id || p.actorId || p.deleted_by_user_id || p.deletedByUserId || '').trim() || undefined;
+    const reason = String(p.reason || p.deletion_reason || p.deletionReason || p.void_reason || p.voidReason || 'Voided in SMAV Central Billing').trim();
+    const nowIso = new Date().toISOString();
+
+    if (!existingLocalOrder) {
+      return res.json({
+        accepted: true,
+        voided: true,
+        skipped_local_mirror: true,
+        bill_number: centralBillNumber,
+        smav_central_bill_id: smavCentralBillId,
+      });
+    }
+
+    if (existingLocalOrder.smav_last_event_id === eventId && existingLocalOrder.deleted_at) {
+      return res.json({
+        accepted: true,
+        duplicate: true,
+        voided: true,
+        native_order_id: existingLocalOrder.id,
+        bill_number: existingLocalOrder.bill_number,
+      });
+    }
+
+    if (!existingLocalOrder.deleted_at) {
+      await salonRepository.softDeleteOrderTransaction(
+        existingLocalOrder.id,
+        { userId: actorId, name: actorName },
+        reason
+      );
+    }
+
+    await salonRepository.updateOrder(existingLocalOrder.id, {
+      smav_bill_status: 'voided',
+      payment_status: 'Cancelled',
+      smav_last_event_id: eventId,
+      smav_last_event_at: nowIso,
+      ...(smavCentralBillId ? { smav_central_bill_id: smavCentralBillId } : {}),
+    });
+
+    await salonRepository.logAudit(
+      'SMAV_CENTRAL_BILL_VOIDED',
+      'Order',
+      existingLocalOrder.id,
+      actorName,
+      `Soft-deleted bill ${existingLocalOrder.bill_number} via SMAV webhook (${eventType}, event=${eventId}). Reason: ${reason}`
+    );
+
+    return res.json({
+      accepted: true,
+      voided: true,
+      duplicate: Boolean(existingLocalOrder.deleted_at),
+      native_order_id: existingLocalOrder.id,
+      bill_number: existingLocalOrder.bill_number,
+      smav_central_bill_id: smavCentralBillId || existingLocalOrder.smav_central_bill_id || null,
+    });
+  }
+
+  // 3b. Handle central_bill_restored / bill_restored idempotently (clear deletion status on order + items + payments)
+  if (['central_bill_restored', 'bill_restored'].includes(eventType)) {
+    const actorName = String(p.actor_name || p.actorName || p.restored_by || p.restoredBy || 'SMAV Central').trim();
+    const actorId = String(p.actor_id || p.actorId || '').trim() || undefined;
+    const nowIso = new Date().toISOString();
+
+    if (!existingLocalOrder) {
+      return res.json({
+        accepted: true,
+        restored: true,
+        skipped_local_mirror: true,
+        bill_number: centralBillNumber,
+        smav_central_bill_id: smavCentralBillId,
+      });
+    }
+
+    if (existingLocalOrder.smav_last_event_id === eventId && !existingLocalOrder.deleted_at) {
+      return res.json({
+        accepted: true,
+        duplicate: true,
+        restored: true,
+        native_order_id: existingLocalOrder.id,
+        bill_number: existingLocalOrder.bill_number,
+      });
+    }
+
+    if (existingLocalOrder.deleted_at) {
+      await salonRepository.restoreOrderTransaction(existingLocalOrder.id, {
+        userId: actorId,
+        name: actorName,
+      });
+    }
+
+    const restoredPaymentStatus: Order['payment_status'] =
+      existingLocalOrder.payment_status === 'Cancelled'
+        ? normalizeSmavPaymentStatus(p.payment_status ?? p.paymentStatus ?? 'Paid', Number(existingLocalOrder.due_amount || 0))
+        : existingLocalOrder.payment_status;
+
+    await salonRepository.updateOrder(existingLocalOrder.id, {
+      smav_bill_status: 'finalized',
+      payment_status: restoredPaymentStatus,
+      smav_last_event_id: eventId,
+      smav_last_event_at: nowIso,
+      ...(smavCentralBillId ? { smav_central_bill_id: smavCentralBillId } : {}),
+    });
+
+    await salonRepository.logAudit(
+      'SMAV_CENTRAL_BILL_RESTORED',
+      'Order',
+      existingLocalOrder.id,
+      actorName,
+      `Restored bill ${existingLocalOrder.bill_number} via SMAV webhook (${eventType}, event=${eventId})`
+    );
+
+    return res.json({
+      accepted: true,
+      restored: true,
+      duplicate: !existingLocalOrder.deleted_at,
+      native_order_id: existingLocalOrder.id,
+      bill_number: existingLocalOrder.bill_number,
+      smav_central_bill_id: smavCentralBillId || existingLocalOrder.smav_central_bill_id || null,
+    });
+  }
+
+  // 3c. Handle central_bill_updated (and full/partial bill updates) without duplicating CRM or WhatsApp
+  if (eventType === 'central_bill_updated' && !existingLocalOrder && resolvedBranchId && resolvedBranchCode && cleanBranchName && smavCentralBillId) {
+    // Upsert missed central bill cleanly on update event without sending duplicate WhatsApp receipt
+    const customerObj = p.customer && typeof p.customer === 'object' ? p.customer : {};
+    const customerName = String(p.customer_name || p.customerName || customerObj.name || 'Walk-in Customer').trim();
+    const customerPhone = String(p.customer_phone || p.customerPhone || p.customer_mobile || customerObj.phone || '').trim();
+    const rawItems: any[] = Array.isArray(p.items) ? p.items : Array.isArray(p.line_items) ? p.line_items : [];
+    const mappedItems = rawItems.map((i: any) => {
+      const qty = Math.max(1, Number(i.quantity ?? i.qty ?? 1) || 1);
+      const unitPrice = Number(i.unit_price ?? i.unitPrice ?? i.price ?? 0) || 0;
+      const totalPrice = Number(i.total_price ?? i.totalPrice ?? i.amount ?? qty * unitPrice) || 0;
+      return {
+        service_id: i.service_id || i.serviceId || undefined,
+        product_id: i.product_id || i.productId || undefined,
+        item_name: String(i.item_name || i.itemName || i.name || 'Salon Service').trim(),
+        item_type: (String(i.item_type || i.itemType || 'service').toLowerCase() === 'product' ? 'product' : 'service') as 'service' | 'product',
+        quantity: qty,
+        unit_price: unitPrice,
+        total_price: totalPrice,
+        staff_id: i.staff_id || i.staffId || i.stylist_id || i.stylistId || undefined,
+        staff_name: String(i.staff_name || i.staffName || i.stylist_name || i.stylistName || '').trim() || undefined,
+        commission_amount: Number(i.commission_amount ?? i.commissionAmount ?? 0) || 0,
+      };
+    });
+    const subtotal = Math.max(0, Number(p.subtotal ?? p.sub_total ?? mappedItems.reduce((s, i) => s + i.total_price, 0)) || 0);
+    const discount = Math.max(0, Number(p.discount ?? p.discount_amount ?? 0) || 0);
+    const taxPercent = Math.max(0, Number(p.tax_percent ?? p.taxPercent ?? 0) || 0);
+    const taxAmount = Math.max(0, Number(p.tax_amount ?? p.taxAmount ?? p.gst_amount ?? 0) || 0);
+    const tipAmount = Math.max(0, Number(p.tip_amount ?? p.tipAmount ?? 0) || 0);
+    const grandTotal = Math.max(0, Number(p.grand_total ?? p.grandTotal ?? p.amount ?? (subtotal - discount + taxAmount + tipAmount)) || 0);
+    const paidAmount = Math.max(0, Number(p.paid_amount ?? p.paidAmount ?? grandTotal) || 0);
+    const dueAmount = Math.max(0, Number(p.due_amount ?? p.dueAmount ?? Math.max(0, grandTotal - paidAmount)) || 0);
+    const nowIso = new Date().toISOString();
+
+    const upserted = await salonRepository.upsertSmavFinalizedBill({
+      event_id: eventId,
+      central_bill_number: centralBillNumber,
+      smav_central_bill_id: smavCentralBillId,
+      smav_reservation_id: String(p.reservation_id || p.reservationId || '').trim() || null,
+      smav_sale_id: String(p.sale_id || p.saleId || smavCentralBillId).trim() || null,
+      local_order_id: localOrderRef && localOrderRef !== centralBillNumber ? localOrderRef : null,
+      idempotency_key: key,
+      branch_id: resolvedBranchId,
+      branch_code: resolvedBranchCode,
+      branch_name: cleanBranchName,
+      customer_name: customerName,
+      customer_phone: customerPhone,
+      items: mappedItems,
+      subtotal,
+      discount,
+      tax_percent: taxPercent,
+      tax_amount: taxAmount,
+      tip_amount: tipAmount,
+      grand_total: grandTotal,
+      paid_amount: paidAmount,
+      due_amount: dueAmount,
+      payment_status: normalizeSmavPaymentStatus(p.payment_status ?? p.paymentStatus, dueAmount),
+      primary_payment_mode: normalizeSmavPaymentMode(p.primary_payment_mode ?? p.payment_mode ?? p.paymentMode),
+      cashier_name: String(p.cashier_name || p.cashierName || 'SMAV Central').trim(),
+      notes: String(p.notes || '').trim() || undefined,
+      billed_at: normalizeIsoTimestamp(p.billed_at || p.billedAt || p.created_at, nowIso),
+      finalized_at: normalizeIsoTimestamp(p.finalized_at || p.finalizedAt, nowIso),
+    });
+
+    return res.json({
+      accepted: true,
+      created: upserted.created,
+      updated: !upserted.created,
+      native_order_id: upserted.order.id,
+      payment_id: upserted.payment.id,
+      bill_number: upserted.order.bill_number,
+      smav_central_bill_id: upserted.order.smav_central_bill_id || smavCentralBillId,
+    });
+  }
+
+  // 3d. If updating an existing local bill (finalized/updated/payment sync)
   if (existingLocalOrder && !['receipt', 'feedback'].includes(eventType)) {
     if (existingLocalOrder.smav_last_event_id === eventId) {
       return res.json({
@@ -576,38 +982,91 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
         ? { smav_sale_id: String(p.sale_id || p.saleId || p.smav_sale_id || smavCentralBillId) }
         : {}),
       ...(resolvedBranchCode && !existingLocalOrder.branch_code ? { branch_code: resolvedBranchCode } : {}),
+      ...(cleanBranchName && !existingLocalOrder.branch_name ? { branch_name: cleanBranchName } : {}),
     };
 
     if (['sale_recorded', 'sale_finalized', 'bill_finalized'].includes(eventType)) {
       updates.smav_bill_status = 'finalized';
       updates.smav_finalized_at = String(p.finalized_at || p.finalizedAt || nowIso);
       updates.smav_finalize_error = null;
-    } else if (['bill_voided', 'sale_voided'].includes(eventType)) {
-      updates.smav_bill_status = 'voided';
-      updates.payment_status = 'Cancelled';
     } else if (eventType === 'refund') {
       updates.payment_status = 'Refunded';
     }
 
-    if (['bill_updated', 'payment_updated'].includes(eventType)) {
+    if (['central_bill_updated', 'bill_updated', 'payment_updated'].includes(eventType)) {
       const allowedStatuses = ['Paid', 'Partial', 'Pending', 'Refunded', 'Cancelled'];
       const nextStatus = String(p.payment_status || p.paymentStatus || '').trim();
       if (nextStatus && allowedStatuses.includes(nextStatus)) {
         updates.payment_status = nextStatus as Order['payment_status'];
       }
+      if (p.customer_name || p.customerName) {
+        updates.customer_name = String(p.customer_name || p.customerName).trim();
+      }
+      if (p.customer_phone || p.customerPhone) {
+        updates.customer_phone = String(p.customer_phone || p.customerPhone).trim();
+      }
+      if (p.notes !== undefined) {
+        updates.notes = String(p.notes || '').trim();
+      }
+      if (p.subtotal !== undefined && Number.isFinite(Number(p.subtotal))) {
+        updates.subtotal = Math.max(0, Number(p.subtotal));
+      }
+      if (p.discount !== undefined && Number.isFinite(Number(p.discount))) {
+        updates.discount = Math.max(0, Number(p.discount));
+      }
+      if ((p.tax_amount ?? p.taxAmount) !== undefined && Number.isFinite(Number(p.tax_amount ?? p.taxAmount))) {
+        updates.tax_amount = Math.max(0, Number(p.tax_amount ?? p.taxAmount));
+      }
+      if ((p.grand_total ?? p.grandTotal) !== undefined && Number.isFinite(Number(p.grand_total ?? p.grandTotal))) {
+        updates.grand_total = Math.max(0, Number(p.grand_total ?? p.grandTotal));
+      }
       if (p.paid_amount !== undefined || p.paidAmount !== undefined) {
         const paid = Math.max(0, Number(p.paid_amount ?? p.paidAmount));
         if (Number.isFinite(paid)) {
           updates.paid_amount = paid;
-          updates.due_amount = Math.max(0, Number(existingLocalOrder.grand_total || 0) - paid);
+          const totalRef = updates.grand_total !== undefined ? updates.grand_total : Number(existingLocalOrder.grand_total || 0);
+          updates.due_amount = Math.max(0, totalRef - paid);
         }
       }
-      if (p.payment_mode || p.paymentMode) {
-        updates.primary_payment_mode = normalizeSmavPaymentMode(p.payment_mode || p.paymentMode);
+      if (p.payment_mode || p.paymentMode || p.primary_payment_mode || p.primaryPaymentMode) {
+        updates.primary_payment_mode = normalizeSmavPaymentMode(
+          p.primary_payment_mode || p.primaryPaymentMode || p.payment_mode || p.paymentMode
+        );
       }
     }
 
     const updatedOrder = await salonRepository.updateOrder(existingLocalOrder.id, updates);
+
+    // Keep linked payment ledger row synchronized with updated bill fields
+    try {
+      const client = (salonRepository as any).client;
+      if (client) {
+        const payPatch: Record<string, any> = {};
+        if (smavCentralBillId) payPatch.smav_central_bill_id = smavCentralBillId;
+        if (updates.customer_name) payPatch.customer_name = updates.customer_name;
+        if (updates.customer_phone) payPatch.customer_phone = updates.customer_phone;
+        if (updates.primary_payment_mode) payPatch.payment_mode = updates.primary_payment_mode;
+        if (updates.paid_amount !== undefined) payPatch.amount = updates.paid_amount;
+        else if (updates.grand_total !== undefined) payPatch.amount = updates.grand_total;
+        if (updates.payment_status === 'Refunded') payPatch.status = 'Refunded';
+        else if (updates.payment_status === 'Cancelled') payPatch.status = 'Void';
+        if (Object.keys(payPatch).length > 0) {
+          await client
+            .from('payments')
+            .update(payPatch)
+            .eq('order_id', existingLocalOrder.id);
+          if (existingLocalOrder.bill_number) {
+            await client
+              .from('payments')
+              .update(payPatch)
+              .eq('bill_number', existingLocalOrder.bill_number);
+          }
+        }
+      }
+    } catch {
+      // Non-fatal payment sync guard
+    }
+
     await salonRepository.logAudit(
       'SMAV_SALE_EVENT',
       'Order',
@@ -621,6 +1080,7 @@ app.post('/api/integrations/smav/sale-event', async (req, res) => {
       updated: true,
       native_order_id: existingLocalOrder.id,
       bill_number: existingLocalOrder.bill_number,
+      smav_central_bill_id: updatedOrder?.smav_central_bill_id || smavCentralBillId || existingLocalOrder.smav_central_bill_id || null,
       smav_bill_status: updatedOrder?.smav_bill_status || updates.smav_bill_status || existingLocalOrder.smav_bill_status,
     });
   }
@@ -944,8 +1404,13 @@ app.get('/api/health', (req, res) => {
 
 // Settings & Contact Info
 app.get('/api/settings', async (req, res) => {
-  const s = await salonRepository.getSettings();
-  res.json(s);
+  try {
+    const s = await salonRepository.getSettings();
+    res.json(s);
+  } catch (err: any) {
+    console.error('[GET /api/settings] Error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to load salon settings' });
+  }
 });
 
 app.put('/api/settings', async (req, res) => {
@@ -2602,9 +3067,14 @@ interface SendWhatsAppTemplateOptions {
   renderedPreview?: string;
   templateParams?: Record<string, any>;
   recordFailureInInbox?: boolean;
+  skipInboxRecording?: boolean;
+  disableAutoRetry?: boolean;
+  extraDiagnostics?: string;
   jobType?:
     | 'appointment_confirmation'
     | 'appointment_reminder'
+    | 'appointment_admin_alert'
+    | 'enquiry_admin_alert'
     | 'customer_feedback'
     | 'bill_receipt'
     | 'payment_reminder'
@@ -2663,8 +3133,13 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
     renderedPreview,
     templateParams,
     recordFailureInInbox,
+    skipInboxRecording,
+    disableAutoRetry,
+    extraDiagnostics,
     customData,
   } = options;
+  const formatDiagnostics = (detail: string) =>
+    extraDiagnostics ? `${extraDiagnostics} | ${detail}` : detail;
   let integration = await salonRepository.getBranchWhatsAppIntegration(branchId);
   if (!integration || integration.status !== 'connected' || !integration.phone_number_id) {
     const defaultBranchId = await getDefaultBranchIdFromRepo();
@@ -2696,7 +3171,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       sender_phone_number_id: integration?.phone_number_id || 'unassigned',
       status: 'failed',
       error_message: errorMsg,
-      diagnostics: 'Recipient validation failed'
+      diagnostics: formatDiagnostics('Recipient validation failed')
     });
     return { sent: false, status: 'failed', error: errorMsg, log };
   }
@@ -2717,7 +3192,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       sender_phone_number_id: integration?.phone_number_id || 'unassigned',
       status: 'failed',
       error_message: errorMsg,
-      diagnostics: 'Branch connection check failed'
+      diagnostics: formatDiagnostics('Branch connection check failed')
     });
     return { sent: false, status: 'failed', error: errorMsg, log };
   }
@@ -2735,7 +3210,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       sender_phone_number_id: integration.phone_number_id,
       status: 'failed',
       error_message: errorMsg,
-      diagnostics: 'Missing system user access token'
+      diagnostics: formatDiagnostics('Missing system user access token')
     });
     return { sent: false, status: 'failed', error: errorMsg, log };
   }
@@ -2949,7 +3424,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
         sent_by_user_id: sentByUserId,
         sent_by_user_name: sentByUserName,
         sent_at: sentTime,
-        diagnostics: `Graph API message accepted (Message ID: ${messageId})`
+        diagnostics: formatDiagnostics(`Graph API message accepted (Message ID: ${messageId})`)
       });
 
       if (orderId) {
@@ -2981,53 +3456,56 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       }
 
       // Record outbound template message ONCE into permanent WhatsApp Inbox history
+      // (skipped for internal salon/admin alert templates so customer Inbox remains uncluttered)
       let inboxMsg: WhatsAppMessage | null = null;
-      try {
-        const inboxConv = await salonRepository.getOrCreateWhatsAppConversation({
-          branch_id: branchId,
-          customer_phone: recipientE164,
-          customer_name: customData?.customerName,
-          wa_phone_number_id: integration.phone_number_id
-        });
-        const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
-        const resolvedSalonId = branchId || (await getDefaultBranchIdFromRepo());
-        inboxMsg = await salonRepository.createWhatsAppMessage({
-          salon_id: resolvedSalonId,
-          branch_id: resolvedSalonId,
-          conversation_id: inboxConv.id,
-          appointment_id: appointmentId,
-          order_id: orderId,
-          bill_number: billNumber || customData?.billNumber,
-          payment_id: paymentId,
-          direction: 'OUTBOUND',
-          message_type: 'template',
-          type: 'template',
-          text_body: templateBody,
-          message_body: templateBody,
-          body: templateBody,
-          template_name: resolvedTemplateName,
-          template_params: templateParams || customData || null,
-          meta_message_id: messageId,
-          status: 'sent',
-          delivery_status: 'sent',
-          source_badge: 'TEMPLATE',
-          sent_by_user_id: sentByUserId,
-          sent_by_user_name: sentByUserName,
-          sent_at: sentTime
-        });
-        await salonRepository.updateWhatsAppConversation(inboxConv.id, {
-          last_message_at: sentTime,
-          last_message_text: templateBody,
-          last_message_preview: templateBody
-        }).catch(() => null);
-        broadcastWhatsAppInboxEvent({
-          type: 'outbound_message',
-          conversationId: inboxConv.id,
-          message: inboxMsg,
-          conversation: inboxConv
-        });
-      } catch (inboxErr) {
-        console.warn('[WhatsApp Inbox] Failed to record outbound template in inbox:', inboxErr);
+      if (!skipInboxRecording) {
+        try {
+          const inboxConv = await salonRepository.getOrCreateWhatsAppConversation({
+            branch_id: branchId,
+            customer_phone: recipientE164,
+            customer_name: customData?.customerName,
+            wa_phone_number_id: integration.phone_number_id
+          });
+          const templateBody = renderedPreview?.trim() || `Template: ${resolvedTemplateName}`;
+          const resolvedSalonId = branchId || (await getDefaultBranchIdFromRepo());
+          inboxMsg = await salonRepository.createWhatsAppMessage({
+            salon_id: resolvedSalonId,
+            branch_id: resolvedSalonId,
+            conversation_id: inboxConv.id,
+            appointment_id: appointmentId,
+            order_id: orderId,
+            bill_number: billNumber || customData?.billNumber,
+            payment_id: paymentId,
+            direction: 'OUTBOUND',
+            message_type: 'template',
+            type: 'template',
+            text_body: templateBody,
+            message_body: templateBody,
+            body: templateBody,
+            template_name: resolvedTemplateName,
+            template_params: templateParams || customData || null,
+            meta_message_id: messageId,
+            status: 'sent',
+            delivery_status: 'sent',
+            source_badge: 'TEMPLATE',
+            sent_by_user_id: sentByUserId,
+            sent_by_user_name: sentByUserName,
+            sent_at: sentTime
+          });
+          await salonRepository.updateWhatsAppConversation(inboxConv.id, {
+            last_message_at: sentTime,
+            last_message_text: templateBody,
+            last_message_preview: templateBody
+          }).catch(() => null);
+          broadcastWhatsAppInboxEvent({
+            type: 'outbound_message',
+            conversationId: inboxConv.id,
+            message: inboxMsg,
+            conversation: inboxConv
+          });
+        } catch (inboxErr) {
+          console.warn('[WhatsApp Inbox] Failed to record outbound template in inbox:', inboxErr);
+        }
       }
 
       return { sent: true, status: 'sent', messageId, log, inboxMessage: inboxMsg };
@@ -3047,7 +3525,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       errMsg.toLowerCase().includes('development');
 
     // Detect temporary/retryable errors: rate limits (Code 4, 17, 32, 613, 80007), temporary service error (Code 1, 2), or 5xx HTTP response
-    const isRetryable =
+    const isRetryable = !disableAutoRetry && (
       response.status >= 500 ||
       errCode === 4 ||
       errCode === 17 ||
@@ -3056,7 +3534,8 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       errCode === 80007 ||
       errMsg.toLowerCase().includes('rate limit') ||
       errMsg.toLowerCase().includes('temporarily unavailable') ||
-      errMsg.toLowerCase().includes('try again');
+      errMsg.toLowerCase().includes('try again')
+    );
 
     const status: 'sent' | 'pending_approval' | 'failed' | 'retrying' = isAppReviewOrSandbox
       ? 'pending_approval'
@@ -3068,9 +3547,9 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       ? 'Pending Meta approval: Live sending is currently restricted by Meta while App Review is in progress. Real messages can only be delivered to verified test/admin phone numbers in Meta App Settings.'
       : isRetryable
       ? `Meta API temporarily unavailable (Code ${errCode || response.status}): Enqueued for automatic retry.`
-      : `Meta API delivery failed: ${errMsg}`;
+      : `Meta API delivery failed (Code ${errCode || response.status}): ${errMsg}`;
 
-    const diagnostic = `Meta Graph API error (Code ${errCode || 'N/A'}): ${errMsg}`;
+    const diagnostic = formatDiagnostics(`Meta Graph API error (Code ${errCode || 'N/A'}): ${errMsg}`);
     const nextRetryAt = isRetryable ? new Date(Date.now() + 60 * 1000).toISOString() : undefined;
 
     const log = await salonRepository.createWhatsAppMessageLog({
@@ -3094,7 +3573,7 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
     });
 
     let failedInboxMsg: WhatsAppMessage | null = null;
-    if (recordFailureInInbox) {
+    if (recordFailureInInbox && !skipInboxRecording) {
       try {
         const failedAt = new Date().toISOString();
         const inboxConv = await salonRepository.getOrCreateWhatsAppConversation({
@@ -3165,7 +3644,9 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
     };
   } catch (err: any) {
     const errorMsg = `Network error communicating with Meta Cloud API: ${err.message}`;
-    const nextRetryAt = new Date(Date.now() + 60 * 1000).toISOString();
+    const shouldRetry = !disableAutoRetry;
+    const catchStatus: 'failed' | 'retrying' = shouldRetry ? 'retrying' : 'failed';
+    const nextRetryAt = shouldRetry ? new Date(Date.now() + 60 * 1000).toISOString() : undefined;
     const log = await salonRepository.createWhatsAppMessageLog({
       appointment_id: appointmentId,
       order_id: orderId,
@@ -3175,30 +3656,36 @@ async function sendBranchWhatsAppTemplate(options: SendWhatsAppTemplateOptions):
       job_type: resolvedJobType,
       recipient_number: recipientE164,
       sender_phone_number_id: integration?.phone_number_id || 'unassigned',
-      status: 'retrying',
+      status: catchStatus,
       error_message: errorMsg,
-      diagnostics: `Network failure: ${err.message}`,
-      retry_count: 1,
+      diagnostics: formatDiagnostics(`Network failure: ${err.message}`),
+      retry_count: shouldRetry ? 1 : 0,
       next_retry_at: nextRetryAt
     });
 
     if (orderId) {
       if (resolvedJobType === 'bill_receipt') {
         await salonRepository.updateOrder(orderId, {
-          receipt_whatsapp_status: 'retrying',
+          receipt_whatsapp_status: catchStatus,
           receipt_whatsapp_error: errorMsg,
-          whatsapp_status: 'retrying',
+          whatsapp_status: catchStatus,
           whatsapp_error: errorMsg
         });
       } else if (resolvedJobType === 'customer_feedback') {
         await salonRepository.updateOrder(orderId, {
-          feedback_whatsapp_status: 'retrying',
+          feedback_whatsapp_status: catchStatus,
           feedback_whatsapp_error: errorMsg
         });
       }
     }
 
-    return { sent: false, status: 'retrying', error: `${errorMsg}. Enqueued for automatic retry.`, log };
+    return {
+      sent: false,
+      status: catchStatus,
+      error: shouldRetry ? `${errorMsg}. Enqueued for automatic retry.` : errorMsg,
+      diagnostics: formatDiagnostics(`Network failure: ${err.message}`),
+      log
+    };
   }
 }
 
@@ -3395,6 +3882,15 @@ async function checkAndRunWhatsAppRetries() {
     if (!dueRetries || !dueRetries.length) return;
 
     for (const log of dueRetries) {
+      // Never auto-retry internal admin/salon alert templates from the background worker
+      if (
+        log.job_type === 'appointment_admin_alert' ||
+        log.job_type === 'enquiry_admin_alert' ||
+        log.template_name === APPOINTMENT_ADMIN_ALERT_TEMPLATE ||
+        log.template_name === ENQUIRY_ADMIN_ALERT_TEMPLATE
+      ) {
+        continue;
+      }
       const nextRetryCount = (log.retry_count || 0) + 1;
       const result = await sendBranchWhatsAppTemplate({
         branchId: log.branch_id || (await getDefaultBranchIdFromRepo()),
@@ -3465,15 +3961,7 @@ setInterval(() => {
 // Automated Daily Stylist Sales Reporting Through WhatsApp (10:15 PM Asia/Kolkata)
 // ============================================================================
 
-function getKolkataDateString(date: Date = new Date()): string {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  });
-  return formatter.format(date);
-}
+// Uses shared getKolkataDateString(dateInput?: Date | string) imported from ./src/lib/rbac.ts
 
 function getKolkataDisplayDate(dateStr: string): string {
   try {
@@ -4705,6 +5193,182 @@ async function fetchApprovedWabaTemplates(branchId?: string): Promise<{
   } catch (err: any) {
     return { templates: [], source: 'unavailable', error: err?.message || 'Failed to fetch Meta templates.' };
   }
+}
+
+// Short-lived in-memory cache for Meta approved template definitions so admin alerts
+// automatically match live placeholder count/order/language without extra API round-trips
+const META_TEMPLATE_CACHE_TTL_MS = 5 * 60 * 1000;
+const approvedMetaTemplatesCache = new Map<
+  string,
+  { expiresAt: number; templates: ApprovedMetaTemplateSchema[] }
+>();
+const inFlightAdminAlertKeys = new Set<string>();
+
+async function getCachedApprovedMetaTemplates(
+  branchId?: string
+): Promise<ApprovedMetaTemplateSchema[]> {
+  const cacheKey = branchId || '__default__';
+  const cached = approvedMetaTemplatesCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.templates;
+  }
+  const result = await fetchApprovedWabaTemplates(branchId);
+  if (result.source === 'meta_api' && result.templates.length > 0) {
+    approvedMetaTemplatesCache.set(cacheKey, {
+      expiresAt: Date.now() + META_TEMPLATE_CACHE_TTL_MS,
+      templates: result.templates,
+    });
+    return result.templates;
+  }
+  return cached?.templates || [];
+}
+
+async function dispatchSalonAdminWhatsAppAlert(params: {
+  entityType: 'appointment' | 'enquiry';
+  entityId: string;
+  branchId: string;
+  branch?: any;
+  branchHint?: string | null;
+  templateName: string;
+  variables: Record<string, string>;
+  defaultPositionalOrder: Array<{ key: string; value: string }>;
+  fingerprintParts: string[];
+  idempotencyKey?: string | null;
+  appointmentId?: string;
+  customerName?: string;
+}): Promise<void> {
+  const {
+    entityType,
+    entityId,
+    branchId,
+    branch,
+    branchHint,
+    templateName,
+    variables,
+    defaultPositionalOrder,
+    fingerprintParts,
+    idempotencyKey,
+    appointmentId,
+    customerName,
+  } = params;
+
+  const recipients = resolveBranchAlertRecipients(branch, branchHint);
+  if (recipients.length === 0) {
+    console.warn(
+      `[WhatsApp Admin Alert] No recipient configured for ${entityType} ${entityId} (branch: ${branchId}). Configure WHATSAPP_GACHIBOWLI_ALERT_NUMBER / WHATSAPP_KONDAPUR_ALERT_NUMBER / WHATSAPP_ADMIN_ALERT_NUMBER.`
+    );
+    return;
+  }
+
+  const approvedTemplates = await getCachedApprovedMetaTemplates(branchId).catch(() => []);
+  const approvedSchema = approvedTemplates.find(
+    t => t.name.toLowerCase() === templateName.toLowerCase()
+  );
+
+  const builtPayload = buildAlertTemplateComponents({
+    templateName,
+    entityType,
+    approvedTemplateSchema: approvedSchema,
+    variables,
+    defaultPositionalOrder,
+  });
+
+  // Load existing logs once for appointment alerts as an extra durable duplicate check
+  let existingAppointmentLogs: any[] = [];
+  if (entityType === 'appointment' && appointmentId) {
+    try {
+      existingAppointmentLogs = await salonRepository.getWhatsAppMessageLogs(appointmentId);
+    } catch {
+      existingAppointmentLogs = [];
+    }
+  }
+
+  const jobType = entityType === 'appointment' ? 'appointment_admin_alert' : 'enquiry_admin_alert';
+
+  await Promise.allSettled(
+    recipients.map(async recipient => {
+      const dedupKeys = buildAdminAlertDedupKeys({
+        entityType,
+        entityId,
+        recipientMeta: recipient.metaRecipient,
+        fingerprintParts,
+        idempotencyKey,
+      });
+
+      // 1. Process-level in-flight lock prevents duplicate concurrent sends
+      if (dedupKeys.some(key => inFlightAdminAlertKeys.has(key))) {
+        return;
+      }
+
+      // 2. Durable check in whatsapp_message_logs (for appointments)
+      if (
+        entityType === 'appointment' &&
+        existingAppointmentLogs.some(
+          log =>
+            log.template_name === templateName &&
+            String(log.recipient_number || '').replace(/\D/g, '').endsWith(recipient.metaRecipient.slice(-10)) &&
+            (log.status === 'sent' || log.status === 'delivered' || log.status === 'read')
+        )
+      ) {
+        return;
+      }
+
+      // 3. Durable idempotency check in processed_webhook_events
+      for (const key of dedupKeys) {
+        try {
+          if (await salonRepository.isWebhookEventProcessed(key)) {
+            return;
+          }
+        } catch {
+          // Continue to lock/send if lookup transiently fails
+        }
+      }
+
+      // Claim keys before Meta API call to block retries/refreshes across concurrent requests
+      dedupKeys.forEach(key => inFlightAdminAlertKeys.add(key));
+      try {
+        for (const key of dedupKeys) {
+          await salonRepository.recordProcessedWebhookEvent(key, jobType).catch(() => null);
+        }
+
+        const extraDiagnostics = [
+          `entity_type=${entityType}`,
+          `entity_id=${entityId}`,
+          `branch_id=${branchId}`,
+          `recipient_role=${recipient.role}`,
+          `template_schema=${builtPayload.usedLiveMetaSchema ? 'meta_live' : 'default_fallback'}`,
+          `param_count=${builtPayload.resolvedParameters.length}`,
+        ].join('; ');
+
+        const sendResult = await sendBranchWhatsAppTemplate({
+          branchId,
+          recipientPhone: recipient.metaRecipient,
+          templateName: builtPayload.templateName,
+          templateLanguage: builtPayload.templateLanguage,
+          components: builtPayload.components,
+          appointmentId: entityType === 'appointment' ? appointmentId : undefined,
+          renderedPreview: builtPayload.renderedPreview,
+          templateParams: Object.fromEntries(
+            builtPayload.resolvedParameters.map(p => [p.key, p.value])
+          ),
+          jobType,
+          skipInboxRecording: true,
+          disableAutoRetry: true,
+          extraDiagnostics,
+          customData: {
+            customerName: customerName || variables.customer_name,
+            branchName: variables.branch_name,
+          },
+        });
+
+        console.log(
+          `[WhatsApp Admin Alert] template=${builtPayload.templateName} entity=${entityType}:${entityId} recipient=${maskPhoneNumber(recipient.e164)} status=${sendResult.status} wamid=${sendResult.messageId || 'none'} error=${sendResult.error || 'none'}`
+        );
+      } finally {
+        dedupKeys.forEach(key => inFlightAdminAlertKeys.delete(key));
+      }
+    })
+  );
 }
 
 function buildRecordTemplateVariables(
@@ -6366,8 +7030,13 @@ app.post('/api/admin/branches/:branchId/whatsapp/disconnect', async (req, res) =
 // Categories, Services & Packages CRUD
 // ----------------------------------------------------------------------------
 app.get('/api/categories', async (req, res) => {
-  const cats = await salonRepository.getCategories();
-  res.json(cats);
+  try {
+    const cats = await salonRepository.getCategories();
+    res.json(cats);
+  } catch (err: any) {
+    console.error('[GET /api/categories] Error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to load service categories' });
+  }
 });
 
 app.post('/api/categories', async (req, res) => {
@@ -6389,10 +7058,15 @@ app.delete('/api/categories/:id', async (req, res) => {
 });
 
 app.get('/api/services', async (req, res) => {
-  const categoryId = req.query.category_id as string | undefined;
-  const search = req.query.search as string | undefined;
-  const list = await salonRepository.getServices(categoryId, search);
-  res.json(list);
+  try {
+    const categoryId = req.query.category_id as string | undefined;
+    const search = req.query.search as string | undefined;
+    const list = await salonRepository.getServices(categoryId, search);
+    res.json(list);
+  } catch (err: any) {
+    console.error('[GET /api/services] Error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to load services' });
+  }
 });
 
 app.post('/api/services', async (req, res) => {
@@ -6414,8 +7088,13 @@ app.delete('/api/services/:id', async (req, res) => {
 });
 
 app.get('/api/packages', async (req, res) => {
-  const pkgs = await salonRepository.getPackages();
-  res.json(pkgs);
+  try {
+    const pkgs = await salonRepository.getPackages();
+    res.json(pkgs);
+  } catch (err: any) {
+    console.error('[GET /api/packages] Error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to load packages' });
+  }
 });
 
 app.post('/api/packages', async (req, res) => {
@@ -6602,6 +7281,37 @@ app.post('/api/appointments', async (req, res) => {
     } catch (waErr: any) {
       console.warn(`[Appointments] Non-blocking WhatsApp confirmation failure:`, waErr.message);
       waResult = { sent: false, status: 'failed', error: waErr.message };
+    }
+
+    // Send gl_new_appointment_alert once to branch + optional admin alert numbers
+    try {
+      const { variables, defaultPositionalOrder } = buildAppointmentAlertVariables(newApt, branch);
+      const phone10 = String(newApt.customer_phone || '').replace(/\D/g, '').slice(-10);
+      const reqIdempotencyKey = String(
+        req.headers['x-idempotency-key'] || req.body?.idempotency_key || ''
+      ).trim() || null;
+
+      await dispatchSalonAdminWhatsAppAlert({
+        entityType: 'appointment',
+        entityId: newApt.id,
+        branchId: effectiveBranchId,
+        branch,
+        branchHint: branchName,
+        templateName: APPOINTMENT_ADMIN_ALERT_TEMPLATE,
+        variables,
+        defaultPositionalOrder,
+        fingerprintParts: [
+          effectiveBranchId,
+          phone10,
+          newApt.appointment_date,
+          newApt.time_slot,
+        ],
+        idempotencyKey: reqIdempotencyKey,
+        appointmentId: newApt.id,
+        customerName: newApt.customer_name,
+      });
+    } catch (alertErr: any) {
+      console.warn(`[Appointments] Non-blocking salon/admin WhatsApp alert failure:`, alertErr?.message || alertErr);
     }
 
     // Return appointment with clear WhatsApp delivery report
@@ -7145,18 +7855,25 @@ app.post('/api/orders', async (req, res) => {
       finalizedBy: actor,
       finalizedByUserId: authAdmin?.id,
       centralAuthId: authAdmin?.central_auth_id,
+      actorRole: authAdmin?.role,
     });
 
     if (finalizeResult.ok) {
       const finalizedAt = finalizeResult.finalizedAt || new Date().toISOString();
+      const resolvedCentralBillId = finalizeResult.centralBillId || finalizeResult.saleId || null;
       await salonRepository.updateOrder(order.id, {
         smav_bill_status: 'finalized',
-        smav_sale_id: finalizeResult.saleId,
+        smav_central_bill_id: resolvedCentralBillId,
+        smav_sale_id: finalizeResult.saleId || resolvedCentralBillId || undefined,
         smav_finalized_at: finalizedAt,
         smav_finalize_error: null,
       });
+      if (resolvedCentralBillId) {
+        await syncPaymentCentralBillId(order.id, order.bill_number, resolvedCentralBillId);
+      }
       order.smav_bill_status = 'finalized';
-      order.smav_sale_id = finalizeResult.saleId;
+      order.smav_central_bill_id = resolvedCentralBillId;
+      order.smav_sale_id = finalizeResult.saleId || resolvedCentralBillId || undefined;
       order.smav_finalized_at = finalizedAt;
       order.smav_finalize_error = null;
     } else {
@@ -7307,7 +8024,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// Retry SMAV central bill finalize for any committed bill whose finalize call transiently failed
+// Retry SMAV central bill finalize/upsert for any committed bill whose sync transiently failed
 app.post('/api/orders/:id/retry-smav-finalize', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
@@ -7319,53 +8036,32 @@ app.post('/api/orders/:id/retry-smav-finalize', async (req, res) => {
     if (order.is_legacy_bill) {
       return res.status(400).json({ error: 'Legacy historical bills are preserved as-is and do not require SMAV finalization.' });
     }
-    if (order.smav_bill_status === 'finalized') {
+    if (order.smav_bill_status === 'finalized' && !req.body?.force) {
       return res.json({ success: true, already_finalized: true, order });
     }
 
-    const branchCode = order.branch_code || resolveCanonicalBranchCode({ branchId: order.branch_id }) || '';
-    const branchName = order.branch_name || getCleanReceiptBranchName({ branchId: order.branch_id, branchCode });
-    const result = await finalizeSmavCentralBillNumber({
-      reservationId: order.smav_reservation_id,
-      billNumber: order.bill_number,
-      branchId: order.branch_id || '',
-      branchCode,
-      branchName,
-      localOrderId: order.id,
-      idempotencyKey: order.idempotency_key || order.bill_number,
+    const syncResult = await syncOrderToSmavCentral(
       order,
-      finalizedBy: admin.name,
-      finalizedByUserId: admin.id,
-      centralAuthId: admin.central_auth_id,
-    });
+      { id: admin.id, name: admin.name, role: admin.role, central_auth_id: admin.central_auth_id },
+      'finalize_or_upsert'
+    );
 
-    if (!result.ok) {
-      await salonRepository.updateOrder(order.id, {
-        smav_bill_status: 'finalize_pending',
-        smav_finalize_error: String(result.error || 'Finalize retry failed').slice(0, 500),
-      });
-      return res.status(result.status >= 400 && result.status < 600 ? result.status : 503).json({
+    if (!syncResult.ok) {
+      return res.status(syncResult.status >= 400 && syncResult.status < 600 ? syncResult.status : 503).json({
         success: false,
-        error: result.error || 'SMAV finalize retry failed',
+        error: syncResult.error || 'SMAV sync retry failed',
       });
     }
-
-    const updated = await salonRepository.updateOrder(order.id, {
-      smav_bill_status: 'finalized',
-      smav_sale_id: result.saleId || order.smav_sale_id,
-      smav_finalized_at: result.finalizedAt || new Date().toISOString(),
-      smav_finalize_error: null,
-    });
 
     await salonRepository.logAudit(
       'SMAV_FINALIZE_RETRIED',
       'Order',
       order.id,
       admin.name,
-      `Finalized central bill ${order.bill_number} in SMAV`
+      `Synced central bill ${order.bill_number} to SMAV Central Billing`
     );
 
-    return res.json({ success: true, order: updated || order });
+    return res.json({ success: true, order: syncResult.order });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -7483,15 +8179,79 @@ app.patch('/api/orders/:id', async (req, res) => {
       `Order ${existingOrder.bill_number} edited: ${JSON.stringify(auditChanges)}`
     );
 
-    const fullOrder = await salonRepository.getOrderById(orderId) || updated;
+    let fullOrder = (await salonRepository.getOrderById(orderId)) || updated;
+
+    // Synchronize bill edits to SMAV Central Billing via idempotent bills/upsert (preserves existing bill ID & invoice number)
+    if (fullOrder && !fullOrder.is_legacy_bill && Object.keys(auditChanges).length > 0) {
+      const syncRes = await syncOrderToSmavCentral(
+        fullOrder,
+        { id: admin.id, name: actor, role: admin.role, central_auth_id: admin.central_auth_id },
+        'upsert'
+      );
+      fullOrder = syncRes.order;
+      if (!syncRes.ok) {
+        await salonRepository.logAudit(
+          'SMAV_UPSERT_PENDING',
+          'Order',
+          orderId,
+          actor,
+          `Local edit saved for ${existingOrder.bill_number}; SMAV upsert queued for retry: ${syncRes.error}`
+        );
+      }
+    }
+
     res.json(fullOrder);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Soft-delete complete Bill/Order transaction + related order_items + all linked payments (SUPERADMIN, ADMIN, OWNER only)
-app.delete('/api/orders/:id', async (req, res) => {
+async function resolveTargetOrderForLifecycle(params: {
+  paramId: string;
+  bodyOrderId?: string;
+  bodyCentralBillId?: string;
+  bodyBillNumber?: string;
+  source: 'order' | 'payment';
+}): Promise<Order | null> {
+  const { paramId, bodyOrderId, bodyCentralBillId, bodyBillNumber, source } = params;
+  if (source === 'order') {
+    const byId = await salonRepository.getOrderById(paramId);
+    if (byId) return byId;
+  } else {
+    const allPayments = await salonRepository.getPayments({ deleted: 'all' });
+    const match = allPayments.find(p => p.id === paramId);
+    if (match?.order_id) {
+      const byPayOrder = await salonRepository.getOrderById(match.order_id);
+      if (byPayOrder) return byPayOrder;
+    }
+    if (match?.bill_number) {
+      const byPayBill = await salonRepository.getOrderByBillNumber(match.bill_number);
+      if (byPayBill) return byPayBill;
+    }
+  }
+  if (bodyOrderId) {
+    const byBodyOrder = await salonRepository.getOrderById(bodyOrderId);
+    if (byBodyOrder) return byBodyOrder;
+  }
+  if (bodyCentralBillId) {
+    const byCentral = await salonRepository.getOrderBySmavCentralBillId(bodyCentralBillId);
+    if (byCentral) return byCentral;
+  }
+  if (bodyBillNumber) {
+    const byBill = await salonRepository.getOrderByBillNumber(bodyBillNumber);
+    if (byBill) return byBill;
+  }
+  // Finally try paramId as central bill ID or bill number
+  const byParamCentral = await salonRepository.getOrderBySmavCentralBillId(paramId);
+  if (byParamCentral) return byParamCentral;
+  return await salonRepository.getOrderByBillNumber(paramId);
+}
+
+async function handleAuthorizedCentralBillVoid(
+  req: express.Request,
+  res: express.Response,
+  source: 'order' | 'payment'
+) {
   try {
     const admin = await getAuthAdmin(req);
     if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
@@ -7503,23 +8263,97 @@ app.delete('/api/orders/:id', async (req, res) => {
     const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
       ? req.body.reason.trim()
       : 'Removed from active ledger';
+    const bodyOrderId = typeof req.body?.order_id === 'string' ? req.body.order_id.trim() : '';
+    const bodyCentralBillId = typeof req.body?.smav_central_bill_id === 'string' ? req.body.smav_central_bill_id.trim() : '';
+    const bodyBillNumber = typeof req.body?.bill_number === 'string' ? req.body.bill_number.trim() : '';
 
-    const result = await salonRepository.softDeleteOrderTransaction(
-      req.params.id,
-      { userId: admin.id, name: admin.name },
-      reason
-    );
-    if (!result) {
+    const localOrder = await resolveTargetOrderForLifecycle({
+      paramId: req.params.id,
+      bodyOrderId,
+      bodyCentralBillId,
+      bodyBillNumber,
+      source,
+    });
+
+    const isCentralBill = localOrder ? !localOrder.is_legacy_bill : Boolean(bodyCentralBillId || bodyBillNumber || req.params.id);
+    if (!localOrder && !isCentralBill) {
       return res.status(404).json({ error: 'Bill / order not found.' });
     }
-    res.json({ success: true, ...result });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete bill transaction.' });
-  }
-});
 
-// Restore soft-deleted Bill/Order transaction + order_items + linked payments (SUPERADMIN, ADMIN, OWNER only)
-app.post('/api/orders/:id/restore', async (req, res) => {
+    let smavVoided = false;
+    let resolvedCentralBillId = localOrder?.smav_central_bill_id || bodyCentralBillId || localOrder?.smav_sale_id || undefined;
+
+    // For central bills, confirm SMAV Central void persistence FIRST before updating local state or reporting success
+    if (isCentralBill) {
+      const targetSmavBillId =
+        resolvedCentralBillId ||
+        localOrder?.bill_number ||
+        bodyBillNumber ||
+        req.params.id;
+
+      const smavRes = await voidSmavCentralBill({
+        billId: targetSmavBillId,
+        billNumber: localOrder?.bill_number || bodyBillNumber || undefined,
+        externalOrderId: localOrder?.id || bodyOrderId || undefined,
+        reason,
+        actorId: admin.id,
+        actorName: admin.name,
+        actorRole: admin.role,
+        centralAuthId: admin.central_auth_id,
+      });
+
+      if (!smavRes.ok) {
+        return res.status(smavRes.status >= 400 && smavRes.status < 600 ? smavRes.status : 503).json({
+          success: false,
+          smav_sync_failed: true,
+          error: smavRes.error || 'Failed to void bill in SMAV Central Ledger. Bill was not deleted.',
+        });
+      }
+      smavVoided = true;
+      resolvedCentralBillId = smavRes.billId || resolvedCentralBillId;
+    }
+
+    if (localOrder) {
+      const result = await salonRepository.softDeleteOrderTransaction(
+        localOrder.id,
+        { userId: admin.id, name: admin.name },
+        reason
+      );
+      if (!result) {
+        return res.status(404).json({ error: 'Bill / order not found.' });
+      }
+      await salonRepository.updateOrder(localOrder.id, {
+        smav_bill_status: 'voided',
+        ...(resolvedCentralBillId ? { smav_central_bill_id: resolvedCentralBillId } : {}),
+      });
+      return res.json({ success: true, smav_synced: smavVoided, ...result });
+    }
+
+    // Central-only SMAV Web/Android bill with no local mirror row
+    await salonRepository.logAudit(
+      'SOFT_DELETE_CENTRAL_BILL',
+      'PaymentLedgerBill',
+      resolvedCentralBillId || req.params.id,
+      admin.name,
+      `Voided SMAV Central bill ${bodyBillNumber || req.params.id}. Reason: ${reason}`
+    );
+    return res.json({
+      success: true,
+      smav_synced: true,
+      bill_id: resolvedCentralBillId || req.params.id,
+      bill_number: bodyBillNumber || req.params.id,
+      affected_payments: 1,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to delete bill transaction.' });
+  }
+}
+
+async function handleAuthorizedCentralBillRestore(
+  req: express.Request,
+  res: express.Response,
+  source: 'order' | 'payment'
+) {
   try {
     const admin = await getAuthAdmin(req);
     if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
@@ -7528,17 +8362,98 @@ app.post('/api/orders/:id/restore', async (req, res) => {
       });
     }
 
-    const result = await salonRepository.restoreOrderTransaction(req.params.id, {
-      userId: admin.id,
-      name: admin.name
+    const bodyOrderId = typeof req.body?.order_id === 'string' ? req.body.order_id.trim() : '';
+    const bodyCentralBillId = typeof req.body?.smav_central_bill_id === 'string' ? req.body.smav_central_bill_id.trim() : '';
+    const bodyBillNumber = typeof req.body?.bill_number === 'string' ? req.body.bill_number.trim() : '';
+
+    const localOrder = await resolveTargetOrderForLifecycle({
+      paramId: req.params.id,
+      bodyOrderId,
+      bodyCentralBillId,
+      bodyBillNumber,
+      source,
     });
-    if (!result) {
-      return res.status(404).json({ error: 'Bill / order not found.' });
+
+    const isCentralBill = localOrder ? !localOrder.is_legacy_bill : Boolean(bodyCentralBillId || bodyBillNumber || req.params.id);
+    if (!localOrder && !isCentralBill) {
+      return res.status(404).json({ error: 'Deleted bill / order not found.' });
     }
-    res.json({ success: true, ...result });
+
+    let smavRestored = false;
+    let resolvedCentralBillId = localOrder?.smav_central_bill_id || bodyCentralBillId || localOrder?.smav_sale_id || undefined;
+
+    // For central bills, confirm SMAV Central restore persistence FIRST before updating local state or reporting success
+    if (isCentralBill) {
+      const targetSmavBillId =
+        resolvedCentralBillId ||
+        localOrder?.bill_number ||
+        bodyBillNumber ||
+        req.params.id;
+
+      const smavRes = await restoreSmavCentralBill({
+        billId: targetSmavBillId,
+        billNumber: localOrder?.bill_number || bodyBillNumber || undefined,
+        externalOrderId: localOrder?.id || bodyOrderId || undefined,
+        actorId: admin.id,
+        actorName: admin.name,
+        actorRole: admin.role,
+        centralAuthId: admin.central_auth_id,
+      });
+
+      if (!smavRes.ok) {
+        return res.status(smavRes.status >= 400 && smavRes.status < 600 ? smavRes.status : 503).json({
+          success: false,
+          smav_sync_failed: true,
+          error: smavRes.error || 'Failed to restore bill in SMAV Central Ledger. Bill remains deleted.',
+        });
+      }
+      smavRestored = true;
+      resolvedCentralBillId = smavRes.billId || resolvedCentralBillId;
+    }
+
+    if (localOrder) {
+      const result = await salonRepository.restoreOrderTransaction(localOrder.id, {
+        userId: admin.id,
+        name: admin.name
+      });
+      if (!result) {
+        return res.status(404).json({ error: 'Bill / order not found.' });
+      }
+      await salonRepository.updateOrder(localOrder.id, {
+        smav_bill_status: 'finalized',
+        ...(localOrder.payment_status === 'Cancelled' ? { payment_status: 'Paid' } : {}),
+        ...(resolvedCentralBillId ? { smav_central_bill_id: resolvedCentralBillId } : {}),
+      });
+      return res.json({ success: true, smav_synced: smavRestored, ...result });
+    }
+
+    await salonRepository.logAudit(
+      'RESTORE_CENTRAL_BILL',
+      'PaymentLedgerBill',
+      resolvedCentralBillId || req.params.id,
+      admin.name,
+      `Restored SMAV Central bill ${bodyBillNumber || req.params.id}`
+    );
+    return res.json({
+      success: true,
+      smav_synced: true,
+      bill_id: resolvedCentralBillId || req.params.id,
+      bill_number: bodyBillNumber || req.params.id,
+      restored_payments: 1,
+    });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to restore bill transaction.' });
+    return res.status(500).json({ error: err.message || 'Failed to restore bill transaction.' });
   }
+}
+
+// Soft-delete complete Bill/Order transaction + SMAV Central void (SUPERADMIN, ADMIN, OWNER only)
+app.delete('/api/orders/:id', async (req, res) => {
+  await handleAuthorizedCentralBillVoid(req, res, 'order');
+});
+
+// Restore soft-deleted Bill/Order transaction + SMAV Central restore (SUPERADMIN, ADMIN, OWNER only)
+app.post('/api/orders/:id/restore', async (req, res) => {
+  await handleAuthorizedCentralBillRestore(req, res, 'order');
 });
 
 // Real-time WhatsApp status endpoint for polling from POS and Admin
@@ -7930,72 +8845,251 @@ app.post('/api/payments/:id/refund', async (req, res) => {
   }
 });
 
-// Soft-delete Payment Ledger row -> ALWAYS deletes the complete bill/order + order_items + all linked payments together
-app.delete('/api/payments/:id', async (req, res) => {
+// ----------------------------------------------------------------------------
+// Authoritative SMAV Central Payments Ledger Proxy (Server-Side RBAC Enforced)
+// ----------------------------------------------------------------------------
+app.get('/api/admin/payments/ledger', async (req, res) => {
   try {
     const admin = await getAuthAdmin(req);
-    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
-      return res.status(403).json({
-        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to delete Payment Ledger records.'
-      });
+    if (!admin) {
+      return res.status(401).json({ error: 'Authentication required to access the Payment Ledger.' });
     }
 
-    const allPayments = await salonRepository.getPayments({ deleted: 'all' });
-    const targetPayment = allPayments.find(p => p.id === req.params.id);
-    if (!targetPayment) {
-      return res.status(404).json({ error: 'Payment record not found.' });
-    }
-    if (!targetPayment.order_id) {
-      return res.status(409).json({
-        error: 'Refusing partial payment deletion: payment is missing a linked order_id.'
-      });
+    const fullAccess = hasFullPaymentLedgerAccess(admin.role);
+    const todayStr = getKolkataDateString();
+    const rawScope = String(req.query.scope || 'today').trim().toLowerCase();
+    const rawFromDate = typeof req.query.fromDate === 'string' ? req.query.fromDate.trim() : '';
+    const rawToDate = typeof req.query.toDate === 'string' ? req.query.toDate.trim() : '';
+    const rawBranchId = typeof req.query.branchId === 'string' && req.query.branchId !== 'all'
+      ? req.query.branchId.trim()
+      : undefined;
+    const rawSearch = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+
+    // Server-side RBAC enforcement for POS_BILLING / restricted staff
+    if (!fullAccess) {
+      if (rawScope === 'history' || rawScope === 'deleted') {
+        return res.status(403).json({
+          error: 'Access denied: POS / Staff roles may only view today\'s active bills (Asia/Kolkata).',
+        });
+      }
+      if ((rawFromDate && rawFromDate !== todayStr) || (rawToDate && rawToDate !== todayStr)) {
+        return res.status(403).json({
+          error: 'Access denied: Historical date queries are restricted to OWNER, ADMIN, and SUPERADMIN.',
+        });
+      }
     }
 
-    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
-      ? req.body.reason.trim()
-      : 'Removed complete bill transaction from ledger';
+    const scope: 'today' | 'history' | 'deleted' =
+      fullAccess && (rawScope === 'history' || rawScope === 'deleted') ? rawScope : 'today';
 
-    const result = await salonRepository.softDeleteOrderTransaction(
-      targetPayment.order_id,
-      { userId: admin.id, name: admin.name },
-      reason
+    const effectiveFromDate = scope === 'today' ? todayStr : (rawFromDate || undefined);
+    const effectiveToDate = scope === 'today' ? todayStr : (rawToDate || undefined);
+    const effectiveBranchId = fullAccess ? rawBranchId : await resolveStaffAssignedBranchId(admin);
+
+    const startIso = effectiveFromDate ? `${effectiveFromDate}T00:00:00.000+05:30` : undefined;
+    const endIso = effectiveToDate ? `${effectiveToDate}T23:59:59.999+05:30` : undefined;
+    const localDeletedMode: 'active' | 'deleted' = scope === 'deleted' ? 'deleted' : 'active';
+
+    const [localBranches, localOrders, localPayments] = await Promise.all([
+      salonRepository.getBranches().catch(() => []),
+      salonRepository.getOrders({
+        deleted: localDeletedMode,
+        branchId: effectiveBranchId,
+        startIso,
+        endIso,
+      }).catch(() => []),
+      salonRepository.getPayments({
+        deleted: localDeletedMode,
+        branchId: effectiveBranchId,
+        startIso,
+        endIso,
+      }).catch(() => []),
+    ]);
+
+    const orderByCentralId = new Map<string, Order>();
+    const orderByBillNum = new Map<string, Order>();
+    const orderById = new Map<string, Order>();
+    for (const o of localOrders) {
+      orderById.set(o.id, o);
+      if (o.bill_number) orderByBillNum.set(o.bill_number, o);
+      if (o.smav_central_bill_id) orderByCentralId.set(o.smav_central_bill_id, o);
+    }
+
+    const smavResult = await fetchSmavCentralLedger(
+      {
+        scope,
+        timezone: 'Asia/Kolkata',
+        fromDate: effectiveFromDate,
+        toDate: effectiveToDate,
+        branchId: effectiveBranchId,
+        search: rawSearch || undefined,
+        admin,
+      },
+      localBranches
     );
-    if (!result) {
-      return res.status(404).json({ error: 'Linked bill/order transaction not found.' });
+
+    const matchesLocalFilters = (p: PaymentRecord): boolean => {
+      if (effectiveBranchId && p.branch_id && p.branch_id !== effectiveBranchId) return false;
+      const effectiveTs = p.billed_at || p.created_at;
+      const dateStr = getKolkataDateString(effectiveTs);
+      if (scope === 'today' && dateStr !== todayStr) return false;
+      if (effectiveFromDate && dateStr < effectiveFromDate) return false;
+      if (effectiveToDate && dateStr > effectiveToDate) return false;
+      if (rawSearch) {
+        const q = rawSearch.toLowerCase();
+        const hay = `${p.bill_number || ''} ${p.customer_name || ''} ${p.customer_phone || ''} ${p.branch_name || ''} ${p.branch_code || ''} ${(p.items || []).map(i => `${i.item_name} ${i.staff_name || ''}`).join(' ')}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    };
+
+    const enrichWithLocalOrder = (p: PaymentRecord): PaymentRecord => {
+      const localOrd =
+        (p.smav_central_bill_id ? orderByCentralId.get(p.smav_central_bill_id) : undefined) ||
+        (p.bill_number ? orderByBillNum.get(p.bill_number) : undefined) ||
+        (p.order_id ? orderById.get(p.order_id) : undefined);
+
+      if (!localOrd) return p;
+
+      return {
+        ...p,
+        order_id: localOrd.id,
+        branch_id: p.branch_id || localOrd.branch_id,
+        branch_code: p.branch_code || localOrd.branch_code,
+        branch_name: p.branch_name || localOrd.branch_name,
+        subtotal: p.subtotal ?? localOrd.subtotal,
+        discount: p.discount ?? localOrd.discount,
+        tax_amount: p.tax_amount ?? localOrd.tax_amount,
+        items: p.items && p.items.length > 0 ? p.items : localOrd.items,
+        receipt_whatsapp_status: localOrd.receipt_whatsapp_status || p.receipt_whatsapp_status,
+        receipt_whatsapp_error: localOrd.receipt_whatsapp_error || p.receipt_whatsapp_error,
+        feedback_whatsapp_status: localOrd.feedback_whatsapp_status || p.feedback_whatsapp_status,
+        smav_bill_status: localOrd.smav_bill_status || p.smav_bill_status,
+        smav_finalize_error: localOrd.smav_finalize_error ?? p.smav_finalize_error,
+        is_legacy_bill: localOrd.is_legacy_bill ?? p.is_legacy_bill,
+        billing_date: p.billing_date || localOrd.billing_date,
+        billed_at: p.billed_at || localOrd.billed_at,
+        backdated_by: p.backdated_by || localOrd.backdated_by,
+        backdated_at: p.backdated_at || localOrd.backdated_at,
+      };
+    };
+
+    let mergedPayments: PaymentRecord[] = [];
+    let source: 'smav' | 'local_fallback' = 'smav';
+    let warning: string | null = null;
+
+    if (smavResult.ok) {
+      const seenBillNums = new Set<string>();
+      const seenCentralIds = new Set<string>();
+      const seenOrderIds = new Set<string>();
+
+      for (const row of smavResult.payments) {
+        const enriched = enrichWithLocalOrder(row);
+        if (scope === 'deleted') {
+          if (!enriched.deleted_at && enriched.status !== 'Void') continue;
+        } else {
+          if (enriched.deleted_at || enriched.status === 'Void') continue;
+        }
+        if (!matchesLocalFilters(enriched)) continue;
+        mergedPayments.push(enriched);
+        if (enriched.bill_number) seenBillNums.add(enriched.bill_number);
+        if (enriched.smav_central_bill_id) seenCentralIds.add(enriched.smav_central_bill_id);
+        if (enriched.order_id) seenOrderIds.add(enriched.order_id);
+      }
+
+      // Include local bills that are pending SMAV sync (finalize_pending) or pre-SMAV legacy historical bills
+      for (const localPay of localPayments) {
+        const enrichedLocal = enrichWithLocalOrder(localPay);
+        const alreadyPresent =
+          (enrichedLocal.bill_number && seenBillNums.has(enrichedLocal.bill_number)) ||
+          (enrichedLocal.smav_central_bill_id && seenCentralIds.has(enrichedLocal.smav_central_bill_id)) ||
+          (enrichedLocal.order_id && seenOrderIds.has(enrichedLocal.order_id));
+        if (alreadyPresent) continue;
+
+        const isPendingSync =
+          enrichedLocal.smav_bill_status === 'finalize_pending' ||
+          enrichedLocal.smav_bill_status === 'reserved';
+        const isLegacyHistorical = Boolean(enrichedLocal.is_legacy_bill);
+
+        if ((isPendingSync || isLegacyHistorical) && matchesLocalFilters(enrichedLocal)) {
+          mergedPayments.push({
+            ...enrichedLocal,
+            source_channel: enrichedLocal.source_channel || (isLegacyHistorical ? 'GLOSSYLOOKS_LEGACY' : 'GLOSSYLOOKS_ADMIN'),
+          });
+        }
+      }
+    } else {
+      source = 'local_fallback';
+      warning = smavResult.error || 'SMAV Central Ledger is temporarily unavailable; displaying local cached bills.';
+      mergedPayments = localPayments
+        .map(p => ({
+          ...enrichWithLocalOrder(p),
+          source_channel: p.source_channel || 'GLOSSYLOOKS_LOCAL_CACHE',
+        }))
+        .filter(matchesLocalFilters);
     }
-    res.json({ success: true, ...result });
+
+    // Sort strictly newest first by billed_at || created_at
+    mergedPayments.sort((a, b) => {
+      const timeA = Date.parse(a.billed_at || a.created_at || '') || 0;
+      const timeB = Date.parse(b.billed_at || b.created_at || '') || 0;
+      return timeB - timeA;
+    });
+
+    const pendingSyncCount = localOrders.filter(
+      o => !o.deleted_at && !o.is_legacy_bill && (o.smav_bill_status === 'finalize_pending' || o.smav_bill_status === 'reserved')
+    ).length;
+
+    const responsePayload: CentralPaymentLedgerResponse = {
+      source,
+      scope,
+      timezone: 'Asia/Kolkata',
+      payments: mergedPayments,
+      totals: computePaymentLedgerTotals(mergedPayments),
+      pending_sync_count: pendingSyncCount,
+      warning,
+    };
+
+    return res.json(responsePayload);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete payment ledger transaction.' });
+    return res.status(500).json({ error: err.message || 'Failed to load central payment ledger.' });
   }
 });
 
-// Restore Payment Ledger row -> restores the complete bill/order + order_items + all linked payments together
-app.post('/api/payments/:id/restore', async (req, res) => {
+// Cron / Admin endpoint to drain pending SMAV central bill sync retries
+app.post('/api/cron/smav-bill-sync-retry', async (req, res) => {
   try {
-    const admin = await getAuthAdmin(req);
-    if (!admin || !canDeleteOrRestoreRecords(admin.role)) {
-      return res.status(403).json({
-        error: 'Access denied: Only SUPERADMIN, ADMIN, and OWNER roles are authorized to restore deleted Payment Ledger records.'
-      });
+    const cronSecret = (process.env.CRON_SECRET || '').trim();
+    const authHeader = String(req.headers.authorization || '').trim();
+    const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+    const cronBuf = Buffer.from(cronSecret, 'utf8');
+    const bearerBuf = Buffer.from(bearer, 'utf8');
+    const isCronAuthorized = Boolean(
+      cronBuf.length > 0 &&
+      cronBuf.length === bearerBuf.length &&
+      crypto.timingSafeEqual(cronBuf, bearerBuf)
+    );
+    const admin = isCronAuthorized ? null : await getAuthAdmin(req);
+
+    if (!isCronAuthorized && (!admin || !hasFullPaymentLedgerAccess(admin.role))) {
+      return res.status(403).json({ error: 'Unauthorized: CRON_SECRET or OWNER/ADMIN/SUPERADMIN session required.' });
     }
 
-    const allPayments = await salonRepository.getPayments({ deleted: 'all' });
-    const targetPayment = allPayments.find(p => p.id === req.params.id);
-    if (!targetPayment || !targetPayment.order_id) {
-      return res.status(404).json({ error: 'Deleted payment record or linked order not found.' });
-    }
-
-    const result = await salonRepository.restoreOrderTransaction(targetPayment.order_id, {
-      userId: admin.id,
-      name: admin.name
-    });
-    if (!result) {
-      return res.status(404).json({ error: 'Linked bill/order transaction not found.' });
-    }
-    res.json({ success: true, ...result });
+    const result = await drainPendingSmavCentralBills(20);
+    return res.json({ success: true, ...result });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to restore payment ledger transaction.' });
+    return res.status(500).json({ error: err.message || 'Failed to process pending SMAV bill sync retries.' });
   }
+});
+
+// Soft-delete Payment Ledger row -> voids in SMAV Central FIRST, then soft-deletes complete local bill transaction
+app.delete('/api/payments/:id', async (req, res) => {
+  await handleAuthorizedCentralBillVoid(req, res, 'payment');
+});
+
+// Restore Payment Ledger row -> restores in SMAV Central FIRST, then restores complete local bill transaction
+app.post('/api/payments/:id/restore', async (req, res) => {
+  await handleAuthorizedCentralBillRestore(req, res, 'payment');
 });
 
 // ----------------------------------------------------------------------------
@@ -8395,9 +9489,14 @@ app.patch('/api/print-jobs/:id/status', async (req, res) => {
 // Gallery & Reviews & Enquiries
 // ----------------------------------------------------------------------------
 app.get('/api/gallery', async (req, res) => {
-  const onlyApproved = req.query.approved === 'true';
-  const list = await salonRepository.getGallery(onlyApproved);
-  res.json(list);
+  try {
+    const onlyApproved = req.query.approved === 'true';
+    const list = await salonRepository.getGallery(onlyApproved);
+    res.json(list);
+  } catch (err: any) {
+    console.error('[GET /api/gallery] Error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to load gallery' });
+  }
 });
 
 app.post('/api/gallery', async (req, res) => {
@@ -8483,6 +9582,46 @@ app.post('/api/enquiries', async (req, res) => {
       console.warn('[Website Enquiry] Failed to record in WhatsApp Inbox:', inboxErr.message);
     }
 
+    // Send gl_new_enquiry_alert once to branch + optional admin alert numbers (only after enquiry saved)
+    try {
+      const allBranches = await salonRepository.getBranches().catch(() => []);
+      const defaultBranchId = await getDefaultBranchIdFromRepo();
+      const targetBranch = resolveEnquiryBranch(
+        allBranches,
+        { ...req.body, branch_id: req.body?.branch_id || (enq as any)?.branch_id },
+        defaultBranchId
+      );
+      const effectiveEnquiryBranchId = targetBranch?.id || defaultBranchId;
+      const { variables, defaultPositionalOrder } = buildEnquiryAlertVariables(enq, targetBranch);
+      const phone10 = String(enq.phone || '').replace(/\D/g, '').slice(-10);
+      const tenMinBucket = String(Math.floor(Date.now() / (10 * 60 * 1000)));
+      const reqIdempotencyKey = String(
+        req.headers['x-idempotency-key'] || req.body?.idempotency_key || ''
+      ).trim() || null;
+
+      await dispatchSalonAdminWhatsAppAlert({
+        entityType: 'enquiry',
+        entityId: enq.id,
+        branchId: effectiveEnquiryBranchId,
+        branch: targetBranch,
+        branchHint: req.body?.branch_name || req.body?.branch || targetBranch?.name || null,
+        templateName: ENQUIRY_ADMIN_ALERT_TEMPLATE,
+        variables,
+        defaultPositionalOrder,
+        fingerprintParts: [
+          effectiveEnquiryBranchId,
+          phone10,
+          enq.service_interest || '',
+          enq.message || '',
+          tenMinBucket,
+        ],
+        idempotencyKey: reqIdempotencyKey,
+        customerName: enq.name,
+      });
+    } catch (alertErr: any) {
+      console.warn('[Website Enquiry] Non-blocking salon/admin WhatsApp alert failure:', alertErr?.message || alertErr);
+    }
+
     res.status(201).json(enq);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -8566,10 +9705,11 @@ async function startServer() {
     console.log(`Server running on port ${PORT}`);
   });
 
-  // Automatically process due PENDING SMAV user sync outbox retries in long-running Node processes
+  // Automatically process due PENDING SMAV user sync outbox & pending central bill sync retries in long-running Node processes
   const smavOutboxTimer = setInterval(() => {
     if (!process.env.GLOSSYLOOKS_INTEGRATION_KEY) return;
     triggerNonBlockingOutboxDrain(55_000);
+    void drainPendingSmavCentralBills(10);
   }, 60_000);
   if (typeof smavOutboxTimer.unref === 'function') {
     smavOutboxTimer.unref();

@@ -3567,7 +3567,7 @@ export class SupabaseSalonRepository implements ISalonRepository {
 
   public async recordProcessedWebhookEvent(eventId: string, eventType: string): Promise<ProcessedWebhookEvent> {
     this.inMemoryProcessedWebhookEvents.add(eventId);
-    const id = `pwe-${Date.now()}`;
+    const id = `pwe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const evt: ProcessedWebhookEvent = {
       id,
       event_id: eventId,

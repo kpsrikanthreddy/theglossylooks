@@ -121,18 +121,30 @@ export default function App() {
     async function loadInitial() {
       try {
         setLoading(true);
-        const [settingsData, catsData, srvsData, pkgsData, galleryData] = await Promise.all([
+        const [settingsRes, catsRes, srvsRes, pkgsRes, galleryRes] = await Promise.allSettled([
           api.getSettings(),
           api.getCategories(),
           api.getServices(),
           api.getPackages(),
           api.getGallery()
         ]);
-        if (settingsData) setSettings(settingsData);
-        if (catsData) setCategories(catsData);
-        if (srvsData) setServices(srvsData);
-        if (pkgsData) setPackages(pkgsData);
-        if (galleryData) setGallery(galleryData);
+        if (settingsRes.status === 'fulfilled' && settingsRes.value) setSettings(settingsRes.value);
+        if (catsRes.status === 'fulfilled' && catsRes.value) setCategories(catsRes.value);
+        if (srvsRes.status === 'fulfilled' && srvsRes.value) setServices(srvsRes.value);
+        if (pkgsRes.status === 'fulfilled' && pkgsRes.value) setPackages(pkgsRes.value);
+        if (galleryRes.status === 'fulfilled' && galleryRes.value) setGallery(galleryRes.value);
+
+        const failed = [
+          settingsRes.status === 'rejected' ? `settings (${settingsRes.reason?.message || settingsRes.reason})` : null,
+          catsRes.status === 'rejected' ? `categories (${catsRes.reason?.message || catsRes.reason})` : null,
+          srvsRes.status === 'rejected' ? `services (${srvsRes.reason?.message || srvsRes.reason})` : null,
+          pkgsRes.status === 'rejected' ? `packages (${pkgsRes.reason?.message || pkgsRes.reason})` : null,
+          galleryRes.status === 'rejected' ? `gallery (${galleryRes.reason?.message || galleryRes.reason})` : null,
+        ].filter(Boolean);
+
+        if (failed.length > 0) {
+          console.warn('Partial storefront load failure:', failed.join(', '));
+        }
       } catch (err) {
         console.error('Failed to load store data:', err);
       } finally {

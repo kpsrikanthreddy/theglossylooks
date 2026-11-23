@@ -479,14 +479,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     }).format(d);
   };
 
-  // Payment Ledger & Order Management State
-  const [ledgerDateFilter, setLedgerDateFilter] = useState<'all' | 'today' | 'yesterday' | 'this_week' | 'this_month' | 'custom'>('all');
+  // Payment Ledger & Order Management State (Defaults to Today's active bills from SMAV Central Ledger)
+  const [ledgerDateFilter, setLedgerDateFilter] = useState<'all' | 'today' | 'yesterday' | 'this_week' | 'this_month' | 'custom'>('today');
   const [ledgerStartDate, setLedgerStartDate] = useState(() => getKolkataDateString());
   const [ledgerEndDate, setLedgerEndDate] = useState(() => getKolkataDateString());
   const [ledgerBranchFilter, setLedgerBranchFilter] = useState('all');
   const [ledgerModeFilter, setLedgerModeFilter] = useState('all');
   const [ledgerSearch, setLedgerSearch] = useState('');
   const [ledgerDeletedFilter, setLedgerDeletedFilter] = useState<'active' | 'deleted'>('active');
+  const [centralLedgerPayments, setCentralLedgerPayments] = useState<PaymentRecord[]>([]);
+  const [centralLedgerSource, setCentralLedgerSource] = useState<'smav' | 'local_fallback' | null>(null);
+  const [centralLedgerWarning, setCentralLedgerWarning] = useState<string | null>(null);
+  const [centralLedgerPendingSync, setCentralLedgerPendingSync] = useState(0);
+  const [loadingCentralLedger, setLoadingCentralLedger] = useState(false);
+  const [centralLedgerLoaded, setCentralLedgerLoaded] = useState(false);
   const [deletedPayments, setDeletedPayments] = useState<PaymentRecord[]>([]);
   const [deletedOrders, setDeletedOrders] = useState<Order[]>([]);
   const [loadingDeletedLedger, setLoadingDeletedLedger] = useState(false);
@@ -908,22 +914,143 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
     }
   };
 
-  const loadDeletedLedger = async () => {
-    if (!canDeleteOrRestore) return;
-    setLoadingDeletedLedger(true);
+  const resolveLedgerQueryParams = (targetMode: 'active' | 'deleted' = ledgerDeletedFilter) => {
+    const todayKolkata = getKolkataDateString(new Date());
+    if (!fullPaymentLedgerAccess) {
+      return {
+        scope: 'today' as const,
+        timezone: 'Asia/Kolkata',
+        fromDate: todayKolkata,
+        toDate: todayKolkata,
+        branchId: currentUser?.branch_id || undefined,
+        search: ledgerSearch.trim() || undefined,
+      };
+    }
+
+    if (targetMode === 'deleted') {
+      return {
+        scope: 'deleted' as const,
+        timezone: 'Asia/Kolkata',
+        branchId: ledgerBranchFilter !== 'all' ? ledgerBranchFilter : undefined,
+        search: ledgerSearch.trim() || undefined,
+      };
+    }
+
+    if (ledgerDateFilter === 'today') {
+      return {
+        scope: 'today' as const,
+        timezone: 'Asia/Kolkata',
+        fromDate: todayKolkata,
+        toDate: todayKolkata,
+        branchId: ledgerBranchFilter !== 'all' ? ledgerBranchFilter : undefined,
+        search: ledgerSearch.trim() || undefined,
+      };
+    }
+
+    let fromDate: string | undefined;
+    let toDate: string | undefined;
+    if (ledgerDateFilter === 'yesterday') {
+      const yDate = new Date();
+      yDate.setDate(yDate.getDate() - 1);
+      const yStr = getKolkataDateString(yDate);
+      fromDate = yStr;
+      toDate = yStr;
+    } else if (ledgerDateFilter === 'this_week') {
+      const [y, m, d] = todayKolkata.split('-').map(Number);
+      const tDate = new Date(y, m - 1, d);
+      const diff = (tDate.getDay() + 6) % 7;
+      const monday = new Date(tDate);
+      monday.setDate(tDate.getDate() - diff);
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      fromDate = getKolkataDateString(monday);
+      toDate = getKolkataDateString(sunday);
+    } else if (ledgerDateFilter === 'this_month') {
+      fromDate = `${todayKolkata.slice(0, 7)}-01`;
+      toDate = todayKolkata;
+    } else if (ledgerDateFilter === 'custom') {
+      fromDate = ledgerStartDate || undefined;
+      toDate = ledgerEndDate || undefined;
+    }
+
+    return {
+      scope: 'history' as const,
+      timezone: 'Asia/Kolkata',
+      fromDate,
+      toDate,
+      branchId: ledgerBranchFilter !== 'all' ? ledgerBranchFilter : undefined,
+      search: ledgerSearch.trim() || undefined,
+    };
+  };
+
+  const loadCentralPaymentLedger = async (targetMode: 'active' | 'deleted' = ledgerDeletedFilter, notify = false) => {
+    if (!currentUser) return;
+    const isDeletedView = targetMode === 'deleted' && canDeleteOrRestore;
+    if (isDeletedView) {
+      setLoadingDeletedLedger(true);
+    } else {
+      setLoadingCentralLedger(true);
+    }
     try {
-      const [delPays, delOrds] = await Promise.all([
-        api.getPayments({ deleted: 'deleted' }),
-        api.getOrders({ deleted: 'deleted' })
+      const params = resolveLedgerQueryParams(isDeletedView ? 'deleted' : 'active');
+      const [ledgerRes, localDeletedOrds] = await Promise.all([
+        api.getCentralPaymentLedger(params),
+        isDeletedView ? api.getOrders({ deleted: 'deleted' }).catch(() => []) : Promise.resolve(null),
       ]);
-      setDeletedPayments(delPays);
-      setDeletedOrders(delOrds);
+
+      setCentralLedgerSource(ledgerRes.source);
+      setCentralLedgerWarning(ledgerRes.warning || null);
+      setCentralLedgerPendingSync(ledgerRes.pending_sync_count || 0);
+
+      if (isDeletedView) {
+        setDeletedPayments(ledgerRes.payments || []);
+        if (localDeletedOrds) setDeletedOrders(localDeletedOrds);
+      } else {
+        setCentralLedgerPayments(ledgerRes.payments || []);
+        setCentralLedgerLoaded(true);
+      }
+      if (notify) {
+        toast.success(
+          ledgerRes.source === 'smav'
+            ? 'Payment ledger synchronized with SMAV Central'
+            : 'Payment ledger refreshed from local cache'
+        );
+      }
     } catch (err) {
-      toast.error(getSafeErrorMessage(err, 'Failed to load deleted payment ledger bills.'));
+      console.error('Failed to load central payment ledger:', err);
+      toast.error(getSafeErrorMessage(err, 'Failed to load payment ledger.'));
     } finally {
-      setLoadingDeletedLedger(false);
+      if (isDeletedView) {
+        setLoadingDeletedLedger(false);
+      } else {
+        setLoadingCentralLedger(false);
+      }
     }
   };
+
+  const loadDeletedLedger = async () => {
+    if (!canDeleteOrRestore) return;
+    await loadCentralPaymentLedger('deleted');
+  };
+
+  // Automatically fetch authoritative SMAV Central Ledger when Payments tab or filters change
+  useEffect(() => {
+    if (!currentUser || activeTab !== 'payments') return;
+    const timer = setTimeout(() => {
+      void loadCentralPaymentLedger(ledgerDeletedFilter);
+    }, ledgerSearch.trim() ? 250 : 0);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    currentUser?.id,
+    activeTab,
+    ledgerDeletedFilter,
+    ledgerDateFilter,
+    ledgerStartDate,
+    ledgerEndDate,
+    ledgerBranchFilter,
+    ledgerSearch,
+  ]);
 
   const handleExportPaymentLedgerCsv = async () => {
     if (!fullPaymentLedgerAccess) return;
@@ -1069,6 +1196,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         // Generate new idempotency key for next bill attempt
         setPosIdempotencyKey(`pos-idem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
         loadAllData();
+        void loadCentralPaymentLedger('active');
         return newOrder;
       },
       {
@@ -1091,6 +1219,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
         setPosSuccessOrder(prev => (prev && prev.id === orderId ? { ...prev, ...res.order } : prev));
         toast.success(`Bill ${res.order.bill_number} finalized in SMAV`);
         loadAllData();
+        void loadCentralPaymentLedger('active');
       } else {
         toast.error(res.error || 'Could not finalize bill in SMAV yet.');
       }
@@ -3924,7 +4053,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
           {/* ================================================================= */}
           {activeTab === 'payments' && (() => {
             const viewingDeletedLedger = canDeleteOrRestore && ledgerDeletedFilter === 'deleted';
-            const sourcePayments = viewingDeletedLedger ? deletedPayments : payments;
+            const activeLedgerList = centralLedgerLoaded ? centralLedgerPayments : payments;
+            const sourcePayments = viewingDeletedLedger ? deletedPayments : activeLedgerList;
             const sourceOrders = viewingDeletedLedger ? deletedOrders : orders;
             const todayKolkata = getKolkataDateString(new Date());
             const staffAssignedBranchId = currentUser?.branch_id || '';
@@ -3975,14 +4105,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
             const filteredPayments = sourcePayments
               .slice()
-              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+              .sort((a, b) => new Date(b.billed_at || b.created_at).getTime() - new Date(a.billed_at || a.created_at).getTime())
               .filter(p => {
+                const effectiveTs = p.billed_at || p.created_at;
+
                 // Defensive UI guard: Staff roles strictly see ONLY today's Asia/Kolkata active records for their assigned branch
                 if (!fullPaymentLedgerAccess) {
                   if (p.deleted_at) return false;
-                  if (getKolkataDateString(p.created_at) !== todayKolkata) return false;
+                  if (getKolkataDateString(effectiveTs) !== todayKolkata) return false;
                   const pBranch = p.branch_id || '';
-                  if (staffAssignedBranchId && pBranch !== staffAssignedBranchId) return false;
+                  if (staffAssignedBranchId && pBranch && pBranch !== staffAssignedBranchId) return false;
                 }
 
                 // 1. Search by Bill Number, Customer Name, Mobile, Branch, Service, or Stylist
@@ -4015,9 +4147,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   if (p.payment_mode !== ledgerModeFilter) return false;
                 }
 
-                // 4. Date Filtering in Asia/Kolkata Timezone (OWNER / ADMIN / SUPERADMIN only)
-                if (fullPaymentLedgerAccess && ledgerDateFilter !== 'all') {
-                  const recordDateKolkata = getKolkataDateString(p.created_at);
+                // 4. Date Filtering in Asia/Kolkata Timezone (OWNER / ADMIN / SUPERADMIN only; Deleted archive shows all deleted unless custom filtered)
+                if (fullPaymentLedgerAccess && !viewingDeletedLedger && ledgerDateFilter !== 'all') {
+                  const recordDateKolkata = getKolkataDateString(effectiveTs);
 
                   if (ledgerDateFilter === 'today') {
                     if (recordDateKolkata !== todayKolkata) return false;
@@ -4119,13 +4251,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                               : 'text-slate-600 hover:text-slate-900'
                           }`}
                         >
-                          Active ({payments.length})
+                          Active ({activeLedgerList.length})
                         </button>
                         <button
                           type="button"
                           onClick={() => {
                             setLedgerDeletedFilter('deleted');
-                            loadDeletedLedger();
+                            void loadDeletedLedger();
                           }}
                           className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors cursor-pointer flex items-center gap-1 ${
                             ledgerDeletedFilter === 'deleted'
@@ -4154,11 +4286,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
                     <button
                       type="button"
-                      onClick={() => viewingDeletedLedger ? loadDeletedLedger() : loadAllData()}
+                      onClick={() => {
+                        void loadCentralPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active', true);
+                        loadAllData();
+                      }}
                       className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                      title="Refresh payment records"
+                      title="Refresh payment records from SMAV Central Ledger"
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${(loading || loadingDeletedLedger) ? 'animate-spin text-[#5B132B]' : ''}`} />
+                      <RefreshCw className={`w-3.5 h-3.5 ${(loading || loadingCentralLedger || loadingDeletedLedger) ? 'animate-spin text-[#5B132B]' : ''}`} />
                       <span>Refresh Ledger</span>
                     </button>
                   </div>
@@ -4172,6 +4307,36 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                       <span className="font-bold">Staff Today-Only Scope ({todayKolkata} · {staffBranchName}): </span>
                       Historical dates, other branches, exports, edits, refunds, and deletions are restricted to Owner, Admin, and Superadmin accounts.
                     </div>
+                  </div>
+                )}
+
+                {/* Fallback / Pending SMAV Sync Notice (only shown when SMAV is unreachable or bills await retry) */}
+                {(centralLedgerSource === 'local_fallback' || centralLedgerPendingSync > 0) && (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                      <div>
+                        {centralLedgerSource === 'local_fallback' && (
+                          <div>
+                            <span className="font-bold">Showing local cached bills: </span>
+                            {centralLedgerWarning || 'SMAV Central Ledger is temporarily unavailable.'}
+                          </div>
+                        )}
+                        {centralLedgerPendingSync > 0 && (
+                          <div>
+                            <span className="font-bold">{centralLedgerPendingSync} bill{centralLedgerPendingSync > 1 ? 's' : ''} awaiting SMAV sync: </span>
+                            Local bills are preserved safely and retry automatically.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void loadCentralPaymentLedger(viewingDeletedLedger ? 'deleted' : 'active', true)}
+                      className="px-2.5 py-1 text-[11px] font-bold text-amber-900 bg-white border border-amber-300 rounded-lg hover:bg-amber-100 shrink-0 cursor-pointer"
+                    >
+                      Retry Now
+                    </button>
                   </div>
                 )}
 
@@ -4342,10 +4507,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
 
                 {/* Payments Table */}
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
-                  {viewingDeletedLedger && loadingDeletedLedger ? (
+                  {(viewingDeletedLedger && loadingDeletedLedger) || (!viewingDeletedLedger && loadingCentralLedger && !centralLedgerLoaded) ? (
                     <div className="p-12 flex items-center justify-center gap-2 text-xs text-slate-500">
                       <Loader2 className="w-4 h-4 animate-spin text-[#5B132B]" />
-                      <span>Loading deleted bills archive…</span>
+                      <span>{viewingDeletedLedger ? 'Loading deleted bills archive…' : 'Synchronizing central payment ledger…'}</span>
                     </div>
                   ) : filteredPayments.length === 0 ? (
                     <div className="p-12 text-center space-y-3">
@@ -4364,9 +4529,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           ? 'Deleted bills and their linked payments will appear here for authorized restore and audit review.'
                           : !fullPaymentLedgerAccess
                             ? `Only today's (${todayKolkata}) active bills for ${staffBranchName} are visible to staff.`
-                            : (ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all')
-                              ? 'No payments match the active filter criteria. Try resetting the filters.'
-                              : 'Every POS bill and completed appointment payment will automatically appear here with complete audit trail and WhatsApp delivery logs.'}
+                            : (ledgerSearch || ledgerDateFilter !== 'today' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all')
+                              ? 'No payments match the active filter criteria. Try switching to All Time or resetting filters.'
+                              : 'Every POS bill from Glossy Looks Admin, SMAV Web, and SMAV Android will appear here with complete audit trail and WhatsApp delivery logs.'}
                       </p>
                       {fullPaymentLedgerAccess && (ledgerSearch || ledgerDateFilter !== 'all' || ledgerBranchFilter !== 'all' || ledgerModeFilter !== 'all') && (
                         <button
@@ -4379,7 +4544,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                           }}
                           className="px-3.5 py-1.5 text-xs font-semibold text-[#5B132B] hover:underline cursor-pointer"
                         >
-                          Reset all filters
+                          Show all time &amp; reset filters
                         </button>
                       )}
                     </div>
@@ -4419,14 +4584,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                             const discountVal = p.discount ?? matchingOrder?.discount ?? 0;
                             const taxVal = p.tax_amount ?? matchingOrder?.tax_amount ?? 0;
                             const targetOrderId = matchingOrder?.id || p.order_id;
+                            const isPendingCentralSync =
+                              (p.smav_bill_status || matchingOrder?.smav_bill_status) === 'finalize_pending';
 
                             return (
                               <tr key={p.id} className={`hover:bg-slate-50 transition-colors ${viewingDeletedLedger ? 'bg-rose-50/20' : ''}`}>
                                 <td className="p-3.5 font-mono font-bold text-[#5B132B]">
-                                  {p.bill_number}
+                                  <div>{p.bill_number}</div>
+                                  {isPendingCentralSync && targetOrderId && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleRetrySmavFinalize(targetOrderId)}
+                                      className="mt-0.5 text-[10px] font-sans font-semibold text-amber-700 hover:text-amber-900 underline cursor-pointer"
+                                      title="Sync this bill to SMAV Central Ledger now"
+                                    >
+                                      Sync pending · Retry
+                                    </button>
+                                  )}
                                 </td>
                                 <td className="p-3.5 text-slate-600 text-[11px] whitespace-nowrap">
-                                  {formatKolkataDateTime(p.created_at)}
+                                  {formatKolkataDateTime(p.billed_at || p.created_at)}
                                 </td>
                                 <td className="p-3.5">
                                   <div className="font-semibold text-slate-900">{p.customer_name}</div>
@@ -4545,8 +4722,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                           rowAction.runForKey(
                                             `pay-restore-${p.id}`,
                                             async () => {
-                                              await api.restorePaymentBill(p.id, currentUser.name);
-                                              await Promise.all([loadAllData(), loadDeletedLedger()]);
+                                              await api.restorePaymentBill(p.id, currentUser.name, {
+                                                bill_number: p.bill_number,
+                                                smav_central_bill_id: p.smav_central_bill_id,
+                                                order_id: targetOrderId,
+                                              });
+                                              await Promise.all([
+                                                loadAllData(),
+                                                loadCentralPaymentLedger('deleted'),
+                                                loadCentralPaymentLedger('active'),
+                                              ]);
                                             },
                                             {
                                               successMessage: `Bill ${p.bill_number} and linked payments restored`,
@@ -4615,41 +4800,45 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                                               inputLabel: 'Reason for Refund *',
                                               inputPlaceholder: 'e.g. Service cancelled / duplicate charge',
                                               inputRequired: true,
-                                              onConfirm: async (reason) => {
-                                                await api.refundPayment(p.id, (reason || '').trim(), currentUser.name);
-                                                await loadAllData();
-                                                toast.success(`Payment ${p.bill_number} refunded successfully`);
-                                              }
-                                            });
-                                          }}
-                                          className="py-1 px-2.5 text-[11px] font-bold text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
-                                        >
-                                          Refund
-                                        </button>
-                                      )}
+                                                onConfirm: async (reason) => {
+                                                  await api.refundPayment(p.id, (reason || '').trim(), currentUser.name);
+                                                  await Promise.all([loadAllData(), loadCentralPaymentLedger('active')]);
+                                                  toast.success(`Payment ${p.bill_number} refunded successfully`);
+                                                }
+                                              });
+                                            }}
+                                            className="py-1 px-2.5 text-[11px] font-bold text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                                          >
+                                            Refund
+                                          </button>
+                                        )}
 
-                                      {canDeleteOrRestore && (
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            setConfirmActionInput('');
-                                            setConfirmActionError('');
-                                            setConfirmActionModal({
-                                              isOpen: true,
-                                              title: `Delete Bill (${p.bill_number})`,
-                                              description: `Delete this bill? This action will remove bill ${p.bill_number} (₹${Number(p.amount || 0).toFixed(2)}) and all linked payments & order items from active records and ledger totals.`,
-                                              confirmLabel: 'Delete Bill',
-                                              loadingLabel: 'Deleting...',
-                                              inputLabel: 'Deletion Reason (optional)',
-                                              inputPlaceholder: 'e.g. Duplicate POS bill / test entry',
-                                              inputRequired: false,
-                                              onConfirm: async (reason) => {
-                                                await api.softDeletePaymentBill(p.id, (reason || '').trim(), currentUser.name);
-                                                await loadAllData();
-                                                toast.success(`Bill ${p.bill_number} and linked payments moved to Deleted archive`);
-                                              }
-                                            });
-                                          }}
+                                        {canDeleteOrRestore && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setConfirmActionInput('');
+                                              setConfirmActionError('');
+                                              setConfirmActionModal({
+                                                isOpen: true,
+                                                title: `Delete Bill (${p.bill_number})`,
+                                                description: `Delete this bill? This action will remove bill ${p.bill_number} (₹${Number(p.amount || 0).toFixed(2)}) and all linked payments & order items from active records and ledger totals across Glossy Looks and SMAV.`,
+                                                confirmLabel: 'Delete Bill',
+                                                loadingLabel: 'Deleting...',
+                                                inputLabel: 'Deletion Reason (optional)',
+                                                inputPlaceholder: 'e.g. Duplicate POS bill / test entry',
+                                                inputRequired: false,
+                                                onConfirm: async (reason) => {
+                                                  await api.softDeletePaymentBill(p.id, (reason || '').trim(), currentUser.name, {
+                                                    bill_number: p.bill_number,
+                                                    smav_central_bill_id: p.smav_central_bill_id,
+                                                    order_id: targetOrderId,
+                                                  });
+                                                  await Promise.all([loadAllData(), loadCentralPaymentLedger('active')]);
+                                                  toast.success(`Bill ${p.bill_number} and linked payments moved to Deleted archive`);
+                                                }
+                                              });
+                                            }}
                                           className="inline-flex p-1.5 text-rose-600 hover:text-white hover:bg-rose-600 rounded-lg transition-colors cursor-pointer align-middle"
                                           title="Soft-delete complete bill & linked payments (SUPERADMIN / ADMIN / OWNER only)"
                                         >
@@ -7775,7 +7964,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({ onBackToWebsite, onVie
                   }, currentUser.name);
 
                   setOrderEditModal({ isOpen: false });
-                  await loadAllData();
+                  await Promise.all([loadAllData(), loadCentralPaymentLedger('active')]);
                 },
                 {
                   successMessage: 'Order and settlement details updated successfully',

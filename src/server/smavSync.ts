@@ -200,7 +200,7 @@ export function getGlossyLooksSmavAdapter(): GlossyLooksSmavAuthAdapter {
  */
 export function mapLocalRoleToSmavRole(role?: string): SmavOutletRole {
   const clean = String(role || 'stylist').trim().toLowerCase();
-  if (clean === 'owner' || clean === 'manager' || clean === 'admin') {
+  if (clean === 'superadmin' || clean === 'owner' || clean === 'manager' || clean === 'admin') {
     return 'ADMIN';
   }
   return 'POS_BILLING';

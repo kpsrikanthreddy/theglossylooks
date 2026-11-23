@@ -11,6 +11,7 @@ import {
   Customer,
   Order,
   PaymentRecord,
+  CentralPaymentLedgerResponse,
   Product,
   Supplier,
   PurchaseOrder,
@@ -187,35 +188,51 @@ async function fetchJson<T>(url: string, options?: RequestInit, adminName?: stri
     headers['x-admin-name'] = adminName;
   }
 
-  const controller = !options?.signal ? new AbortController() : null;
-  const timeoutId = controller
-    ? window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS)
-    : null;
+  const method = String(options?.method || 'GET').toUpperCase();
+  const maxAttempts = method === 'GET' && !options?.signal ? 2 : 1;
 
-  try {
-    const res = await fetch(url, {
-      ...options,
-      headers,
-      signal: options?.signal ?? controller?.signal
-    });
-    if (!res.ok) {
-      const errorData = await res.json().catch(() => ({}));
-      throw new Error(errorData.error || errorData.message || `Request failed (HTTP ${res.status})`);
-    }
-    return await res.json();
-  } catch (err: any) {
-    if (err?.name === 'AbortError') {
-      throw new Error('Request timed out. Please check your connection and try again.');
-    }
-    if (err instanceof TypeError) {
-      throw new Error('Network error. Please check your internet connection and try again.');
-    }
-    throw err;
-  } finally {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = !options?.signal ? new AbortController() : null;
+    const timeoutId = controller
+      ? window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS)
+      : null;
+
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers,
+        signal: options?.signal ?? controller?.signal
+      });
+      if (!res.ok) {
+        if (attempt < maxAttempts && (res.status === 502 || res.status === 503 || res.status === 504)) {
+          await new Promise(resolve => window.setTimeout(resolve, 800));
+          continue;
+        }
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || errorData.message || `Request failed (HTTP ${res.status})`);
+      }
+      return await res.json();
+    } catch (err: any) {
+      const isTransient = err?.name === 'AbortError' || err instanceof TypeError;
+      if (attempt < maxAttempts && isTransient) {
+        await new Promise(resolve => window.setTimeout(resolve, 800));
+        continue;
+      }
+      if (err?.name === 'AbortError') {
+        throw new Error('Request timed out. Please check your connection and try again.');
+      }
+      if (err instanceof TypeError) {
+        throw new Error('Network error. Please check your internet connection and try again.');
+      }
+      throw err;
+    } finally {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
     }
   }
+
+  throw new Error('Request failed unexpectedly.');
 }
 
 export const api = {
@@ -427,6 +444,24 @@ export const api = {
     ),
 
   // Payments & Refunds
+  getCentralPaymentLedger: (filters?: {
+    scope?: 'today' | 'history' | 'deleted';
+    timezone?: string;
+    fromDate?: string;
+    toDate?: string;
+    branchId?: string;
+    search?: string;
+  }) => {
+    const params = new URLSearchParams();
+    if (filters?.scope) params.append('scope', filters.scope);
+    params.append('timezone', filters?.timezone || 'Asia/Kolkata');
+    if (filters?.fromDate) params.append('fromDate', filters.fromDate);
+    if (filters?.toDate) params.append('toDate', filters.toDate);
+    if (filters?.branchId && filters.branchId !== 'all') params.append('branchId', filters.branchId);
+    if (filters?.search && filters.search.trim()) params.append('search', filters.search.trim());
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return fetchJson<CentralPaymentLedgerResponse>(`${API_BASE}/admin/payments/ledger${qs}`);
+  },
   getPayments: (filters?: { deleted?: 'active' | 'deleted' | 'all'; branchId?: string; startIso?: string; endIso?: string }) => {
     const params = new URLSearchParams();
     if (filters?.deleted && filters.deleted !== 'active') params.append('deleted', filters.deleted);
@@ -460,16 +495,40 @@ export const api = {
   },
   refundPayment: (id: string, reason: string, adminName?: string) =>
     fetchJson<PaymentRecord>(`${API_BASE}/payments/${id}/refund`, { method: 'POST', body: JSON.stringify({ reason }) }, adminName),
-  softDeletePaymentBill: (paymentId: string, reason?: string, adminName?: string) =>
-    fetchJson<{ success: boolean; order: Order; affected_payments: number; affected_order_items: number }>(
-      `${API_BASE}/payments/${paymentId}`,
-      { method: 'DELETE', body: JSON.stringify({ reason }) },
+  softDeletePaymentBill: (
+    paymentId: string,
+    reason?: string,
+    adminName?: string,
+    meta?: { bill_number?: string; smav_central_bill_id?: string | null; order_id?: string }
+  ) =>
+    fetchJson<{ success: boolean; order?: Order; smav_synced?: boolean; affected_payments: number; affected_order_items?: number }>(
+      `${API_BASE}/payments/${encodeURIComponent(paymentId)}`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({
+          reason,
+          ...(meta?.bill_number ? { bill_number: meta.bill_number } : {}),
+          ...(meta?.smav_central_bill_id ? { smav_central_bill_id: meta.smav_central_bill_id } : {}),
+          ...(meta?.order_id ? { order_id: meta.order_id } : {}),
+        }),
+      },
       adminName
     ),
-  restorePaymentBill: (paymentId: string, adminName?: string) =>
-    fetchJson<{ success: boolean; order: Order; restored_payments: number; restored_order_items: number }>(
-      `${API_BASE}/payments/${paymentId}/restore`,
-      { method: 'POST' },
+  restorePaymentBill: (
+    paymentId: string,
+    adminName?: string,
+    meta?: { bill_number?: string; smav_central_bill_id?: string | null; order_id?: string }
+  ) =>
+    fetchJson<{ success: boolean; order?: Order; smav_synced?: boolean; restored_payments: number; restored_order_items?: number }>(
+      `${API_BASE}/payments/${encodeURIComponent(paymentId)}/restore`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...(meta?.bill_number ? { bill_number: meta.bill_number } : {}),
+          ...(meta?.smav_central_bill_id ? { smav_central_bill_id: meta.smav_central_bill_id } : {}),
+          ...(meta?.order_id ? { order_id: meta.order_id } : {}),
+        }),
+      },
       adminName
     ),
 
