@@ -56,6 +56,8 @@ export class SmavOutletUserAdapter {
   protected readonly outletCode: string;
   protected readonly gatewayOrEdgeUrl: string;
   protected readonly integrationKey: string;
+  /** Server-only JWT/API token accepted by the Supabase Edge gateway. */
+  protected readonly edgeFunctionAuthToken: string;
   protected readonly useCentralGateway: boolean;
   protected readonly fetchImpl: FetchLike;
   protected readonly timeoutMs: number;
@@ -65,11 +67,21 @@ export class SmavOutletUserAdapter {
     integrationKey?: string;
     gatewayUrl?: string;
     edgeFunctionUrl?: string;
+    edgeFunctionAuthToken?: string;
     fetchImpl?: FetchLike;
     timeoutMs?: number;
   }) {
     this.outletCode = String(config.outletCode || '').trim().toLowerCase();
     this.integrationKey = (config.integrationKey || '').trim();
+    // The outlet integration key authorizes the business action.  Supabase's
+    // Edge gateway may additionally require a valid Bearer token before the
+    // function is reached; never use an admin browser session for that call.
+    this.edgeFunctionAuthToken = (
+      config.edgeFunctionAuthToken ||
+      process.env.SMAV_EDGE_FUNCTION_AUTH_TOKEN ||
+      process.env.SMAV_SUPABASE_ANON_KEY ||
+      ''
+    ).trim();
     this.fetchImpl = config.fetchImpl || fetch;
     this.timeoutMs = typeof config.timeoutMs === 'number' && config.timeoutMs > 0
       ? config.timeoutMs
@@ -112,6 +124,11 @@ export class SmavOutletUserAdapter {
       'X-Integration-Key': this.integrationKey,
       'X-SMAV-Sync-Origin': 'outlet_admin',
       'X-Idempotency-Key': idempotencyKey || `${this.outletCode}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      // Required only for a direct Edge Function fallback. This is a server
+      // credential, not the currently logged-in GlossyLooks user's token.
+      ...(!this.useCentralGateway && this.edgeFunctionAuthToken
+        ? { Authorization: `Bearer ${this.edgeFunctionAuthToken}` }
+        : {}),
       ...(!this.useCentralGateway && anonKey ? { apikey: anonKey } : {}),
     };
   }
@@ -128,6 +145,14 @@ export class SmavOutletUserAdapter {
         status: 503,
         retryable: false,
         message: `Integration key not configured for outlet "${this.outletCode}".`,
+      };
+    }
+    if (!this.useCentralGateway && !this.edgeFunctionAuthToken) {
+      return {
+        success: false,
+        status: 503,
+        retryable: false,
+        message: 'SMAV Edge Function authentication is not configured. Set SMAV_GATEWAY_URL (recommended) or SMAV_EDGE_FUNCTION_AUTH_TOKEN server-side.',
       };
     }
 

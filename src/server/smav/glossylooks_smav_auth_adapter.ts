@@ -22,6 +22,7 @@ export class GlossyLooksSmavAuthAdapter extends SmavOutletUserAdapter {
   constructor(config?: {
     gatewayUrl?: string;
     edgeFunctionUrl?: string;
+    edgeFunctionAuthToken?: string;
     integrationKey?: string;
     outletCode?: string;
     fetchImpl?: FetchLike;
@@ -32,6 +33,9 @@ export class GlossyLooksSmavAuthAdapter extends SmavOutletUserAdapter {
       integrationKey: config?.integrationKey !== undefined ? config.integrationKey : (process.env.GLOSSYLOOKS_INTEGRATION_KEY || ''),
       gatewayUrl: config?.gatewayUrl !== undefined ? config.gatewayUrl : process.env.SMAV_GATEWAY_URL,
       edgeFunctionUrl: config?.edgeFunctionUrl !== undefined ? config.edgeFunctionUrl : process.env.SMAV_EDGE_FUNCTION_URL,
+      edgeFunctionAuthToken: config?.edgeFunctionAuthToken !== undefined
+        ? config.edgeFunctionAuthToken
+        : process.env.SMAV_EDGE_FUNCTION_AUTH_TOKEN,
       fetchImpl: config?.fetchImpl,
       timeoutMs: config?.timeoutMs,
     });

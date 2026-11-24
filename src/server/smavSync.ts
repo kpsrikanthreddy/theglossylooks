@@ -190,6 +190,7 @@ export function getGlossyLooksSmavAdapter(): GlossyLooksSmavAuthAdapter {
     integrationKey: process.env.GLOSSYLOOKS_INTEGRATION_KEY || '',
     gatewayUrl: process.env.SMAV_GATEWAY_URL,
     edgeFunctionUrl,
+    edgeFunctionAuthToken: process.env.SMAV_EDGE_FUNCTION_AUTH_TOKEN,
   });
 }
 
